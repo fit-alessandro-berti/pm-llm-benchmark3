@@ -1,0 +1,175 @@
+# 1. Executive Verdict
+
+The net is syntactically a workflow net (single source and single sink, with every node on a source-to-sink path), but it fails to be sound. Its principal structural defect is a concurrency-choice mismatch at the split-join boundaries: the model splits into parallel paths (analysis and review) using an implicit OR/AND topology, but the review branch offers a race between a standard review and a waiver via a shared place `p_review`. 
+
+Because `t_standard_review` and `t_waive_review` consume the same token from `p_review`, the model behaves as an exclusive choice between a standard review and a waiver. However, the completion of analysis (`t_join_normal`) and the waiver completion (`t_join_waived`) feed into two separate join transitions that both push tokens to `p_decision`. 
+
+The business consequence is twofold: first, deadlocks occur if standard review is chosen (because the waiver join `t_join_waived` is starved); second, token duplication occurs if the waiver is chosen (because both analysis and waiver paths fire, sending two tokens to `p_decision`, which leaves a dangling token at `sink` while another token may remain trapped or cause unsound final markings).
+
+# 2. Structural Diagnosis
+
+| Element or subnet | Intended role | Actual structural effect | Potential symptom |
+| :--- | :--- | :--- | :--- |
+| **Initial/Final Markings** | Define start (`source`) and end (`sink`) of the workflow. | Exactly 1 token in `source`, 1 in `sink` at completion. | Structurally valid workflow net source/sink pair, but behavioral token accumulation violates proper completion. |
+| **Split (`t_split`)** | Parallel split initiating analysis and review. | Places one token in `p_analysis` and one token in `p_review`. | Correct structural parallel split, but downstream choices misalign. |
+| **Review Alternatives** | Exclusive choice between standard review and waiver. | `t_standard_review` and `t_waive_review` both consume from `p_review`. | Race condition; mutually exclusive execution paths correctly modeled at this micro-step. |
+| **Joins (`t_join_normal`, `t_join_waived`)** | Synchronize analysis and review outcomes. | `t_join_normal` requires `p_analysis_done` AND `p_review_done`. `t_join_waived` requires only `p_waived`. | Deadlock if standard review is chosen (and analysis finishes, but review fails to feed `p_review_done` if waived instead). Deadlock or token leak depending on execution race. |
+| **Path Connectivity** | Every node must lie on a source-to-sink path. | All places and transitions are connected from `source` through intermediate states to `sink`. | Satisfies structural workflow-net prerequisite, but hides behavioral unsoundness. |
+
+# 3. Marking-Based Counterexample
+
+Consider the legal firing sequence for the **waiver route**:
+1. `t_register`
+2. `t_split`
+3. `t_waive_review`
+4. `t_analyze`
+5. `t_join_waived`
+6. `t_join_normal`
+7. `t_authorize`
+
+### Marking Table (Waiver Route)
+
+| Step | Fired transition | Resulting nonzero marking | Enabled transitions | Observation |
+| :--- | :--- | :--- | :--- | :--- |
+| 0 | (Initial) | `{source: 1}` | `t_register` | Initial state. |
+| 1 | `t_register` | `{p_ready: 1}` | `t_split` | Case registered. |
+| 2 | `t_split` | `{p_analysis: 1, p_review: 1}` | `t_analyze, t_standard_review, t_waive_review` | Parallel branches created. |
+| 3 | `t_waive_review` | `{p_analysis: 1, p_waived: 1}` | `t_analyze, t_join_waived` | Waiver recorded; review branch closed. |
+| 4 | `t_analyze` | `{p_analysis_done: 1, p_waived: 1}` | `t_join_normal, t_join_waived` | Analysis completed. |
+| 5 | `t_join_waived` | `{p_analysis_done: 1, p_decision: 1}` | `t_join_normal, t_authorize` | Waiver join fires, placing a token in `p_decision`. |
+| 6 | `t_join_normal` | `{p_decision: 2}` | `t_authorize` | Normal join fires **even though the review was waived**, placing a second token in `p_decision`. |
+| 7 | `t_authorize` | `{sink: 1, p_decision: 1}` | `t_authorize` (if re-enabled) | `t_authorize` fires once, placing a token in `sink`, but **a leftover token remains in `p_decision`**. |
+
+**Explanation of leftover tokens:** The exact final marking requirement ($\text{fm} = \{\text{sink}: 1\}$) is violated because a stray token remains trapped in `p_decision`. If standard review is chosen instead, `t_join_waived` is never enabled, and `t_join_normal` cannot fire because `p_review_done` is never populated, resulting in a deadlock.
+
+# 4. Minimal-Repair Alternatives
+
+| Repair | Exact edits | Edit cost | Preserved intent | Changed behavior | New risk |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Repair A (Waiver Join Sync)** | Remove arc `(p_waived, join_waived)`. Add arcs `(p_analysis_done, join_waived)` and `(p_waived, join_waived)`. Route `join_waived` to `p_decision`. | 3 arc changes (1 removed, 2 added) | Mandatory analysis on all paths; explicit waiver synchronization. | Waiver path now explicitly waits for analysis completion before proceeding to decision. | Deadlock if waiver path bypasses analysis conceptually (mitigated by policy). |
+| **Repair B (Unified Join with Silent Transition)** | Remove `join_waived` and `p_waived`. Add silent transition `t_skip_review` between `p_review` and `p_decision` (or merge into `join_normal`). | 2 places/transitions removed, 3 arcs rewired | Flexible review outcome feeding standard decision node. | Waiver completely skips analysis and review, merging directly into decision. | Violates business intent that analysis is *always* mandatory. |
+
+**Minimality Justification:** Under an edit-cost model counting atomic graph mutations (add/remove arcs, places, transitions), **Repair A** incurs a cost of 3 (1 arc removal, 2 arc additions) and preserves the core business policy that analysis is mandatory. **Repair B** incurs a higher structural transformation cost (removing a place and transition, rewiring multiple arcs) and alters the business rule by making analysis optional when waived. Thus, Repair A is the minimal structural fix that adheres strictly to the business intent.
+
+# 5. Corrected PM4Py Code
+
+```python
+import pm4py
+from pm4py.objects.petri_net.obj import PetriNet, Marking
+from pm4py.objects.petri_net.utils import petri_utils
+
+repaired_net = PetriNet("parallel_review_with_waiver_repaired")
+
+source = PetriNet.Place("source")
+p_ready = PetriNet.Place("p_ready")
+p_analysis = PetriNet.Place("p_analysis")
+p_review = PetriNet.Place("p_review")
+p_analysis_done = PetriNet.Place("p_analysis_done")
+p_review_done = PetriNet.Place("p_review_done")
+p_waived = PetriNet.Place("p_waived")
+p_decision = PetriNet.Place("p_decision")
+sink = PetriNet.Place("sink")
+
+for p in {
+    source, p_ready, p_analysis, p_review, p_analysis_done,
+    p_review_done, p_waived, p_decision, sink
+}:
+    repaired_net.places.add(p)
+
+register = PetriNet.Transition("t_register", "Register Case")
+split = PetriNet.Transition("t_split", None)
+analyze = PetriNet.Transition("t_analyze", "Perform Analysis")
+standard_review = PetriNet.Transition("t_standard_review", "Perform Standard Review")
+waive_review = PetriNet.Transition("t_waive_review", "Record Review Waiver")
+join_normal = PetriNet.Transition("t_join_normal", None)
+join_waived = PetriNet.Transition("t_join_waived", None)
+authorize = PetriNet.Transition("t_authorize", "Authorize Case")
+
+for t in {
+    register, split, analyze, standard_review, waive_review,
+    join_normal, join_waived, authorize
+}:
+    repaired_net.transitions.add(t)
+
+petri_utils.add_arc_from_to(source, register, repaired_net)
+petri_utils.add_arc_from_to(register, p_ready, repaired_net)
+petri_utils.add_arc_from_to(p_ready, split, repaired_net)
+petri_utils.add_arc_from_to(split, p_analysis, repaired_net)
+petri_utils.add_arc_from_to(split, p_review, repaired_net)
+
+petri_utils.add_arc_from_to(p_analysis, analyze, repaired_net)
+petri_utils.add_arc_from_to(analyze, p_analysis_done, repaired_net)
+
+petri_utils.add_arc_from_to(p_review, standard_review, repaired_net)
+petri_utils.add_arc_from_to(standard_review, p_review_done, repaired_net)
+
+petri_utils.add_arc_from_to(p_review, waive_review, repaired_net)
+petri_utils.add_arc_from_to(waive_review, p_waived, repaired_net)
+
+# Normal join: requires analysis done AND standard review done
+petri_utils.add_arc_from_to(p_analysis_done, join_normal, repaired_net)
+petri_utils.add_arc_from_to(p_review_done, join_normal, repaired_net)
+petri_utils.add_arc_from_to(join_normal, p_decision, repaired_net)
+
+# Repaired waiver join: requires analysis done AND waiver recorded (Repair A)
+petri_utils.add_arc_from_to(p_analysis_done, join_waived, repaired_net)
+petri_utils.add_arc_from_to(p_waived, join_waived, repaired_net)
+petri_utils.add_arc_from_to(join_waived, p_decision, repaired_net)
+
+petri_utils.add_arc_from_to(p_decision, authorize, repaired_net)
+petri_utils.add_arc_from_to(authorize, sink, repaired_net)
+
+repaired_im = Marking()
+repaired_im[source] = 1
+repaired_fm = Marking()
+repaired_fm[sink] = 1
+```
+
+# 6. Diagnostic and Reachability Code
+
+```python
+import pm4py
+
+# Diagnostic checks on original net
+print("=== Original Net Diagnostics ==/n")
+try:
+    print("Is workflow net:", pm4py.check_is_workflow_net(net))
+    print("Is sound:", pm4py.check_soundness(net, im, fm, print_diagnostics=True))
+except Exception as e:
+    print("Original net evaluation error:", e)
+
+# Diagnostic checks on repaired net
+print("/n=== Repaired Net Diagnostics ==/n")
+print("Is workflow net:", pm4py.check_is_workflow_net(repaired_net))
+print("Is sound:", pm4py.check_soundness(repaired_net, repaired_im, repaired_fm, print_diagnostics=True))
+
+# Reachability graph generation
+orig_rg = pm4py.convert_to_reachability_graph(net, im, fm)
+rep_rg = pm4py.convert_to_reachability_graph(repaired_net, repaired_im, repaired_fm)
+print("Original reachability graph nodes:", len(orig_rg.nodes))
+print("Repaired reachability graph nodes:", len(rep_rg.nodes))
+
+# Helper to safely fire a transition along a path
+def safe_fire(net, marking, transition_name):
+    enabled = pm4py.get_enabled_transitions(net, marking)
+    target_t = next((t for t in enabled if t.name == transition_name), None)
+    if not target_t:
+        raise ValueError(f"Transition '{transition_name}' is not enabled in marking {marking}")
+    return pm4py.objects.petri_net.utils.petri_utils.execute(target_t, marking)
+```
+
+**Expected Qualitative Difference:** The original net diagnostics will report unsoundness due to deadlocks (when standard review is chosen) and/or improper completion (stray tokens in `p_decision`). The repaired net diagnostics will confirm that the net is a sound workflow net, guaranteeing proper completion and absence of deadlocks.
+
+# 7. Repair Trade-Offs and Residual Risks
+
+- **Distinguishability:** Standard review and waiver remain fully distinguishable through the firing of `t_standard_review` versus `t_waive_review`.
+- **Silent Transitions:** The repair introduces no new silent transitions, preserving clear event logs for process mining discovery.
+- **Soundness vs. Business Rules:** Soundness proves absence of deadlocks and proper termination, but it does not intrinsically prove that business rules (e.g., "analysis cannot be skipped") are met unless modeled structurally.
+- **Regression Testing:** Positive traces (Register $\rightarrow$ Analyze $\rightarrow$ Standard Review $\rightarrow$ Authorize) and (Register $\rightarrow$ Analyze $\rightarrow$ Waive $\rightarrow$ Authorize) must be tested. Negative traces (attempting to authorize without completing review or analysis) must be verified as blocked.
+- **Bypass Detection:** Accidental bypasses of mandatory analysis are prevented structurally because both `join_normal` and `join_waived` explicitly depend on `p_analysis_done`.
+
+# 8. Final Recommendation
+
+**Deployment Choice:** **Repair A** (Waiver Join Sync) is selected for deployment. It requires minimal structural changes (modifying only incoming arcs to `join_waived`), preserves all original transition labels and semantics, and strictly enforces the business mandate that analysis must always precede authorization regardless of whether the review is performed or waived.
+
+**Fallback Choice:** As a fallback, if business requirements evolve to allow parallel waiver processing *without* waiting for analysis, a redesigned exclusive choice gateway preceding both branches should be implemented, converting the process into a structured XOR-split over two distinct subprocess branches rather than a flawed concurrent split.

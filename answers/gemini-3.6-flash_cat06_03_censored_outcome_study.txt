@@ -1,0 +1,484 @@
+## 1. Target definition
+
+### Primary Target Definition
+The primary target is defined as **Conditional 90-Day Post-Activation Default**, denoted as $Y_{\text{cond}} \in \{0, 1\}$.
+
+*   **Unit of Analysis**: An individual credit application instance $i$, identified by `case:concept:name`.
+*   **Prediction Time ($T_{\text{pred}}$)**: Evaluated at a process milestone—specifically, upon completion of the $k$-th prefix event (e.g., $k=3$ or $k=5$, corresponding to the conclusion of initial identity/KYC checks or initial credit review) or at a fixed elapsed duration ($\Delta t = 24\text{ hours}$) after `Application Started`.
+*   **Observation Horizon**: 90 calendar days following the timestamp of the `Account Activated` event ($t_{\text{act}}$), with a mandatory label-ingestion buffer of 35 additional days ($t_{\text{act}} + 125\text{ days}$) to accommodate delayed external outcome feeds.
+*   **Target Population**: All credit applications initiated within an observation window whose outcomes have reached maturity relative to the data extraction date ($T_{\text{extract}} = \text{2026-02-15}$).
+*   **Estimand**: The conditional probability of default within 90 days of account activation, given the prefix features observed up to $T_{\text{pred}}$, conditioned on the case being accepted and activated under the operational policy:
+$$\theta(X) = \mathbb{P}\left(Y_{\text{default\_90d}} = 1 \;\middle|\; X_{\le T_{\text{pred}}}, A = 1\right)$$
+where $A = 1$ indicates that the application transitions to `Account Activated`.
+
+```
+Application Started -> [Prefix Window (X_<=T_pred)] -> Decision Boundary -> (If Activated A=1) -> Activation (t_act) -> [90-Day Default Window] -> [35d Delay] -> Target Y Observed
+                                                                         -> (If Rejected A=0)  -> Terminal State (Y Undefined)
+```
+
+### Alternative Target Formulations
+
+#### 1. Multi-State Competing Risks Target (All Applications)
+*   **Definition**: A categorical target $S_T \in \{\text{Activated-Default}_{90d}, \text{Activated-NonDefault}_{90d}, \text{Rejected}, \text{Withdrawn}, \text{Transferred}\}$ evaluated at a fixed operational horizon $T$ (e.g., 180 days after application start).
+*   **Why it answers a different question**: Instead of restricting analysis to activated accounts, this target models the joint distribution of process pathways and credit outcomes. It directly addresses operational efficiency, applicant churn, and rejection rates alongside default risk, preventing the misclassification of rejected cases as "non-default."
+
+#### 2. Time-to-Event (Survival) Target with Right-Censoring
+*   **Definition**: A continuous survival time $T_{\text{event}} = \min(t_{\text{default}} - t_{\text{act}}, U)$, accompanied by an event indicator $\delta = \mathbb{I}(t_{\text{default}} - t_{\text{act}} \le U)$, where $U$ is the censoring time measured from account activation.
+*   **Why it answers a different question**: This formulation incorporates partially observed accounts (e.g., accounts activated less than 125 days prior to $T_{\text{extract}}$) without throwing away data or introducing truncation bias. It models the instantaneous hazard rate of default $h(t \mid X_{\le T_{\text{pred}}})$ over time.
+
+#### 3. Policy-Specific Counterfactual Target $Y(1)$
+*   **Definition**: The potential default outcome $Y(1) \in \{0, 1\}$ that *would* be observed if an application were hypothetically activated, regardless of the historical credit decision.
+*   **Why it answers a different question**: This formulation addresses credit policy optimization ("What would happen if we relaxed our approval threshold?"). Estimating $\mathbb{P}(Y(1)=1 \mid X_{\le T_{\text{pred}}})$ requires strong structural assumptions (e.g., unconfoundedness, presence of instrumental variables like quasi-random underwriter assignments) to correct for selection bias ($A$).
+
+---
+
+## 2. Cohort construction
+
+To prevent selection bias and cohort truncation, all 48,000 started applications must be accounted for using explicit temporal as-of logic relative to the extraction date ($T_{\text{extract}} = \text{2026-02-15}$).
+
+### Inclusion, Exclusion, and As-Of Rules
+1.  **Inclusion Rule**: All unique application cases in `applications_events.csv` with `Application Started` timestamp $t_{\text{start}} \ge \text{2024-01-01 00:00:00}$ and $t_{\text{start}} \le \text{2025-12-31 23:59:59}$.
+2.  **Maturity Cutoff Rule (Static Target)**: A case activated at $t_{\text{act}}$ is considered **mature** for the static 90-day binary default label if and only if $t_{\text{act}} + 125\text{ days} \le T_{\text{extract}}$ (i.e., $t_{\text{act}} \le \text{2025-10-13 00:00:00}$).
+3.  **Transferred Case Resolution Rule**: If a case is marked `Transferred`, the linkage table is queried. If linked to a downstream application identifier, the primary event stream is appended with the child process record. If unlinked (40% of cases), the application is categorized as `Transferred (Unlinked)` and treated as a competing terminal outcome.
+4.  **Exclusion Rule**: Cases with corrupted timestamps ($t_i > T_{\text{extract}}$ or $t_{\text{event}} < t_{\text{start}}$) or missing initial mandatory fields (`case:concept:name`, `time:timestamp`) are excluded from primary modeling and logged in the data quality audit.
+
+### Cohort Flow Table ($N = 48,000$)
+
+| Cohort Category | $N$ Cases | Target $Y_{\text{cond}}$ Status | Multi-State Target $S_T$ | Statistical Treatment |
+| :--- | :--- | :--- | :--- | :--- |
+| **Total Applications Started** | **48,000** | -- | -- | Base population |
+|  **Activated & Matured** | **21,600** | Labeled ($Y \in \{0,1\}$) | `Activated-Default` / `Activated-NonDefault` | Primary evaluation set for $Y_{\text{cond}}$ |
+|    *Non-Default (90d)* | *18,900* | $Y = 0$ | `Activated-NonDefault` | Observed negative outcome |
+|    *Default (90d)* | *2,700* | $Y = 1$ | `Activated-Default` | Observed positive outcome |
+|  **Activated & Immature** | **3,600** | Unobserved / Censored | `Activated-Pending` | Excluded from static $Y_{\text{cond}}$; Right-censored in Survival |
+|  **Rejected Applications** | **9,100** | Undefined (Not Activated) | `Rejected` | Competing outcome; Selection model denominator |
+|  **Withdrawn Applications** | **5,700** | Undefined (Not Activated) | `Withdrawn` | Competing outcome; Right-censored at withdrawal time |
+|  **Transferred Applications** | **2,900** | Undefined / Partial Link | `Transferred` | Competing outcome; IPCW adjustment for linked subset |
+|  **Still-Open / In-Flight** | **5,100** | Unobserved | `In-Flight` | Censored in process timing; Excluded from static target |
+
+---
+
+## 3. Censoring and missing-label strategy
+
+The dataset contains five distinct mechanisms that cause outcomes to be unobserved or non-randomly missing:
+
+```
+                           Activated & Matured (125d+) > Observed Y  {0,1}
+                           Activated & Immature (<125d) > Delayed Feed / Right-Censored
+All Applications (48,000)  Rejected / Withdrawn > Selection Bias (Y Undefined)
+                           Transferred (Unlinked) > Competing Event / Missing Follow-up
+                           Partner-Originated > Systematic Missing Data (MNAR)
+```
+
+### Taxonomy of Missingness and Censoring
+
+1.  **Ordinary Right-Censoring**: In-flight cases (5,100) or activated cases with elapsed time post-activation $< 90$ days at extraction. The event of interest (default) has not had time to occur.
+2.  **Delayed Labels**: Activated accounts where $90 \text{ days} \le t_{\text{extract}} - t_{\text{act}} < 125 \text{ days}$. The 90-day observation window has passed, but the external outcome feed (7–35 day delay) has not arrived.
+3.  **Selection Through Activation**: Rejected (9,100) and withdrawn (5,700) cases never receive credit exposure. $Y_{\text{default\_90d}}$ is counterfactual and structurally missing.
+4.  **Transfer as a Competing Event / Missing Linkage**: Transferred applications (2,900) exit the primary funnel. For the 40% lacking linkage records, follow-up is missing conditionally on the transfer destination.
+5.  **Permanently Missing Outcome Feeds**: Partner-originated accounts suffer from missing outcome feeds due to integration failures. This missingness is dependent on `case:channel`.
+
+### Analytical Strategies
+
+#### Primary Strategy: Multi-State Competing Risks Framework with Inverse Probability Weighting (IPW)
+To evaluate risk without discarding non-activated cases or treating rejections as non-defaults, model the process as a competing risks system.
+*   Let $T_{\text{terminal}}$ be the time to a terminal process state.
+*   Define cause-specific hazards $h_k(t \mid X_{\le T_{\text{pred}}})$ for transitions $k \in \{\text{Activated}, \text{Rejected}, \text{Withdrawn}, \text{Transferred}\}$.
+*   For the activated subset, apply **Inverse Probability of Censoring Weighting (IPCW)** and **Selection Propensity Weighting**:
+$$w_i = \frac{1}{\mathbb{P}(A_i = 1 \mid X_{\le T_{\text{pred}}})} \times \frac{1}{\mathbb{P}(C_i = 0 \mid X_{\le T_{\text{pred}}}, A_i = 1, \text{channel}_i)}$$
+where $\mathbb{P}(A_i = 1 \mid X)$ is the propensity score of activation (estimated across all 48,000 cases), and $\mathbb{P}(C_i = 0 \mid \dots)$ corrects for partner-specific feed dropouts and maturity censoring.
+
+#### Sensitivity Analysis Strategy
+1.  **Manski Non-Parametric Extreme Bounds**: Compute lower and upper bounds for overall application risk by assuming all unobserved/rejected accounts would have had either $Y(1) = 0$ (lower bound) or $Y(1) = 1$ (upper bound).
+2.  **Pattern-Mixture Model for Partner Feeds**: Introduce an unobserved sensitivity parameter $\delta_{\text{MNAR}}$ representing the log-odds ratio of default for partner accounts with missing outcome feeds relative to observed partner accounts:
+$$\text{logit}(\mathbb{P}(Y=1 \mid X, \text{Missing})) = \text{logit}(\mathbb{P}(Y=1 \mid X, \text{Observed})) + \delta_{\text{MNAR}}$$
+Vary $\delta_{\text{MNAR}} \in [-0.5, 1.5]$ to evaluate model robustness to non-random feed loss.
+
+### Testability Matrix
+
+| Mechanism | Testability | Test Procedure / Diagnostic |
+| :--- | :--- | :--- |
+| **Delayed Labels** | **Fully Testable** | Empirically estimate the empirical cumulative distribution function (ECDF) of label delay times ($\Delta t_{\text{feed}} = t_{\text{label}} - t_{\text{act\_90d}}$) using historical backlogs. |
+| **Partner Feed Missingness** | **Partially Testable** | Test for Missing Completely at Random (MCAR) across channels using Little's test; test for MAR by modeling missingness against prefix features and requested loan amounts. |
+| **Transfer Unlinked Loss** | **Partially Testable** | Compare feature distributions ($X_{\le T_{\text{pred}}}$) between linked (60%) and unlinked (40%) transferred cases using Kolmogorov-Smirnov tests. |
+| **Selection via Activation** | **Untestable (Structural)** | The counterfactual default rate of rejected applicants $Y(1) \mid A=0$ is unobserved without randomized approval audits or explicit instrumental variables. |
+
+---
+
+## 4. Prefix extraction
+
+Prefix generation must enforce strict temporal ordering to prevent look-ahead contamination.
+
+```
+Raw Case Log: [Event 1 (t1)] -> [Event 2 (t2)] -> [Event 3 (t3)] | -> [Event 4 (t4)] -> [Event 5 (t5)]
+                                                                 |
+                                                          Prediction Cutoff (T_pred)
+                                                                 |
+Prefix Log:   [Event 1 (t1)] -> [Event 2 (t2)] -> [Event 3 (t3)] | (Events 4 & 5 TRUNCATED)
+```
+
+### Prefix Extraction Mechanics
+
+1.  **Fixed Event-Count Prefix ($k$-prefix)**:
+    *   Extract events $\sigma_i = \langle e_1, e_2, \dots, e_k \rangle$.
+    *   If a case terminates at length $m < k$, append a padding token `[CASE_TERMINATED]` up to length $k$, and set all incremental time features to zero. The prediction timestamp $T_{\text{pred}}$ is fixed to $t(e_m)$.
+2.  **Elapsed-Time Prefix ($\Delta t$-prefix)**:
+    *   Extract all events occurring within $t_{\text{start}} \le t(e_j) \le t_{\text{start}} + \Delta t$ (e.g., $\Delta t = 72 \text{ hours}$).
+    *   If no events occur within the window, the prefix contains only `Application Started`.
+
+### Handling Operational Process Artifacts
+
+*   **Document Loop Rework**: When a case requests documents repeatedly (`Credit Review` $\rightarrow$ `Document Requested` $\rightarrow$ `Credit Review`), dynamic events accumulate while structural process state remains unchanged. Prefix extraction captures loop counts as static features (`num_doc_requests = count("Document Requested")`) and records cumulative duration, avoiding un-truncated sequence inflation.
+*   **System Migration (15 October 2025)**:
+    *   *Activity Renaming*: Apply a deterministic mapping table prior to prefix generation. Legacy names (e.g., `ID_Check_V1`, `Scoring_Legacy`) are mapped to unified concepts (`Identity/KYC Check`, `Credit Review`).
+    *   *Duplicate Events*: Deduplicate sequential events where $e_j = e_{j+1}$ on `(case_id, activity, timestamp)` within a 1-second window, retaining the first instance.
+
+---
+
+## 5. Process-aware features
+
+All features are calculated using data available prior to $T_{\text{pred}}$.
+
+```
+                             Control-Flow > Activity counts, variants, DFG fitness
+                             Timing > Elapsed time, state waiting time
+Feature Vector (at T_pred)  Resource > Queue depth, underwriter historical workload
+                             Static > Requested amount, origination channel, region
+                             Prefix-Derived > Initial score, score trajectory ( score)
+```
+
+### Feature Classification Matrix
+
+| Category | Feature Name | Description | Calculation Method / Availability Rule |
+| :--- | :--- | :--- | :--- |
+| **Control-Flow** | `activity_vector` | One-hot / frequency count of activities in prefix | Count of activities in sub-trace $\sigma_{\le T_{\text{pred}}}$ |
+| **Control-Flow** | `current_state` | Last observed activity at $T_{\text{pred}}$ | Activity name of event $e_k$ |
+| **Control-Flow** | `rework_count_docs` | Number of document re-requests | Frequency of `Document Requested` in prefix |
+| **Control-Flow** | `dfg_alignment_score` | Trace fitness against base process map | Conformance alignment score computed using reference DFG |
+| **Timing** | `elapsed_time_total` | Total duration from start to $T_{\text{pred}}$ | $t(e_k) - t(e_1)$ in hours |
+| **Timing** | `credit_review_wait_time` | Cumulative time spent waiting in Credit Review | Sum of durations for `Credit Review` intervals $\le T_{\text{pred}}$ |
+| **Timing** | `last_event_lag` | Time since previous event | $t(e_k) - t(e_{k-1})$ in minutes |
+| **Resource / Queue** | `resource_queue_depth` | Number of open active cases assigned to resource | Count of open cases assigned to $r_i$ at time $t(e_k)$ across system |
+| **Resource / Queue** | `historical_approval_rate` | Underwriter's historical approval rate | Rolling 30-day mean approval rate for $r_i$ computed on cases closed *prior* to $t(e_k)$ |
+| **Static Attributes**| `requested_amount` | Initial loan amount requested | `case:requested_amount` (immutable static attribute) |
+| **Static Attributes**| `channel`, `region` | Application channel and geographic region | `case:channel`, `case:region` |
+| **Prefix Dynamic** | `initial_risk_score` | Credit risk score assigned at initial check | First non-null value of `risk_score` in prefix |
+| **Prefix Dynamic** | `risk_score_delta` | Change in risk score during initial screening | `risk_score`($e_k$) - `risk_score`($e_1$) |
+
+---
+
+## 6. Leakage audit
+
+The following audit matrix evaluates all data attributes for look-ahead bias, selection bias, and temporal leakage.
+
+| Feature or Data Element | Leakage or Bias Risk | Valid Availability Rule | Keep / Repair / Drop | Rationale |
+| :--- | :--- | :--- | :--- | :--- |
+| `final_limit` | **Severe Leakage**: Populated only after final credit decision (Accept/Activate). Missing for rejections/withdrawals; reveals future acceptance. | Available only *after* final decision event. | **DROP** | Direct future leakage. Including it causes artificial pattern separation on unapproved cases. |
+| `decision_reason` | **Severe Leakage**: Populated at or after Accept/Reject terminal decision events. | Available only at terminal decision timestamp. | **DROP** | Downstream outcome artifact. Not available during early credit review prefixes. |
+| `collection_status` | **Critical Outcome Leakage**: Populated post-activation; directly indicates default / delinquency status. | Post-activation operational flag. | **DROP** | Target proxy leakage. Directly encodes the target variable or post-target state. |
+| **Future Events** (`Contract Signed`, `Account Activated`, `Collections Contact`, `Default Recorded`) | **Critical Leakage**: Events occurring after $T_{\text{pred}}$. | Events with $t(e) > T_{\text{pred}}$. | **DROP** | Including downstream events breaks the early warning requirement and leaks future process paths. |
+| `documents_total` | **Temporal Leakage**: Nightly snapshot includes documents uploaded later on the same calendar day than $T_{\text{pred}}$. | Intra-day snapshot timestamp. | **REPAIR** | Compute `documents_total` explicitly by counting `Document Uploaded` events with timestamps $\le T_{\text{pred}}$. |
+| Updated `risk_score` | **Look-Ahead Risk**: `risk_score` is updated continuously across events. Using the final score leaks post-prefix events. | Event-specific timestamp. | **REPAIR** | Retain only the most recent `risk_score` value logged at or before $T_{\text{pred}}$. Mask subsequent updates. |
+| `org:resource` Experience | **Temporal Leakage**: Stored as resource experience at data extraction time ($T_{\text{extract}}$), inflating historical experience. | Point-in-time calculation. | **REPAIR** | Reconstruct resource tenure dynamically: $t(e_k) - \text{hire\_date}(r_i)$. If hire date missing, use point-in-time cumulative case volume. |
+| `label_available_at` | **Target Mechanism Leakage**: Indicates when outcome was ingested; correlates with partner feeds and delay patterns. | Administrative meta-field. | **DROP** | Administrative tracking field; must not be used as a predictive feature. |
+
+---
+
+## 7. Validation design
+
+Standard random $k$-fold cross-validation or random train/test splits are invalid for this domain because they break temporal ordering, leak future systemic policies into past predictions, and fail to evaluate model performance across policy shifts.
+
+```
+Timeline: 2024-01-01                    2025-07-01               2025-10-15  2025-10-13        2025-12-31  2026-02-15
+          |------------------------------|------------------------|-----------|-----------------|-----------|
+          [------- Train Cohort ---------] [--- Validation Set ---] [ System  ] [- Guard Band -] [ Open    ] [ Extract ]
+          (Pre-Policy Change)             (Post-Policy Change)     ( Migration) (Unmatured 125d) ( In-Flight) Date
+```
+
+### Out-of-Time (OOT) Temporal Split Architecture
+
+1.  **Training Set**: Applications started between **2024-01-01** and **2025-04-30** ($N \approx 32,000$).
+2.  **Validation Set (Pre-Policy Shift)**: Applications started between **2025-05-01** and **2025-06-30** ($N \approx 5,000$).
+3.  **Out-of-Time Test Set (Post-Policy & Migration)**: Applications started between **2025-07-01** and **2025-10-13** ($N \approx 7,500$).
+    *   *Policy Shift Test*: Evaluates performance under the new credit thresholds implemented on **1 July 2025**.
+    *   *System Migration Test*: Evaluates performance under activity renaming and duplicate log structures introduced on **15 October 2025**.
+    *   *Maturity Buffer*: Cases starting up to 2025-10-13 reaching activation by 2025-10-13 have completed the 90-day post-activation window plus 35-day feed lag prior to $T_{\text{extract}} = \text{2026-02-15}$.
+
+### Why Random Case Splitting Fails
+
+*   **Policy Shift Contamination**: Random splits allow the model to learn outcome relationships from post-July 2025 policy environments and apply them to pre-July 2025 data (and vice versa), underestimating real-world generalization error under policy drift.
+*   **Temporal Autocorrelation**: Macroeconomic trends, seasonal default spikes, and operational bottlenecks are shared across concurrently running applications. Random splits leak intra-period correlations between train and test sets.
+
+### Evaluation Metrics
+
+#### For Conditional Target ($Y_{\text{cond}}$)
+*   **Primary Metric**: Area Under the Precision-Recall Curve (**PR-AUC** / Average Precision) due to severe class imbalance ($2,700 / 21,600 \approx 12.5\%$).
+*   **Calibration Evaluation**: Expected Calibration Error (**ECE**) and Brier Score, assessed via reliability diagrams across deciles of predicted risk.
+*   **Subgroup Robustness**: Disaggregated PR-AUC and Brier Score across:
+    *   *Origination Channel* (Partner vs. Direct Platform).
+    *   *Policy Era* (Pre-July 1, 2025 vs. Post-July 1, 2025).
+
+#### For Competing Risks / Multi-State Target ($S_T$)
+*   **Integrated Brier Score (IBS)** across multi-state outcomes.
+*   **Cumulative Incidence Calibration**: Comparison of predicted vs. empirical cumulative incidence curves for `Activated-Default`, `Rejected`, and `Withdrawn`.
+
+---
+
+## 8. Limitations and decision-use boundary
+
+### What the Study Can and Cannot Claim
+
+```
+
+               CAN CLAIM (Predictive Risk)              
+ Accurately predicts default probability P(Y=1|X, A=1)  
+ for applications accepted under current policy.        
+
+                            
+                             (Requires Unconfoundedness &
+                              Counterfactual Assumptions)
+                            
+
+             CANNOT CLAIM (Causal / Counterfactual)     
+ Predicts true default risk Y(1) for rejected cases     
+ or estimates effect of expanding approval thresholds.  
+
+```
+
+*   **Can Claim**: The model provides a calibrated estimate of default risk $\mathbb{P}(Y_{\text{default\_90d}} = 1 \mid X_{\le T_{\text{pred}}}, A=1)$ for credit applications that pass through the historical selection and activation pipeline under operational conditions similar to the training window.
+*   **Cannot Claim**: The model **does not** estimate the counterfactual default probability $\mathbb{P}(Y(1) = 1)$ for currently rejected or withdrawn applicants. It cannot predict what the default rate *would be* if credit scoring thresholds were lowered to accept previously rejected applicants, as those applicants were subject to selective screening.
+*   **Cannot Claim**: The model does not establish causal links between process delays (e.g., repeated document requests) and default risk. Process delays may reflect applicant unobserved risk factors (confounding) rather than a causal driver of default.
+
+### Deployment-Induced Changes to Data-Generating Process (DGP Feedback Loops)
+
+1.  **Selection Shift (Threshold Rejection Feedback)**: If business operations use this model to automatically reject high-risk applications early in the process, the population of applications reaching `Account Activated` ($A=1$) will change. The downstream distribution of $X_{\le T_{\text{pred}}} \mid A=1$ will shift, rendering historical conditional performance estimates obsolete (Goodhart’s Law).
+2.  **Strategic Applicant Adaptation (Gaming)**: Once the early warning model is deployed into production, brokers and applicants may adapt input behavior (e.g., altering requested amounts or channel pathways) to bypass early-prefix detection thresholds.
+3.  **Resource Allocation Displacement**: If underwriters prioritize manual verification for applications flagged as "high default risk" by the early model, processing times for those applications will increase. This operational change alters the timing and queue features of subsequent cases, invalidating the historical relationship between process delays and default probability.
+
+---
+
+## 9. PM4Py-oriented Python implementation skeleton
+
+```python
+"""
+Predictive Process Monitoring (PPM) Data Engineering & Leakage Audit Pipeline
+Target: Uncertainty-Aware 90-Day Post-Activation Default Prediction
+Library Requirements: pandas, numpy, pm4py
+"""
+
+import pandas as pd
+import numpy as np
+import pm4py
+from datetime import datetime, timedelta
+
+# ==========================================
+# 1. CONSTANTS & CONFIGURATION
+# ==========================================
+CSV_PATH = "applications_events.csv"
+EXTRACTION_DATE = pd.to_datetime("2026-02-15 00:00:00")
+MATURITY_BUFFER_DAYS = 125  # 90d window + 35d delayed outcome feed lag
+MATURITY_CUTOFF_DATE = EXTRACTION_DATE - timedelta(days=MATURITY_BUFFER_DAYS)
+
+# Activity Mapping for System Migration (15 Oct 2025)
+ACTIVITY_MAP = {
+    "ID_Check_V1": "Identity/KYC Check",
+    "Identity Verification": "Identity/KYC Check",
+    "Credit_Scoring_Legacy": "Credit Review",
+    "Scoring_V2": "Credit Review",
+}
+
+# Leakage Blacklist: Columns strictly forbidden from feature generation
+LEAKAGE_COLUMNS = [
+    "final_limit",
+    "decision_reason",
+    "collection_status",
+    "label_available_at",
+    "data_extract_time",
+    "source_system"
+]
+
+# Post-prediction milestone events to exclude from prefix extraction
+FUTURE_EVENT_TYPES = [
+    "Contract Signed",
+    "Account Activated",
+    "Collections Contact",
+    "Default Recorded"
+]
+
+# ==========================================
+# 2. DATA INGESTION & SANITIZATION
+# ==========================================
+def load_and_sanitize_log(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+    
+    # 2.1 Apply Activity Schema Normalization (Fix Migration Discrepancies)
+    df["concept:name"] = df["concept:name"].replace(ACTIVITY_MAP)
+    
+    # 2.2 Deduplicate consecutive identical events within 1-second window
+    df = df.sort_values(by=["case:concept:name", "time:timestamp"])
+    dup_mask = (
+        (df["case:concept:name"] == df["case:concept:name"].shift(1)) &
+        (df["concept:name"] == df["concept:name"].shift(1)) &
+        ((df["time:timestamp"] - df["time:timestamp"].shift(1)).dt.total_seconds() < 1.0)
+    )
+    df = df[~dup_mask].copy()
+    
+    # 2.3 Format dataframe for PM4Py compliance
+    df = pm4py.format_dataframe(
+        df,
+        case_id_key="case:concept:name",
+        activity_key="concept:name",
+        timestamp_key="time:timestamp"
+    )
+    return df
+
+# ==========================================
+# 3. CASE-LEVEL METADATA & COHORT BUILDING
+# ==========================================
+def build_case_cohort_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes case-level start times, activation status, maturity, and outcome states.
+    Strictly preserves competing outcome semantics (No labeling rejections as Y=0).
+    """
+    case_groups = df.groupby("case:concept:name")
+    
+    meta = case_groups.agg(
+        case_start_time=("time:timestamp", "min"),
+        case_end_time=("time:timestamp", "max"),
+        activities=("concept:name", lambda s: set(s)),
+        channel=("case:channel", "first"),
+        region=("case:region", "first"),
+        requested_amount=("case:requested_amount", "first"),
+        raw_default_label=("default_90d", "max") # Max non-null label if present
+    ).reset_index()
+    
+    # Identify explicit lifecycle events
+    meta["is_activated"] = meta["activities"].apply(lambda s: "Account Activated" in s)
+    meta["is_rejected"] = meta["activities"].apply(lambda s: "Rejected" in s)
+    meta["is_withdrawn"] = meta["activities"].apply(lambda s: "Withdrawn" in s)
+    meta["is_transferred"] = meta["activities"].apply(lambda s: "Transferred" in s)
+    
+    # Determine Activation Timestamp for activated cases
+    activation_events = df[df["concept:name"] == "Account Activated"][["case:concept:name", "time:timestamp"]]
+    activation_events = activation_events.rename(columns={"time:timestamp": "activation_time"})
+    meta = meta.merge(activation_events, on="case:concept:name", how="left")
+    
+    # Apply Maturity Rule: 90d + 35d feed delay relative to extraction
+    meta["is_mature"] = meta["activation_time"].apply(
+        lambda t: (t <= MATURITY_CUTOFF_DATE) if pd.notnull(t) else False
+    )
+    
+    # Multi-State Competing Risk Target Categorization
+    def assign_multi_state_target(row):
+        if row["is_activated"]:
+            if not row["is_mature"]:
+                return "ACTIVATED_UNMATURED"
+            return "ACTIVATED_DEFAULT" if row["raw_default_label"] == 1 else "ACTIVATED_NON_DEFAULT"
+        elif row["is_rejected"]:
+            return "TERMINAL_REJECTED"
+        elif row["is_withdrawn"]:
+            return "TERMINAL_WITHDRAWN"
+        elif row["is_transferred"]:
+            return "TERMINAL_TRANSFERRED"
+        else:
+            return "IN_FLIGHT_OPEN"
+
+    meta["competing_risk_target"] = meta.apply(assign_multi_state_target, axis=1)
+    
+    # Primary Conditional Target (Defined ONLY for Activated & Mature cases)
+    # Binary Y is NaN for non-activated, immature, or open cases.
+    meta["target_y_cond"] = np.nan
+    mature_activated_mask = (meta["competing_risk_target"].isin(["ACTIVATED_DEFAULT", "ACTIVATED_NON_DEFAULT"]))
+    meta.loc[mature_activated_mask, "target_y_cond"] = (
+        meta.loc[mature_activated_mask, "competing_risk_target"] == "ACTIVATED_DEFAULT"
+    ).astype(float)
+    
+    return meta
+
+# ==========================================
+# 4. TEMPORAL VALIDATION SPLIT
+# ==========================================
+def apply_temporal_split(meta_df: pd.DataFrame):
+    """
+    Executes an Out-of-Time split based on application start date.
+    Prevents temporal autocorrelation and policy-shift leakage.
+    """
+    train_mask = (meta_df["case_start_time"] >= "2024-01-01") & (meta_df["case_start_time"] < "2025-05-01")
+    val_mask = (meta_df["case_start_time"] >= "2025-05-01") & (meta_df["case_start_time"] < "2025-07-01")
+    test_mask = (meta_df["case_start_time"] >= "2025-07-01") & (meta_df["case_start_time"] <= MATURITY_CUTOFF_DATE)
+    
+    train_cases = set(meta_df[train_mask]["case:concept:name"])
+    val_cases = set(meta_df[val_mask]["case:concept:name"])
+    test_cases = set(meta_df[test_mask]["case:concept:name"])
+    
+    return train_cases, val_cases, test_cases
+
+# ==========================================
+# 5. PREFIX EXTRACTION & LEAKAGE SANITIZATION
+# ==========================================
+def extract_prefix_features(df: pd.DataFrame, prefix_k: int = 3) -> pd.DataFrame:
+    """
+    Extracts k-length prefixes while truncating future events and stripping forbidden fields.
+    """
+    # 5.1 Drop leakage columns prior to feature extraction
+    clean_df = df.drop(columns=[c for c in LEAKAGE_COLUMNS if c in df.columns])
+    
+    # 5.2 Exclude downstream outcome events
+    clean_df = clean_df[~clean_df["concept:name"].isin(FUTURE_EVENT_TYPES)].copy()
+    
+    # 5.3 Filter log to first k events per case
+    clean_df["event_rank"] = clean_df.groupby("case:concept:name").cumcount() + 1
+    prefix_df = clean_df[clean_df["event_rank"] <= prefix_k].copy()
+    
+    # 5.4 Compute Prefix-Level Features
+    prefix_features = prefix_df.groupby("case:concept:name").agg(
+        prefix_len=("event_rank", "max"),
+        elapsed_time_sec=("time:timestamp", lambda x: (x.max() - x.min()).total_seconds()),
+        last_activity=("concept:name", "last"),
+        num_doc_requests=("concept:name", lambda x: (x == "Document Requested").sum()),
+        initial_risk_score=("risk_score", "first"),
+        latest_prefix_risk_score=("risk_score", "last") # Risk score as-of prediction cutoff
+    ).reset_index()
+    
+    # Repair: Calculate risk score delta within prefix window
+    prefix_features["risk_score_delta"] = (
+        prefix_features["latest_prefix_risk_score"] - prefix_features["initial_risk_score"]
+    ).fillna(0.0)
+    
+    return prefix_features
+
+# ==========================================
+# 6. MAIN EXECUTION & AUDIT PIPELINE
+# ==========================================
+if __name__ == "__main__":
+    print("--- 1. Loading & Sanitizing Data ---")
+    event_log = load_and_sanitize_log(CSV_PATH)
+    
+    print("--- 2. Building Cohort & Target Semantics ---")
+    cohort_meta = build_case_cohort_metadata(event_log)
+    
+    print("\n[COHORT DISTRIBUTION AUDIT]")
+    print(cohort_meta["competing_risk_target"].value_counts(dropna=False))
+    
+    print("--- 3. Executing Temporal Validation Split ---")
+    train_ids, val_ids, test_ids = apply_temporal_split(cohort_meta)
+    print(f"Train Cases (Pre-Policy): {len(train_ids)}")
+    print(f"Val Cases (Pre-Policy):   {len(val_ids)}")
+    print(f"Test Cases (Post-Policy):  {len(test_ids)}")
+    
+    print("--- 4. Extracting Prefix Features (k=3) ---")
+    features_df = extract_prefix_features(event_log, prefix_k=3)
+    
+    # Merge Features with Metadata for Modeling Pipeline
+    full_dataset = cohort_meta.merge(features_df, on="case:concept:name", how="inner")
+    
+    # 5. Assert No Leakage Fields Present
+    for col in LEAKAGE_COLUMNS:
+        assert col not in full_dataset.columns, f"LEAKAGE AUDIT FAILED: {col} present in dataset!"
+    
+    print("\n--- PIPELINE COMPLETED SUCCESSFULLY ---")
+    print(f"Final Model-Ready Dataset Shape: {full_dataset.shape}")
+    print("NOTE: Connect Survival Models (Cox/Random Survival Forests) or Multi-State Models")
+    print("      using 'competing_risk_target' and 'elapsed_time_sec' to account for selection bias.")
+```

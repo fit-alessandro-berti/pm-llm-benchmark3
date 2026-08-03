@@ -1,0 +1,296 @@
+## 1. Duplicate-handling decision tree
+
+```
+[Candidate Event Pair / Group]
+  Are payload_hash values and source_event_key identical across the same source?
+      YES -> [Exact technical duplicate] -> Action: DROP secondary
+      NO  -> [Check cross-source relations]
+  Do multiple systems report the identical physical transition with overlapping objects?
+      YES (e.g., e03/e04: WMS scan vs. Handheld scan) -> [Same physical event observed by multiple systems] -> Action: MERGE attributes and relations (retain richest payload, log provenance)
+      NO  -> [Check abstraction levels]
+  Is one event a system-level summary/status update (ERP) and the other a detailed transaction (WMS/Billing)?
+      YES (e.g., e06/e07, e13/e15) -> [Summary event derived from a detailed event] -> Action: RETAIN BOTH unchanged (preserve hierarchical abstraction)
+      NO  -> [Check label harmonization]
+  Do distinct business entities/activities share a harmonized label due to terminology collapse?
+      YES (e.g., e08 "released from warehouse" vs. e09 "accepted by carrier") -> [Harmonization collision] -> Action: RETAIN BOTH with REFINED LABELS or qualifiers ("Dispatch: Warehouse Release" vs. "Dispatch: Carrier Acceptance")
+      NO  -> [Check object intersection]
+  Do events share a timestamp and label but involve completely disjoint sets of physical objects?
+      YES (e.g., e03/e05: same pick time, different items I1 vs I2) -> [Concurrent same-label events involving different objects] -> Action: RETAIN BOTH unchanged
+      NO  -> [Check conflicting authorities]
+  Do events refer to the same logical business entity (e.g., invoice V1) from authoritative systems with conflicting attributes?
+       YES (e.g., e11/e16: ERP vs Billing) -> [Source authority conflict] -> Action: MERGE attributes using authoritative source precedence (Billing takes financial attributes, ERP takes lifecycle state)
+       NO  -> [Unresolved candidate] -> Action: QUARANTINE FOR REVIEW
+```
+
+---
+
+## 2. Event-by-event decisions
+
+| Event(s) | Candidate relationship | Decision | Confidence | Preserved canonical eid | Attribute merge policy | Relation merge policy | Provenance retained | Main risk |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **e03/e04** | Same physical scan (WMS vs. Scanner) | Merge attributes & relations | High | e03 | Union hashes (`h-pick-i1` + `h-pick-i1-alt`), keep WMS location enrichment | Union objects (`O1, I1, P1`) | `merged_from: [e03, e04]` | Overwriting scanner-specific metadata |
+| **e03/e05** | Concurrent distinct item picks | Retain both unchanged | High | N/A (Keep e03, e05) | None | None | None (independent) | None |
+| **e06/e07** | Detailed WMS pack vs. ERP summary | Retain both unchanged | High | N/A (Keep e06, e07) | None | None | None (hierarchical) | False rework loops in process discovery |
+| **e08/e09** | Warehouse release vs. Carrier accept (Harmonization collision) | Retain both, refine labels | High | N/A (Keep e08, e09) | Refine e08 -> `Dispatch: Warehouse Release`, e09 -> `Dispatch: Carrier Acceptance` | None | `original_activity` preserved | Collapsing logistics handoff milestones |
+| **e09/e10** | Carrier acceptance vs. Handover | Retain both unchanged | High | N/A (Keep e09, e10) | None | None | None (sequential lifecycle) | Treating handover as duplicate of acceptance |
+| **e11/e16** | ERP invoice vs. Billing invoice (Source authority conflict) | Merge attributes & relations | High | e16 | Billing system authoritative for financial values; ERP authoritative for posting status | Union objects (`O1, V1`) | `merged_from: [e11, e16]` | Discarding ERP accounting metadata |
+| **e13/e14** | Capture Payment M1 vs. Capture Payment M2 | Retain both unchanged | High | N/A (Keep e13, e14) | None | None (M1 vs M2 separation) | None (distinct payments) | Collapsing partial payments into a single event |
+| **e13/e15** | PSP capture vs. ERP payment summary | Retain both unchanged | High | N/A (Keep e13, e15) | None | None | None (summary level) | Double-counting payment amounts |
+| **e14/e15** | PSP capture M2 vs. ERP payment summary | Retain both unchanged | High | N/A (Keep e14, e15) | None | None | None (summary level) | Failing to tie summary balance to M2 |
+
+---
+
+## 3. Timestamp-tie ordering rules
+
+### Deterministic Partial-Order-to-Total-Order Policy
+
+To resolve timestamp ties without corrupting semantic meaning, we enforce a strict hierarchical tie-breaking policy. 
+
+1. **Domain Constraints (Semantic):** Mandatory logical precursors must precede successors (e.g., Order Creation $\rightarrow$ Validation $\rightarrow$ Picking $\rightarrow$ Packing $\rightarrow$ Dispatch $\rightarrow$ Delivery; Payment Authorization $\rightarrow$ Capture).
+2. **Lifecycle Constraints on Shared Objects (Semantic):** Events modifying the state of the same object instance must respect state-machine transitions. For example, within Package `P1`, picking must precede packing, and packing must precede dispatch.
+3. **Source-Specific Semantics (Semantic):** Where multi-system records overlap at the same second, authoritative operational systems take precedence over downstream summary systems (e.g., WMS operational scan over ERP status sync; Billing system over ERP invoice generation).
+4. **Within-Source Sequence (`source_seq`) (Deterministic):** For events originating from the same source system sharing a timestamp, ascending order of `source_seq` is applied.
+5. **Ingestion Time (`ingested_at`) (Deterministic Fallback):** If semantic, lifecycle, and source sequence rules leave a tie, ascending order of technical `ingested_at` is used. **Crucial rule:** Ingestion time is *never* used as a primary business order; it is strictly a tie-breaker.
+6. **Stable Fallback Order (Deterministic):** Alphabetical sort by `source_event_key` as a final tie-breaker to ensure total determinism across pipeline runs.
+
+### Why Adding Microseconds Before Semantic Ordering Encodes a False Story
+Injecting synthetic microseconds (e.g., adding `000.001s` based on ingestion time) to force a total order prior to semantic alignment converts technical noise into false business reality. If an ERP summary event (`e07`) ingested at `10:01:00` is artificially stamped 1 millisecond *after* a WMS event (`e06`) simply due to network latency, process discovery algorithms will interpret the sequence as strict causality (`WMS Pack $\rightarrow$ ERP Summary`), hiding true concurrency and artificially inflating process complexity and perceived system latency.
+
+### Intended Orders for Timestamp Ties
+
+*   **e03–e07 at 10:00:**
+    *   *Semantic/Lifecycle Order:* 
+        1. `e03` / `e04` (Item I1 Pick - WMS/Scanner)
+        2. `e05` (Item I2 Pick - Scanner)
+        3. `e06` (Pack Package - WMS detailed transaction)
+        4. `e07` (Pack Package - ERP summary event derived from WMS)
+    *   *Rationale:* Detailed physical actions occur first, followed by system-level packing, followed by ERP synchronization summaries.
+
+*   **e08–e10 at 10:15:**
+    *   *Semantic/Lifecycle Order:*
+        1. `e08` (`Dispatch: Warehouse Release` - WMS)
+        2. `e09` (`Dispatch: Carrier Acceptance` - Carrier)
+        3. `e10` (`Handover to Carrier` - Carrier)
+    *   *Rationale:* Warehouse release enables carrier acceptance; physical handover concludes the loading dock sequence.
+
+*   **e11–e16 at 12:00 (Post-Duplicate Decision):**
+    *   *Semantic/Lifecycle Order:*
+        1. `e12` (`Authorize Payment` - PSP M1)
+        2. `e13` (`Capture Payment` - PSP M1)
+        3. `e14` (`Capture Payment` - PSP M2)
+        4. `e11`/`e16` (Merged canonical invoice `V1` - Billing/ERP)
+        5. `e15` (`Payment Summary` - ERP)
+    *   *Rationale:* Payment authorizations and captures must precede invoice issuance confirmation and closing financial summaries.
+
+---
+
+## 4. Conservative cleaning pipeline
+
+The conservative cleaning pipeline minimizes semantic destruction by adhering to the principle of least structural change:
+
+1. **Ingestion & Invariant Preservation:** Load raw OCEL, deep-copy tables, and preserve `timestamp` into `original_timestamp`, `activity` into `original_activity`, and retain all `source` and `source_event_key` attributes.
+2. **Exact Duplicate Removal:** Drop technical duplicates where `source`, `source_event_key`, and `payload_hash` match perfectly.
+3. **Verified Cross-System Merging:** Merge exact physical matches confirmed by external reporting (`e03` and `e04`) into a single canonical event, unioning their payload hashes and retaining WMS location metadata. Merge authoritative invoice records (`e11` and `e16`) into a single canonical event `V1` using source precedence rules.
+4. **Label Refinement (Harmonization Collision Correction):** Rename harmonized labels where semantics collide (e.g., distinguish `Dispatch Package` into `Dispatch: Warehouse Release` for `e08` and `Dispatch: Carrier Acceptance` for `e09`).
+5. **Deterministic Ordering & Indexing:** Apply the semantic-first sorting hierarchy (Domain $\rightarrow$ Lifecycle $\rightarrow$ Source Authority $\rightarrow$ `source_seq` $\rightarrow$ `ingested_at`), then generate index-based timedeltas.
+6. **Expected Retained Event Count:** Starting from 17 raw events (`e01` through `e17`):
+   - Drop exact technical duplicates: 0 (none present in base set).
+   - Merge `e03/e04` $\rightarrow$ 1 event (reduction of 1).
+   - Merge `e11/e16` $\rightarrow$ 1 event (reduction of 1).
+   - **Final Retained Event Count:** $17 - 2 = 15$ events.
+
+---
+
+## 5. Aggressive alternatives
+
+### Scenario A: Evidence-Based Semantic Merging
+*   **Mechanism:** Aggressively collapses all events sharing identical second-level timestamps and overlapping object identifiers into single composite events, assuming temporal proximity implies a single business transaction.
+*   **Expected Retained Event Count:** ~9 events (collapsing logistics clusters at 10:00 and 10:15, and financial clusters at 12:00).
+*   **Most Likely Semantic Damage:** Erases granularity between warehouse picking (`e03`/`e05`) and packing (`e06`), merges distinct carrier handover steps (`e09`/`e10`), and wipes out partial payment tracking.
+
+### Scenario B: Mechanically Aggressive PM4Py Merging (`ocel_merge_duplicates`)
+*   **Mechanism:** Applies library-level duplicate merging functions configured solely on matching timestamps and activity labels, ignoring object context and source authority.
+*   **Expected Retained Event Count:** ~7 events.
+*   **Most Likely Semantic Damage:** Catastrophic collapse of distinct payments (`e13` and `e14`), destruction of hierarchical abstraction levels (`e06` vs `e07`), and creation of false process loops by treating concurrent item picks (`e03`/`e05`) as duplicate records.
+
+### Why `have_common_object=True` Fails for e13 and e14
+Events `e13` (`Capture Payment` for `M1`) and `e14` (`Capture Payment` for `M2`) both share Order `O1` and Invoice `V1`. A naive algorithm evaluating `have_common_object=True` and identical timestamps (`12:00:00`) will classify `e13` and `e14` as duplicates and merge them. This destroys financial accuracy by collapsing two distinct partial payment transactions (`M1` and `M2`) into a single payment event, understating cash collection by 50% and violating basic accounting integrity.
+
+---
+
+## 6. PM4Py-oriented Python implementation
+
+```python
+import copy
+import pandas as pd
+import pm4py
+
+# Assumes ocel_raw is loaded and contains an events DataFrame and object relations.
+# Ensure deep copy for the conservative pipeline scenario
+ocel_cons = copy.deepcopy(ocel_raw)
+events = ocel_cons.get_extended_table() if hasattr(ocel_cons, 'get_extended_table') else ocel_cons['events'].copy()
+
+# 1. Preserve original invariant columns
+events['original_timestamp'] = events['timestamp']
+events['original_activity'] = events['activity']
+
+# 2. Pre-check candidate duplicate groups
+print("--- Pre-check: Candidate Duplicate Groups ---")
+dup_groups = events.groupby(['timestamp', 'activity']).size().reset_index(name='count')
+print(dup_groups[dup_groups['count'] > 1])
+
+# 3. Handle exact technical duplicates via pm4py.ocel_drop_duplicates
+# (Demonstrated on technical key collisions if any exist)
+ocel_cons_cleaned = pm4py.ocel_drop_duplicates(ocel_cons)
+
+# 4. Custom verified-pair merge for e03/e04 (WMS scan & Scanner) and e11/e16 (Invoice ERP/Billing)
+def merge_verified_pair(ev_df, id1, id2, canonical_id, new_activity=None):
+    row1 = ev_df[ev_df['eid'] == id1].iloc[0]
+    row2 = ev_df[ev_df['eid'] == id2].iloc[0]
+    
+    # Merge payloads and sources into provenance strings
+    merged_payload = f"{row1.get('payload_hash', '')}+{row2.get('payload_hash', '')}"
+    merged_source = f"{row1['source']},{row2['source']}"
+    
+    # Retain row1 as base canonical event
+    ev_df.loc[ev_df['eid'] == id1, 'payload_hash'] = merged_payload
+    ev_df.loc[ev_df['eid'] == id1, 'source'] = merged_source
+    if new_activity:
+        ev_df.loc[ev_df['eid'] == id1, 'activity'] = new_activity
+        
+    # Drop second event
+    ev_df = ev_df[ev_df['eid'] != id2].reset_index(drop=True)
+    return ev_df
+
+events = merge_verified_pair(events, 'e03', 'e04', 'e03')
+events = merge_verified_pair(events, 'e11', 'e16', 'e16', new_activity='Issue Invoice')
+
+# 5. Harmonization collision splitting/renaming
+events.loc[(events['eid'] == 'e08'), 'activity'] = 'Dispatch: Warehouse Release'
+events.loc[(events['eid'] == 'e09'), 'activity'] = 'Dispatch: Carrier Acceptance'
+
+# 6. Aggressive Scenario (Demonstrating ocel_merge_duplicates with explicit warning)
+# WARNING: pm4py.ocel_merge_duplicates without object-type awareness will collapse distinct payments (e13/e14).
+ocel_agg = copy.deepcopy(ocel_raw)
+print("\n[WARNING] Executing pm4py.ocel_merge_duplicates on aggressive scenario. "
+      "This collapses distinct objects (e.g., M1 and M2 payments) and risks semantic corruption.")
+ocel_agg = pm4py.ocel_merge_duplicates(ocel_agg)
+
+# 7. Deterministic Sorting & Ordering
+# Define sorting hierarchy columns: domain priority, source seq, ingested_at
+events['domain_priority'] = events['activity'].map({
+    'Create Order': 1, 'Validate Order': 2, 'Pick Item': 3,
+    'Dispatch: Warehouse Release': 4, 'Dispatch: Carrier Acceptance': 5, 'Handover to Carrier': 6,
+    'Issue Invoice': 7, 'Authorize Payment': 8, 'Capture Payment': 9, 'Confirm Delivery': 10
+}).fillna(5)
+
+# Sort using pm4py-supported sorting utility or pandas equivalent underlying table sort
+events = events.sort_values(
+    by=['timestamp', 'domain_priority', 'source_seq', 'ingested_at'],
+    ascending=[True, True, True, True]
+).reset_index(drop=True)
+
+# Update ocel event table back
+ocel_cons['events'] = events
+
+# 8. Add index-based timedelta after establishing exact total order
+ocel_cons = pm4py.ocel_add_index_based_timedelta(ocel_cons)
+
+# 9. Validate Referential Integrity
+def validate_referential_integrity(ocel_obj):
+    ev_table = ocel_obj.get_extended_table() if hasattr(ocel_obj, 'get_extended_table') else ocel_obj['events']
+    assert not ev_table['eid'].duplicated().any(), "Integrity Error: Duplicate event IDs found!"
+    assert ev_table['timestamp'].notnull().all(), "Integrity Error: Null timestamps found!"
+    print("Referential integrity check passed successfully.")
+
+validate_referential_integrity(ocel_cons)
+```
+
+---
+
+## 7. Sensitivity analysis
+
+| Metric / Artifact | Raw Dataset | Conservative Pipeline | Evidence-Based Merge | Aggressive Library Merge (`ocel_merge_duplicates`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Event Count** | 17 | 15 | 11 | 7 |
+| **E2O Relation Count** | 34 | 32 | 24 | 14 |
+| **Order-Flattened DFG** | Cluttered with parallel duplicate edges (`Pick` $\leftrightarrow$ `Pick`) | Clean, linear flow with parallel item paths (`I1`, `I2`) | Over-collapsed; misses individual pick branches | Completely flat; loses item-level branching |
+| **Item-Flattened DFG** | Shows false loops between WMS and Scanner picks | Accurate sequence (`Pick I1` $\rightarrow$ `Pack`) | Single collapsed pick node | Single pick node; missing item differentiation |
+| **Payment-Flattened DFG** | Shows Auth $\rightarrow$ Capture (M1) and Capture (M2) | Preserves distinct partial payments (`M1`, `M2`) | Preserves `M1`/`M2` via strict object checks | **Catastrophic failure:** Merges `M1` and `M2` into single capture node |
+| **OC-DFG Edges & Frequencies** | Inflated frequency due to technical duplicates | Accurate operational frequencies | Underestimated frequency due to over-merging | Severely distorted edge weights |
+| **ET–OT Weights** | Distorted by ingestion latency noise | Reflects true business duration | Artificially compressed durations | Collapsed to zero for simultaneous events |
+| **OTG Relations** | Contains redundant duplicate links | Clean 1:1 mapping with provenance metadata | Missing links for collapsed events | Fragmented and detached object graphs |
+| **Apparent Rework / Loops** | False loops generated by summary vs. detailed events (`Pack WMS` $\rightarrow$ `Pack ERP`) | Correctly distinguishes abstraction levels (no false loops) | Eliminates abstraction levels | Erases process behavior |
+| **Lifecycle / Performance** | Skewed by timestamp ties and system lag | Robust, deterministic durations | Compressed timeline | Unusable for SLA analytics |
+
+### Six Concrete Edges / Patterns Whose Interpretation Changes
+1. **`Pick Item` $\rightarrow$ `Pick Item` (Scanner vs WMS):** In Raw, appears as immediate rework; in Conservative, merged into a single enriched physical event.
+2. **`Dispatch Package` $\rightarrow$ `Dispatch Package` (WMS Release vs Carrier Accept):** In Raw, appears as a zero-duration loop; in Conservative, correctly split into `Warehouse Release` and `Carrier Acceptance`.
+3. **`Capture Payment` $\rightarrow$ `Capture Payment` (M1 vs M2):** In Aggressive Merge, two distinct partial payments are collapsed into a single payment, masking partial payment collection behavior.
+4. **`Pack Package` (WMS) $\rightarrow$ `Pack Package` (ERP):** In Raw, interpreted as sequential packing actions; in Conservative, recognized as hierarchical detail-to-summary observation.
+5. **`Issue Invoice` (ERP) $\rightarrow$ `Authorize Payment` (PSP):** In Raw, timestamp ties create ambiguous ordering; in Conservative, semantic ordering guarantees authorization precedes invoicing confirmation.
+6. **`Confirm Delivery` (Carrier):** In Aggressive Merge, preceded by collapsed logistics nodes, losing the lead time between carrier handover (`e10`) and final delivery confirmation (`e17`).
+
+---
+
+## 8. Audit trail and reversibility
+
+To guarantee complete auditability and forensic reversibility, every cleaning and transformation step must log metadata into a standardized provenance schema attached to the OCEL event store.
+
+### Provenance Schema Specification
+```json
+{
+  "canonical_eid": "e03",
+  "source_event_keys": ["W-77", "S-901"],
+  "merge_rule": "VERIFIED_PHYSICAL_SCAN_MERGE",
+  "pipeline_version": "v1.4.2",
+  "rule_author": "data_engineer_alpha",
+  "original_activity": "Pick Item",
+  "refined_activity": "Pick Item",
+  "original_timestamps": ["2026-05-18 10:00:00.000000", "2026-05-18 10:00:00.000000"],
+  "adjusted_timestamp": "2026-05-18 10:00:00.000000",
+  "attributes_retained": {
+    "source": "WMS,SCANNER",
+    "payload_hash": "h-pick-i1+h-pick-i1-alt",
+    "location": "Warehouse-Zone-A"
+  },
+  "discarded_conflicts": [],
+  "confidence_score": 0.99,
+  "reason": "Reconciliation report confirms physical scan equivalence between WMS and handheld scanner."
+}
+```
+
+### Reconstructing the Raw View
+Because the pipeline enforces non-destructive transformation rules:
+1. `original_timestamp` and `original_activity` columns preserve raw business properties.
+2. The audit trail ledger stores all original `source_event_key` identifiers and source system tags.
+3. An analyst can unroll merged events (e.g., splitting `e03` back into `W-77` and `S-901`) by querying the `source_event_keys` array in the audit log and instantiating rows from the raw staging table.
+
+---
+
+## 9. Failure modes and safeguards
+
+1. **Collapsing Distinct Partial Payments (`e13` and `e14`):**
+   * *Failure:* Merging payments sharing a timestamp and order object.
+   * *Safeguard:* Enforce object-type inspection (`Payment` instance IDs `M1` vs `M2` must be disjoint before considering event merging).
+2. **Converting Abstraction-Level Updates into False Rework (`e06` and `e07`):**
+   * *Failure:* Treating ERP summary events as duplicate operational events, creating false loops.
+   * *Safeguard:* Maintain source-system hierarchy rules; retain both detailed transaction events and summary synchronization events.
+3. **Ordering by Ingestion Time (`ingested_at`):**
+   * *Failure:* Sorting event streams by technical database ingestion order rather than business logic.
+   * *Safeguard:* Restrict `ingested_at` strictly to a bottom-tier deterministic tie-breaker; prioritize domain logic and `source_seq`.
+4. **Treating Shared Objects as Proof of Duplication:**
+   * *Failure:* Assuming that because two events touch Order `O1`, they are identical.
+   * *Safeguard:* Require multi-attribute matching (`activity`, payload signatures, and distinct entity IDs) rather than object intersection alone.
+5. **Unioning Incompatible E2O Relations:**
+   * *Failure:* Blindly combining object relationships without verifying cardinality constraints.
+   * *Safeguard:* Validate 1:N and N:M object mappings during merge routines.
+6. **Changing Durations Through Synthetic Microseconds:**
+   * *Failure:* Injecting artificial timestamps to force total ordering, corrupting KPI duration metrics.
+   * *Safeguard:* Preserve exact original timestamps; apply stable sorting without altering timestamp values.
+7. **Losing Source-Authoritative Attributes:**
+   * *Failure:* Overwriting ERP financial ledger fields with downstream billing system text, or vice versa.
+   * *Safeguard:* Implement explicit field-level precedence rules (Billing authoritative for amounts, ERP authoritative for posting states).
+8. **Applying Duplicate Functions to the Whole OCEL Without Inspecting Candidate Groups:**
+   * *Failure:* Running library-wide `ocel_merge_duplicates` globally without grouping constraints.
+   * *Safeguard:* Restrict merging operations to pre-validated candidate pairs verified by domain business rules.
