@@ -96,7 +96,6 @@ def execute_script(evaluation_folder, model_name, responses=None):
         target_path = os.path.join(evaluation_folder, resp)
 
         catnum = int(question.split("_")[0].split("cat")[1])
-        is_textual = True if catnum != 7 else False
 
         contents = read_file_with_fallback(target_path)
 
@@ -114,9 +113,7 @@ def execute_script(evaluation_folder, model_name, responses=None):
             numb = max(1.0, 10.0 - diff)
 
         total_score += numb
-
-        if is_textual:
-            score_textual += numb
+        score_textual += numb
 
         if catnum == 1:
             score_c1 += numb

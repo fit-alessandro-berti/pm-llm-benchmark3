@@ -105,7 +105,7 @@ def build_model_results(evaluation_folder):
     return model_results
 
 
-def execute(evaluation_folder, target_file, include_closed_source=True, require_vision=False,
+def execute(evaluation_folder, target_file, include_closed_source=True,
             require_reasoning=False, require_reasoning_custom=False, require_not_reasoning=False,
             leaderboard_title="Overall Leaderboard", reg_expr=None, json_file=None, allowed_models=None,
             model_results=None):
@@ -136,19 +136,18 @@ def execute(evaluation_folder, target_file, include_closed_source=True, require_
             if reg_expr is None or reg_expr.lower() in m.lower():
                 this_json = model_data["scores"]
 
-                if this_json["score_c7"] > 0 or not require_vision:
-                    max_c1 = max(max_c1, this_json["score_c1"])
-                    max_c2 = max(max_c2, this_json["score_c2"])
-                    max_c3 = max(max_c3, this_json["score_c3"])
-                    max_c4 = max(max_c4, this_json["score_c4"])
-                    max_c5 = max(max_c5, this_json["score_c5"])
-                    max_c6 = max(max_c6, this_json["score_c6"])
-                    max_c7 = max(max_c7, this_json["score_c7"])
-                    max_c8 = max(max_c8, this_json["score_c8"])
-                    max_c9 = max(max_c9, this_json["score_c9"])
-                    max_c10 = max(max_c10, this_json["score_c10"])
+                max_c1 = max(max_c1, this_json["score_c1"])
+                max_c2 = max(max_c2, this_json["score_c2"])
+                max_c3 = max(max_c3, this_json["score_c3"])
+                max_c4 = max(max_c4, this_json["score_c4"])
+                max_c5 = max(max_c5, this_json["score_c5"])
+                max_c6 = max(max_c6, this_json["score_c6"])
+                max_c7 = max(max_c7, this_json["score_c7"])
+                max_c8 = max(max_c8, this_json["score_c8"])
+                max_c9 = max(max_c9, this_json["score_c9"])
+                max_c10 = max(max_c10, this_json["score_c10"])
 
-                    all_jsons[m] = this_json
+                all_jsons[m] = this_json
 
     for m, model_data in model_results.items():
         if m not in all_jsons:
@@ -211,9 +210,9 @@ def execute(evaluation_folder, target_file, include_closed_source=True, require_
         formatted_scores = result["formatted_scores"]
         entry = {"Model": display_model_name, "Score": "**%.1f**" % (result["score_textual"]),
                  "OS": format_is_open_source(result["model"]), "LRM": format_is_lrm(result["model"]),
-                 "C1": formatted_scores[0], "C2": formatted_scores[1], "C3": formatted_scores[2],
-                 "C4": formatted_scores[3], "C5": formatted_scores[4], "C6": formatted_scores[5],
-                 "C8": formatted_scores[7], "C7": formatted_scores[6]}
+                 "CCR": formatted_scores[0], "SQT": formatted_scores[1], "OCR": formatted_scores[2],
+                 "FMS": formatted_scores[3], "MCA": formatted_scores[4], "PPM": formatted_scores[5],
+                 "ORF": formatted_scores[6], "RPR": formatted_scores[7]}
         overall_table.append(entry)
         leaderboard_stats.append({**entry, "Model": result["model"]})
 
@@ -221,10 +220,10 @@ def execute(evaluation_folder, target_file, include_closed_source=True, require_
         with open(json_file, "w") as handler:
             json.dump(leaderboard_stats, handler)
 
-    headers = ["Model", "Score", "OS", "LRM", "PCo", "CC", "PMo", "PQ", "HG", "FA", "OPT", ":nerd_face: VI"]
+    headers = ["Model", "Score", "OS", "LRM", "CCR", "SQT", "OCR", "FMS", "MCA", "PPM", "ORF", "RPR"]
     rows = [
-        [entry["Model"], entry["Score"], entry["OS"], entry["LRM"], entry["C1"], entry["C2"], entry["C3"],
-         entry["C4"], entry["C5"], entry["C6"], entry["C8"], entry["C7"]]
+        [entry["Model"], entry["Score"], entry["OS"], entry["LRM"], entry["CCR"], entry["SQT"], entry["OCR"],
+         entry["FMS"], entry["MCA"], entry["PPM"], entry["ORF"], entry["RPR"]]
         for entry in overall_table
     ]
     overall_table_markdown = render_markdown_table(headers, rows)
@@ -265,21 +264,20 @@ def write_evaluation(base_path, extra=True):
         evaluation_folder,
         os.path.join(base_path, "leaderboard_" + get_suffix_name(e_m_name) + ".md"),
         include_closed_source=True,
-        require_vision=False,
         leaderboard_title="Overall Leaderboard",
         model_results=model_results,
     )
 
     if True and (extra and "grok-4.5" in e_m_name):
         execute(evaluation_folder, os.path.join(base_path, "leaderboard_lrms_cot_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=True,
-                require_vision=False, require_reasoning=True, require_reasoning_custom=True, leaderboard_title="Large Reasoning Models Leaderboard (Models with CoT)", model_results=model_results)
+                require_reasoning=True, require_reasoning_custom=True, leaderboard_title="Large Reasoning Models Leaderboard (Models with CoT)", model_results=model_results)
         execute(evaluation_folder, os.path.join(base_path, "leaderboard_nolrms_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=True,
-                require_vision=False, require_not_reasoning=True, leaderboard_title="Base LLMs Leaderboard", model_results=model_results)
+                require_not_reasoning=True, leaderboard_title="Base LLMs Leaderboard", model_results=model_results)
         execute(evaluation_folder, os.path.join(base_path, "leaderboard_os_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=False,
-                require_vision=False, leaderboard_title="Open-Source Leaderboard", model_results=model_results)
+                leaderboard_title="Open-Source Leaderboard", model_results=model_results)
         execute(evaluation_folder, os.path.join(base_path, "leaderboard_os_nolrms_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=False,
-                require_vision=False, require_not_reasoning=True, leaderboard_title="Base Open-Source LLMs Leaderboard", model_results=model_results)
-        execute(evaluation_folder, os.path.join(base_path, "leaderboard_QWEN_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=True, require_vision=False,
+                require_not_reasoning=True, leaderboard_title="Base Open-Source LLMs Leaderboard", model_results=model_results)
+        execute(evaluation_folder, os.path.join(base_path, "leaderboard_QWEN_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=True,
                 leaderboard_title="QWEN Leaderboard", reg_expr="qwen", model_results=model_results)
 
 
