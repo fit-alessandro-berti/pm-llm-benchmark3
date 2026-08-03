@@ -1,0 +1,108 @@
+## 1. Target definition
+Primary target: binary indicator of 90-day default after Account Activated, conditional on the case reaching activation. Prediction time is the first event after Credit Review (or the 3rd event, whichever occurs later). Horizon is exactly 90 days post-activation. Unit of analysis is the application case. Population is all applications started on or before 31 August 2025 whose activation (if any) occurs by 15 November 2025, ensuring the 90-day window plus feed delay can mature by the 15 February 2026 extraction. Estimand is the conditional probability P(default_90d = 1 | activation occurs, observed prefix).  
+
+Alternative target: cause-specific cumulative incidence of default versus the competing events “rejected”, “withdrawn”, or “transferred” within 180 days of start, treating activation as an intermediate state. This answers a different policy question about the full intake funnel rather than post-activation credit risk.
+
+## 2. Cohort construction
+Inclusion: cases with start timestamp  31 August 2025.  
+Exclusion: cases whose first event occurs after the 1 July 2025 policy change until sufficient post-change volume exists for a separate stratum; cases with duplicate events created by the October 2025 migration that cannot be deduplicated by timestamp and activity.  
+As-of rule: all features and the decision to predict are frozen at the chosen prediction time; labels are observed only if activation occurs by 15 November 2025 and the outcome feed has arrived by extraction.
+
+Cohort-flow table (48 000 total starts):
+- Reached activation by 15 Nov 2025 and label matured: 21 600 (18 900 non-default, 2 700 default)
+- Activated after 15 Nov 2025 or label feed still pending: 3 600 (right-censored)
+- Rejected: 9 100 (competing terminal state)
+- Withdrawn: 5 700 (competing terminal state)
+- Transferred (no reappearance link): 1 160 (missing follow-up)
+- Transferred with link to new identifier: 1 740 (handled via linkage or competing-risk indicator)
+- Still open at extraction: 5 100 (right-censored, no terminal event)
+- Total: 48 000
+
+## 3. Censoring and missing-label strategy
+Ordinary right censoring applies to cases still open or activated too late for the 90-day window to mature. Delayed labels are handled by requiring label_available_at  extraction date. Selection through activation is modeled explicitly via inverse-probability-of-activation weights or a joint activation–default model. Transfers are treated as a competing event when linkage is absent; linked transfers inherit the downstream label when available. Permanently missing feeds (partner-originated) are flagged by source_system and handled by a missing-at-random sensitivity weight.
+
+Primary analysis: cause-specific Cox or Fine–Gray model on the activated subpopulation with activation-selection weights. Sensitivity: (a) complete-case analysis restricted to cases with observed feed, (b) multiple imputation of missing feeds under MAR given channel and region. Activation selection and transfer missingness mechanisms are only partially testable (via observed covariates); the assumption that rejected cases have zero default risk under activation is fundamentally untestable.
+
+## 4. Prefix extraction
+Generate prefixes up to the chosen prediction time using only events whose timestamp  prediction time. Fixed-length prefixes of length 3 (or the first event after Credit Review) are extracted with `pm4py.get_prefixes_from_log`. Time-based prefixes stop at 14 elapsed days. Short cases (<3 events) receive a special “short” token. Repeated document-request loops are collapsed by counting rework cycles but retaining only events up to the prediction cut. Activity-renaming artifacts from the October 2025 migration are normalized by a mapping table before prefix extraction; duplicate events with identical timestamp and activity are dropped.
+
+## 5. Process-aware features
+Static: case:channel, case:region, case:requested_amount (at start).  
+Prefix-derived: number of document requests (rework count), elapsed time from start to prediction point, DFG path frequency up to prefix, last observed risk_score.  
+Queue/resource: count of cases handled by same org:resource in prior 7 days (requires historical reference table built before prediction time).  
+Calendar/cohort: month of start, indicator for post-1 July 2025 policy regime, weekday of prediction event.  
+All features are computed only from events and attributes known at or before the prefix cut-off.
+
+## 6. Leakage audit
+
+| Feature or data element | Leakage or bias risk | Valid availability rule | Keep/repair/drop | Rationale |
+|-------------------------|----------------------|-------------------------|------------------|-----------|
+| final_limit | Post-decision information | Available only at Accept/Reject | Drop | Reveals final credit decision |
+| decision_reason | Post-decision | At or after Accept/Reject | Drop | Not known at early prefix |
+| collection_status | Post-activation | Updated only after activation | Drop | Directly reveals outcome |
+| future events (Contract Signed, etc.) | Look-ahead | Timestamp > prediction time | Drop | Violates as-of rule |
+| documents_total | Same-day late uploads | Use value at midnight before prediction day | Repair | Snapshot may include later uploads |
+| updated risk_score | May be refreshed after prediction | Use value at last event  prediction time | Keep | Only prefix value |
+| resource experience | Recorded at extraction | Join historical experience table at event time | Repair | Use time-varying experience |
+| label_available_at | Directly encodes outcome timing | Use only for censoring construction | Drop from features | Never used as predictor |
+
+## 7. Validation design
+Primary split: cases with start timestamp in [2024-01-01, 2025-03-31] for training, [2025-04-01, 2025-06-30] for validation (pre-policy), and [2025-07-01, 2025-08-31] for test (post-policy). This respects both the July 2025 policy change and the October 2025 migration. Label maturity is enforced by requiring activation  15 Nov 2025. Calibration is assessed with time-dependent Brier score and cumulative/dynamic AUC; subgroup performance is reported by channel and region. Distribution shift is monitored via population stability index on risk_score and requested_amount. A random case split is misleading because it mixes pre- and post-policy regimes and leaks future information across the migration boundary.
+
+## 8. Limitations and decision-use boundary
+The study estimates default risk conditional on observed activation under the historical policy; it does not estimate counterfactual default risk had rejected cases been activated. Predictive associations may be confounded by selection into activation. Deployment could change the data-generating process by (1) altering acceptance thresholds and therefore the activation-selection mechanism, (2) changing applicant behavior once an early-warning score is visible, and (3) modifying resource allocation that affects both prefix features and downstream outcomes. The model cannot be used to impute default risk for never-activated cases without additional strong assumptions.
+
+## 9. PM4Py-oriented Python implementation skeleton
+```python
+import pandas as pd
+import pm4py
+from pm4py.objects.log.importer.csv import importer as csv_importer
+from pm4py.algo.filtering.log.timestamp import filter_on_timestamp
+from datetime import datetime
+
+df = pd.read_csv("applications_events.csv", parse_dates=["time:timestamp", "label_available_at", "data_extract_time"])
+df = pm4py.format_dataframe(df, case_id="case:concept:name", activity_key="concept:name", timestamp_key="time:timestamp")
+
+# Normalize migration-renamed activities
+rename_map = {"Credit Review v2": "Credit Review"}
+df["concept:name"] = df["concept:name"].replace(rename_map)
+
+# Build case-level maturity table (as-of 15 Feb 2026)
+cutoff = datetime(2025, 8, 31)
+activation_cutoff = datetime(2025, 11, 15)
+cases = df.groupby("case:concept:name").agg(
+    start=("time:timestamp", "min"),
+    has_activation=("concept:name", lambda x: "Account Activated" in x.values),
+    activation_time=("time:timestamp", lambda x: x[df.loc[x.index, "concept:name"] == "Account Activated"].min() if "Account Activated" in x.values else pd.NaT)
+).reset_index()
+cases["mature"] = cases["activation_time"].notna() & (cases["activation_time"] <= activation_cutoff)
+cases["label_ready"] = cases["case:concept:name"].map(df.set_index("case:concept:name")["label_available_at"].max()) <= datetime(2026, 2, 15)
+
+# Temporal split
+train_cases = cases[(cases["start"] >= "2024-01-01") & (cases["start"] <= "2025-03-31")]["case:concept:name"]
+test_cases = cases[(cases["start"] >= "2025-07-01") & (cases["start"] <= "2025-08-31")]["case:concept:name"]
+
+log = pm4py.convert_to_event_log(df)
+train_log = pm4py.filter_log_on_case_id(log, train_cases.tolist())
+test_log = pm4py.filter_log_on_case_id(log, test_cases.tolist())
+
+# Fixed-length prefixes (length 3) up to prediction point
+prefixes = pm4py.get_prefixes_from_log(train_log, k=3)
+
+# Leakage guard: drop any column whose timestamp > prefix end
+def safe_prefix_features(prefix_log):
+    # would compute only columns known at prefix end here
+    return pm4py.extract_temporal_features_dataframe(prefix_log)
+
+# Cohort counts
+print("Total started:", len(cases))
+print("Activated & matured:", cases["mature"].sum())
+print("Rejected/Withdrawn/Open/Transferred:", len(cases) - cases["mature"].sum())
+
+# DFG for process-aware features (pre-prediction only)
+dfg, start, end = pm4py.discover_dfg(train_log)
+print("DFG edges available at training time:", len(dfg))
+
+# Example: insert waiting time feature (justified before prediction)
+train_log = pm4py.insert_case_service_waiting_time(train_log)
+```

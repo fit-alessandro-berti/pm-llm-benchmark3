@@ -1,0 +1,98 @@
+## 1. Duplicate-handling decision tree
+Start with exact technical duplicate check (identical eid, timestamp, activity, payload_hash, source_event_key). Terminal: drop.  
+Next branch: same physical event observed by multiple systems (reconciliation report or shared source objects plus documented enrichment). Terminal: merge attributes and relations.  
+Next branch: summary event derived from a detailed event (ERP status update generated from WMS message). Terminal: retain both with refined labels or qualifiers.  
+Next branch: harmonization collision between semantically distinct source activities (carrier acceptance vs warehouse release). Terminal: retain both with refined labels or qualifiers.  
+Next branch: concurrent same-label events involving different objects (distinct Items or Payments). Terminal: retain both unchanged.  
+Final unresolved candidate branch (no reconciliation report, no object differentiation, conflicting authoritative attributes). Terminal: quarantine for review.
+
+## 2. Event-by-event decisions
+
+Event(s) | Candidate relationship | Decision | Confidence | Preserved canonical eid | Attribute merge policy | Relation merge policy | Provenance retained | Main risk
+---|---|---|---|---|---|---|---|---
+e03/e04 | same physical event | merge attributes and relations | high | e03 | WMS location added to e03; scanner hash kept as alt | union I1,P1,O1 | both source_event_key, payload_hash | loss of scanner-specific enrichment detail
+e03/e05 | concurrent same-label distinct objects | retain both unchanged | high | e03,e05 | none | none | both | none
+e06/e07 | summary derived from detailed | retain both with refined labels | medium | e06,e07 | none | none | both | treating packing and status update as rework
+e08/e09 | harmonization collision | retain both with refined labels | high | e08,e09 | activity refined to “Release from Warehouse” / “Carrier Acceptance” | union O1,P1,D1 | both | misinterpretation of dispatch semantics
+e09/e10 | lifecycle constraint on shared objects | retain both unchanged | high | e09,e10 | none | none | both | none
+e11/e16 | same invoice issuance | merge attributes and relations | high | e11 | billing attributes added to e11 | union O1,V1 | both | loss of billing-system authoritative fields
+e13/e14 | concurrent distinct Payments | retain both unchanged | high | e13,e14 | none | none | both | none
+e13/e15 | summary derived from messages | retain both with refined labels | medium | e13,e15 | none | none | both | ERP summary read as duplicate capture
+e14/e15 | concurrent distinct Payments vs summary | retain both unchanged | high | e14,e15 | none | none | both | none
+
+## 3. Timestamp-tie ordering rules
+Domain constraints (e12 before e13 for M1; e09 before e10) are semantic. Within-source sequence (source_seq) is semantic inside one system. Lifecycle constraints on shared objects (invoice before payment) are semantic. Source-specific semantics (WMS detailed before ERP summary) are semantic. Ingestion time and stable fallback (eid lexical) are deterministic only.  
+
+Adding microseconds before deciding semantic order can encode a false story because the added delta implies a measurable duration that never existed in any source record; subsequent performance analysis would treat the artificial gap as business latency.  
+
+Intended order at 10:00: e03 (merged), e05, e06, e07.  
+Intended order at 10:15: e08, e09, e10.  
+Intended order at 12:00: e11 (merged), e12, e13, e14, e15, e16.
+
+## 4. Conservative cleaning pipeline
+Remove only pairs with explicit reconciliation evidence (e03/e04, e11/e16). Merge attributes from the secondary source into the canonical eid while keeping every original timestamp, activity label, source, and source_event_key in provenance columns. Refine activity labels only for documented harmonization collisions (e08/e09). Retain all other events unchanged, including abstraction-level summaries. Introduce deterministic ordering via a stable composite key (timestamp, source_seq, eid) after semantic constraints are satisfied. No event is dropped solely because timestamps coincide. Expected retained event count: 15.
+
+## 5. Aggressive alternatives
+Evidence-based semantic merging additionally collapses e06/e07 and e13/e15 after verifying derivation paths, yielding 13 events; risk is loss of abstraction-level visibility that later analyses may need for ERP-side balance checks.  
+
+Mechanically aggressive PM4Py merging applies library duplicate functions across all rows sharing activity and timestamp without per-group inspection, yielding 11 events; risk is erroneous collapse of e13/e14 into one payment despite distinct M1/M2 objects. `have_common_object=True` fails to protect them because both share O1 and V1; only the separate Payment objects differentiate the events, which the flag does not examine.
+
+## 6. PM4Py-oriented Python implementation
+```python
+import copy
+import pandas as pd
+import pm4py
+from pm4py.objects.ocel.obj import OCEL
+
+def verified_pair_merge(ocel, pairs):
+    # pairs: list of (canonical_eid, secondary_eid, attr_map, rel_union)
+    df = ocel.events.copy()
+    e2o = ocel.relations.copy()
+    for can, sec, attr_map, rels in pairs:
+        for col, val in attr_map.items():
+            df.loc[df['eid'] == can, col] = val
+        df.loc[df['eid'] == can, 'provenance'] = df.loc[df['eid'] == can, 'provenance'].astype(str) + '|' + sec
+        e2o = pd.concat([e2o, e2o[e2o['eid'] == sec].assign(eid=can)], ignore_index=True)
+        df = df[df['eid'] != sec]
+        e2o = e2o[e2o['eid'] != sec]
+    return OCEL(events=df, relations=e2o, objects=ocel.objects)
+
+ocel_raw = copy.deepcopy(ocel_raw)  # never mutate input
+# pre-check
+candidates = ocel_raw.events.groupby(['timestamp', 'activity']).filter(lambda x: len(x) > 1)
+print("Candidate groups:", candidates['eid'].tolist())
+
+# conservative scenario
+ocel_cons = copy.deepcopy(ocel_raw)
+ocel_cons = verified_pair_merge(ocel_cons, [
+    ('e03', 'e04', {'location': 'WMS_loc'}, ['O1','I1','P1']),
+    ('e11', 'e16', {'billing_attr': 'B9'}, ['O1','V1'])
+])
+
+# aggressive library scenario (with warning)
+ocel_aggr = copy.deepcopy(ocel_raw)
+print("WARNING: ocel_merge_duplicates may collapse distinct payments")
+ocel_aggr = pm4py.ocel_merge_duplicates(ocel_aggr, criteria=['timestamp','activity'])
+ocel_aggr = pm4py.ocel_drop_duplicates(ocel_aggr)
+
+ocel_cons = pm4py.ocel_sort_by_additional_column(ocel_cons, 'source_seq')
+ocel_cons = pm4py.ocel_add_index_based_timedelta(ocel_cons, timedelta=0.000001)  # after order established
+pm4py.ocel_validate_referential_integrity(ocel_cons)
+```
+
+## 7. Sensitivity analysis
+Raw (17 events, 42 E2O): Order-flattened DFG shows one Dispatch edge; Item-flattened DFG shows two concurrent Pick edges; Payment-flattened DFG shows two Capture edges. OC-DFG contains 28 edges. ET–OT weights treat every source equally. OTG relations are complete. Apparent rework is zero. Lifecycle durations are zero at tied timestamps.
+
+Conservative (15 events, 40 E2O): removes two exact duplicates; Order DFG gains one refined “Carrier Acceptance” edge; Item DFG unchanged; Payment DFG retains two Capture edges. OC-DFG edges drop by two. ET–OT weights shift slightly toward WMS. No new loops. Performance measurements remain zero at merged timestamps.
+
+Evidence-based merge (13 events, 37 E2O): collapses summaries; Order DFG merges Pack and status; Payment DFG collapses one Capture–ERP pair. OC-DFG loses four edges. Apparent rework appears on Invoice. Lifecycle shows artificial 1-second gaps.
+
+Aggressive library merge (11 events, 32 E2O): collapses e13/e14; Payment DFG shows single Capture; Order DFG loses concurrency. OC-DFG edges fall to 19. ET–OT weights distort toward ERP. OTG relations become incomplete. Apparent rework loops on Payment; performance measurements report false 3-second capture duration.
+
+Concrete edges whose interpretation changes: PickPack (Item view), ReleaseCarrier Acceptance, InvoiceAuthorize Payment, Capture Payment (M1)Capture Payment (M2), ERP summaryPayment, DispatchHandover.
+
+## 8. Audit trail and reversibility
+Provenance schema columns: canonical_eid, source_eids (list), merge_rule (enum), rule_version, reviewer, original_activity, refined_activity, original_timestamp, adjusted_timestamp (microseconds only after semantic order), attributes_retained (dict per source), discarded_conflicts (list), confidence (0–1), reason. Every transformation writes a new row; raw view is reconstructed by selecting only rows whose merge_rule is null and restoring original columns.
+
+## 9. Failure modes and safeguards
+Collapsing distinct partial payments (e13/e14) when only common objects are checked; safeguard: require Payment object differentiation before any merge. Converting abstraction-level updates into false rework by treating e07 as duplicate of e06; safeguard: retain summaries unless derivation report exists. Ordering by ingestion time places e07 before e06; safeguard: never use ingested_at as primary key. Treating shared objects as proof of duplication merges e13/e14 despite different Payments; safeguard: object-type cardinality check. Unioning incompatible E2O relations adds I2 to e06; safeguard: per-event object-type whitelist. Changing durations through synthetic microseconds creates false 2 ms Pack–Dispatch gap; safeguard: apply timedelta only after semantic order is frozen. Losing source-authoritative attributes drops billing fields from e16; safeguard: mandatory attribute provenance dict. Applying duplicate functions to the whole OCEL without inspecting candidate groups silently removes e05; safeguard: mandatory pre-check that prints every candidate group before any library call.
