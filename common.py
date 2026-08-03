@@ -638,25 +638,11 @@ def get_llm_specific_settings() -> Dict[str, Any]:
 
 
 def dump_payload(payload, target_file):
-    if "answers" in target_file:
-        target_file = target_file.replace("answers", "json_payload")
-        # print(target_file)
-
-        try:
-            json.dump(payload, open(target_file, "w"), indent=2)
-        except:
-            print("payload dumping failed")
+    return
 
 
 def dump_response(response, target_file):
-    if "answers" in target_file:
-        target_file = target_file.replace("answers", "json_resp")
-        # print(target_file)
-
-        try:
-            json.dump(response, open(target_file, "w"), indent=2)
-        except:
-            print("response dumping failed")
+    return
 
 
 def query_text_simple_openai_new(question, api_url, target_file):
