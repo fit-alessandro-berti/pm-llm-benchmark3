@@ -1,0 +1,356 @@
+## 1. Equivalence design space
+
+### Activity-sequence equivalence
+
+For execution \(X\), let \(A(X)\) be the timestamp-ordered word of activity labels, retaining repetitions but discarding all objects and attributes. Define
+
+\[
+X \equiv_A Y \iff A(X)=A(Y).
+\]
+
+For example, X1 and X5 are equivalent because both have  
+`Create, Add, Add, Pack, Dispatch, Issue Invoice, Record Payment`.
+
+**Preserved:** activity labels, their order, and repetition counts.  
+**Discarded:** object identifiers and types, E2O incidence, O2O relations, externality, package/delivery/payment multiplicity except where it creates repeated events, and qualifiers.
+
+This is reflexive, symmetric, and transitive because it is equality of canonical words.
+
+For equal timestamps, I would represent each timestamp as a multiset block of activity labels. Blocks are ordered by timestamp, while activities within a block are unordered. Thus arbitrary database row order does not affect equivalence.
+
+### Typed structural equivalence under identifier renaming
+
+Represent an execution as a colored relational graph:
+
+- event nodes colored by activity;
+- object nodes colored by `(object type, local/external flag)`;
+- E2O edges, including roles or qualifiers when supplied;
+- directed, qualified O2O edges;
+- an event-order relation.
+
+Then
+
+\[
+X \equiv_T Y
+\]
+
+when there is a bijection between their event and object nodes that preserves node colors, E2O and O2O edges, qualifiers, and event order. Object identifiers themselves are not colors. The lead Order must map to the lead Order.
+
+**Preserved:** exact numbers of typed objects and events, repeated activities, E2O topology, O2O topology and qualifiers, external-object status, and temporal ordering.  
+**Discarded:** local identifier spelling, absolute timestamps, and unspecified business attributes such as monetary amounts.
+
+It is reflexive, symmetric, and transitive because colored relational-structure isomorphism is an equivalence relation.
+
+For same-time events, order is represented as a partial order: strict precedence is required only when timestamps differ. Isomorphism may permute concurrent event nodes if their incidence permits it.
+
+### Preferred business-semantic equivalence
+
+I use equality of the following feature signature:
+
+\[
+S(X)=(n_I,\ scope,\ exception,\ n_D,\ n_V,\ settlement)
+\]
+
+where:
+
+- \(n_I\): number of local items;
+- `scope`: `NONE`, `LOG_SHARED`, `FIN_SHARED`, or `BOTH`, depending on whether external objects participate in Pack/Dispatch or Invoice/Payment;
+- `exception`: `NONE`, `PRE_DISPATCH_SUBSTITUTION`, or `RETURN_REPACK`;
+- \(n_D\): number of distinct deliveries;
+- \(n_V\): number of invoices;
+- `settlement`: `SINGLE`, `MULTI`, or `UNSETTLED`, based on payment multiplicity and settlement qualifiers.
+
+Package multiplicity is deliberately discarded when all packages are consolidated into the same delivery without an exception. Consequently, X1 and X3 are equivalent here even though they are not structurally equivalent.
+
+**Preserved:** demand size, cross-order sharing domain, important exception motifs, delivery multiplicity, invoice multiplicity, and settlement pattern.  
+**Discarded:** identifiers, exact package count in consolidated delivery, harmless ordering among independent activities, and low-level topology not affecting these features.
+
+This is reflexive, symmetric, and transitive because it is equality of deterministic signatures. Concurrency matters only for lifecycle motifs. A return must strictly precede a repack to establish `RETURN_REPACK`; a same-time ambiguity would receive a separate `AMBIGUOUS_RETURN` value rather than be resolved by row order.
+
+## 2. Canonical signatures
+
+The following Python-like scheme computes the preferred signature. Events contain an activity, timestamp, and typed object map; O2O rows contain endpoints and a qualifier.
+
+```python
+from collections import defaultdict
+
+LOG_ACTS = {"Pack Package", "Dispatch"}
+FIN_ACTS = {"Issue Invoice", "Record Payment"}
+
+def is_external(oid):
+    return str(oid).startswith("EXT")
+
+def objects_of_type(execution, object_type, local_only=False):
+    result = set()
+    for e in execution.events:
+        for oid in e.objects.get(object_type, []):
+            if not local_only or not is_external(oid):
+                result.add(oid)
+    for r in execution.o2o:
+        for oid, typ in [(r.source, r.source_type),
+                         (r.target, r.target_type)]:
+            if typ == object_type and (not local_only or not is_external(oid)):
+                result.add(oid)
+    return result
+
+def has_external_participant(execution, activities):
+    for e in execution.events:
+        if e.activity in activities:
+            for ids in e.objects.values():
+                if any(is_external(oid) for oid in ids):
+                    return True
+    return False
+
+def preferred_signature(execution):
+    events = sorted(
+        execution.events,
+        key=lambda e: (e.timestamp, e.activity, e.event_id)
+    )
+
+    n_items = len(objects_of_type(execution, "Item", local_only=True))
+    n_deliveries = len(objects_of_type(execution, "Delivery",
+                                       local_only=True))
+    n_invoices = len(objects_of_type(execution, "Invoice",
+                                     local_only=True))
+    n_payments = len(objects_of_type(execution, "Payment",
+                                     local_only=True))
+
+    log_shared = has_external_participant(execution, LOG_ACTS)
+    fin_shared = has_external_participant(execution, FIN_ACTS)
+    scope = {
+        (False, False): "NONE",
+        (True, False): "LOG_SHARED",
+        (False, True): "FIN_SHARED",
+        (True, True): "BOTH",
+    }[(log_shared, fin_shared)]
+
+    qualifiers = {
+        (r.qualifier or "").lower().replace(" ", "_")
+        for r in execution.o2o
+    }
+    activities = [e.activity for e in events]
+
+    has_return = (
+        "Return Item" in activities or
+        "Inspect Return" in activities
+    )
+    has_repack = False
+    if has_return:
+        return_times = [
+            e.timestamp for e in events
+            if e.activity in {"Return Item", "Inspect Return"}
+        ]
+        has_repack = any(
+            e.activity == "Pack Package" and
+            e.timestamp > min(return_times)
+            for e in events
+        )
+
+    if has_return and has_repack:
+        exception = "RETURN_REPACK"
+    elif (
+        "removed_before_dispatch" in qualifiers or
+        "replaces" in qualifiers or
+        "replacement" in qualifiers
+    ):
+        exception = "PRE_DISPATCH_SUBSTITUTION"
+    else:
+        exception = "NONE"
+
+    if n_payments == 0:
+        settlement = "UNSETTLED"
+    elif (
+        n_payments > 1 or
+        "partially_settles" in qualifiers or
+        "partial_settlement" in qualifiers
+    ):
+        settlement = "MULTI"
+    else:
+        settlement = "SINGLE"
+
+    return (
+        n_items,
+        scope,
+        exception,
+        n_deliveries,
+        n_invoices,
+        settlement,
+    )
+```
+
+Identifiers influence only the external flag and set cardinalities. Renaming all local identifiers therefore leaves the signature unchanged.
+
+## 3. Cluster assignments
+
+| Execution | Activity-sequence cluster | Typed-structural cluster | Preferred semantic cluster | Defining signature | Main reason |
+|---|---|---|---|---|---|
+| X1 | A1 | T1 | S-STP | `(2,NONE,NONE,1,1,SINGLE)` | Isolated straight-through fulfillment |
+| X2 | A1 | T1 | S-STP | `(2,NONE,NONE,1,1,SINGLE)` | X1 after identifier renaming |
+| X3 | A2 | T2 | S-STP | `(2,NONE,NONE,1,1,SINGLE)` | Two packages but one consolidated delivery |
+| X4 | A3 | T3 | S-SPLIT | `(2,NONE,NONE,2,1,MULTI)` | Split deliveries and staged settlement |
+| X5 | A1 | T4 | S-LOG-SHARED | `(2,LOG_SHARED,NONE,1,1,SINGLE)` | Package and delivery serve another order |
+| X6 | A1 | T5 | S-FIN-SHARED | `(2,FIN_SHARED,NONE,1,1,SINGLE)` | Shared invoice and unallocated payment |
+| X7 | A1 | T6 | S-SUBSTITUTE | `(2,NONE,PRE_SUBSTITUTION,1,1,SINGLE)` | Removal/replacement before dispatch |
+| X8 | A4 | T7 | S-RETURN | `(2,NONE,RETURN_REPACK,2,1,SINGLE)` | Return, inspection, repack, and redispatch |
+
+## 4. Cluster interpretations
+
+### S-STP — X1, X2, X3
+
+**Signature:** two local items, no sharing or exception, one delivery, one invoice, one settlement.
+
+This is straight-through fulfillment. X3 allows internal package splitting because the packages are consolidated into one customer-facing delivery. It offers a benchmark for cycle time and automation, although package-count variation may still matter for warehouse cost.
+
+An Order-flattened trace cannot explain whether one or two packages contributed to the delivery; an Item flattening duplicates the common dispatch and invoice. The cluster is reasonably stable under package-link repairs because package count is intentionally ignored, but not under repairs that split the delivery.
+
+### S-SPLIT — X4
+
+**Signature:** two deliveries and multiple payments, without return or sharing.
+
+The order is fulfilled and settled in stages. Risks include duplicated freight, customer confusion, open-balance errors, and delayed completion; an opportunity is coordinated consolidation.
+
+Order flattening records repeated Pack, Dispatch, and Payment events but poorly represents which package belongs to which delivery and how payments settle one invoice. Stability is moderate: merging duplicate payments or deliveries can change the cluster.
+
+### S-LOG-SHARED — X5
+
+**Signature:** straight-through locally, but an external order/item shares logistics.
+
+This is cross-order consolidation. It can reduce transport cost but creates allocation, custody, privacy, and order-isolation risks.
+
+Order-case flattening either duplicates the shared package and dispatch across cases or assigns them to only one order. Stability depends strongly on scope repair: if the external links are valid it is stable; if `EXT-IA` is a linkage error, X5 becomes S-STP.
+
+### S-FIN-SHARED — X6
+
+**Signature:** shared invoice/payment, isolated logistics.
+
+The financial document spans multiple orders and the payment lacks an order-level allocation. This creates reconciliation and revenue-attribution risk, while allowing consolidated customer billing.
+
+Order flattening duplicates the invoice/payment or hides the other billed order. Invoice flattening preserves sharing but loses the separate logistics lifecycles. Stability is moderate to low because later allocation records may legitimately turn the shared payment into order-specific settlements.
+
+### S-SUBSTITUTE — X7
+
+**Signature:** one delivery and settlement, with pre-dispatch replacement/removal.
+
+Operationally, an item was substituted or removed before shipment. Risks include billing the removed item, inventory discrepancies, or shipping an unauthorized substitute.
+
+A label-only Order trace is almost indistinguishable from X1. Even an unqualified object graph can miss why I71 was absent at dispatch. Stability is qualifier-sensitive, although the explicit association of I72 with Dispatch provides supporting evidence.
+
+### S-RETURN — X8
+
+**Signature:** return/repack lifecycle, two deliveries, single settlement.
+
+This is reverse logistics followed by redispatch. It implies inspection and handling cost but also a recovery opportunity rather than cancellation or refund.
+
+Delivery flattening separates the first and replacement deliveries; Order flattening shows the return but not cleanly that only I82 was repacked and P82 replaced P81 for that item. It is relatively stable because explicit Return and Inspect events support the motif even if a replacement qualifier is repaired.
+
+## 5. Borderline cases
+
+- **X1 versus X2:** Activity and typed-isomorphism definitions group them. A raw-ID or dataframe-equality definition separates them because `O1/I11/...` differs from `O2/I22/...`. The latter is useful for duplicate detection, not behavioral clustering.
+
+- **X1 versus X5:** Activity equivalence groups them. Lead-local structural equivalence also groups them if external objects are projected away. Full typed structure and the preferred signature separate them because P51 and D51 cross the Order boundary.
+
+- **X1 versus X6:** Their local logistics and activity sequence agree. A logistics-only equivalence groups them, while financial-semantic equivalence separates them because the invoice and payment cannot be attributed solely to O6.
+
+- **X1 versus X7:** Label equivalence groups them. Qualified structural or semantic equivalence separates them because I71 is removed and I72 is the effective dispatch item. If qualifiers and item-level Dispatch incidence are ignored, they can defensibly collapse.
+
+- **X3 versus X4:** A package-centric signature such as “two items packed into two packages” groups them. Full structure or customer-fulfillment semantics separates them: X3 has one consolidated delivery and one payment, while X4 has two deliveries and staged payment.
+
+- **X4 versus X8:** A coarse “multi-delivery exception” signature can group them. Lifecycle-motif equivalence separates proactive split fulfillment from return-driven redispatch; payment multiplicity supplies another distinction.
+
+## 6. Relation to `pm4py.cluster_equivalent_ocel`
+
+`pm4py.cluster_equivalent_ocel` should be treated as exact relative to the key implemented by the installed PM4Py version, not as a guaranteed business-isomorphism procedure. In commonly used implementations, the key retains ordered object lifecycles and their event/object incidence using event and object identifiers. Activity order and repetition, participating objects, and object types are therefore preserved; timestamps generally determine order rather than business duration.
+
+Raw secondary-object identifiers can make the result too fine: X1 and X2 may have identical typed topology but different serialized incidence keys. Externality encoded only by an `EXT` naming convention is also not automatically a semantic attribute. O2O qualifiers, amount allocation, and domain meanings such as “replacement” should not be assumed to participate unless the installed implementation explicitly includes them. This should be verified when PM4Py versions change.
+
+I would replace IDs by a colored-graph canonical labeling, or post-aggregate exact clusters using the preferred signature. Weisfeiler–Lehman hashes are useful indexes but should be followed by graph-isomorphism checks if exactness matters.
+
+```python
+import pm4py
+from collections import defaultdict
+
+LEAD_TYPE = "Order"
+
+# Exact PM4Py partition; return shape is normally a list of sub-OCELs.
+exact_sublogs = pm4py.cluster_equivalent_ocel(
+    ocel,
+    object_type=LEAD_TYPE,
+    max_objs=100000
+)
+
+def local_orders(log):
+    objs = log.objects
+    mask = (
+        (objs["ocel:type"] == LEAD_TYPE) &
+        ~objs["ocel:oid"].astype(str).str.startswith("EXT")
+    )
+    return set(objs.loc[mask, "ocel:oid"])
+
+def execution_for_order(full_ocel, order_id):
+    """One-hop lead execution; convert rows to the structure used above."""
+    rel = full_ocel.relations
+    lead_rows = rel[
+        (rel["ocel:oid"] == order_id) &
+        (rel["ocel:type"] == LEAD_TYPE)
+    ]
+    event_ids = set(lead_rows["ocel:eid"])
+
+    event_rows = full_ocel.events[
+        full_ocel.events["ocel:eid"].isin(event_ids)
+    ]
+    incidence = rel[rel["ocel:eid"].isin(event_ids)]
+
+    # Include O2O rows whose endpoints occur in the selected incidence.
+    object_ids = set(incidence["ocel:oid"])
+    o2o = full_ocel.o2o[
+        full_ocel.o2o["ocel:oid"].isin(object_ids) &
+        full_ocel.o2o["ocel:oid_2"].isin(object_ids)
+    ]
+
+    return to_execution_records(event_rows, incidence, o2o)
+
+# Record PM4Py's exact cluster, but aggregate by ID-invariant semantics.
+exact_cluster_of = {}
+for cluster_no, sublog in enumerate(exact_sublogs):
+    for oid in local_orders(sublog):
+        exact_cluster_of.setdefault(oid, cluster_no)
+
+semantic_clusters = defaultdict(list)
+all_orders = local_orders(ocel)
+
+for oid in all_orders:
+    execution = execution_for_order(ocel, oid)
+    signature = preferred_signature(execution)
+    semantic_clusters[signature].append({
+        "order": oid,
+        "pm4py_exact_cluster": exact_cluster_of.get(oid)
+    })
+```
+
+Exact equivalence is preferable for duplicate detection, audit reproduction, serialization regression tests, and checking whether two records really have identical incidence. Coarser semantic clusters are preferable for segmentation.
+
+`max_objs` limits practical exploration of the chosen lead type. Large connected components—especially a shared invoice, shipment, or master object joining many Orders—can produce expensive, overlapping executions and dominate memory. Such components should be separately flagged, time-windowed, or handled as “mega-component” exceptions rather than silently interpreted as normal variants.
+
+## 7. Robustness analysis
+
+- **Ignore all O2O qualifiers:** X7 may lose its substitution classification and join S-STP under the preferred signature, although typed structure still differs because Dispatch explicitly references I72. X8 remains S-RETURN because its Return and Inspect activities are explicit. X4 remains multi-settlement from two Payment objects.
+
+- **Ignore external objects:** X5 and X6 both collapse into S-STP after removing external incidence. This is a major semantic loss, not merely identifier normalization.
+
+- **Collapse repeated same-label events:** At activity level, collapsing consecutive duplicates makes X1 and X3 much closer because both repeated Add and repeated Pack labels disappear. If event nodes are actually merged, X4 can lose evidence of two payments. Object-based delivery and payment counts should therefore be computed before trace simplification.
+
+- **Use partial rather than total Pack/Dispatch order:** X4 can be viewed as two concurrent branches, each constrained only by `Pack(Pi) < Dispatch(Pi)`. It would then match executions serialized as both Packs followed by both Dispatches. None of the present preferred assignments changes because the signature uses delivery and settlement motifs rather than arbitrary branch interleaving.
+
+- **Represent payment multiplicity as an amount attribute:** Two partial payments could be aggregated into one settlement record with amount history. X4 would lose `MULTI` structurally but remain distinct from S-STP because it still has two deliveries. Financial analyses should preserve installment history even when the current balance is stored as one attribute.
+
+## 8. Limitations and recommendation
+
+For **compliance monitoring**, use qualified typed structure augmented with amounts and allocation attributes: sharing, substitution, and partial settlement must remain visible.
+
+For **operational segmentation**, use the preferred semantic signature. It suppresses harmless identifiers and package-level variation while retaining costly or risky motifs.
+
+For **root-cause analysis**, start from semantic clusters but drill into typed structures, timestamps, resources, and attributes. The coarse signature alone cannot explain why a return or split occurred.
+
+For **descriptive reporting**, use activity or coarser semantic aggregates, accompanied by explicit counts of package, delivery, sharing, and exception variants.
+
+No single relation is optimal: exact structure maximizes fidelity but fragments populations, while coarse behavior improves interpretability but can hide compliance-relevant object relationships.
