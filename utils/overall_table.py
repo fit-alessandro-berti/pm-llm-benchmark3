@@ -270,7 +270,7 @@ def write_evaluation(base_path, extra=True):
         model_results=model_results,
     )
 
-    if True and (extra and "gpt-5.4" in e_m_name):
+    if True and (extra and "grok-4.5" in e_m_name):
         execute(evaluation_folder, os.path.join(base_path, "leaderboard_lrms_cot_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=True,
                 require_vision=False, require_reasoning=True, require_reasoning_custom=True, leaderboard_title="Large Reasoning Models Leaderboard (Models with CoT)", model_results=model_results)
         execute(evaluation_folder, os.path.join(base_path, "leaderboard_nolrms_" + get_suffix_name(e_m_name) + ".md"), include_closed_source=True,
