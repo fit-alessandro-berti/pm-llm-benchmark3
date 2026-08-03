@@ -384,7 +384,8 @@ _CLOSED_SOURCE_COMMERCIAL_TIERS = (
     "2.5-turbo",
     "2.5-max",
     "qwen3-max",
-    "qwen3.6",
+    "qwen3.6-max",
+    "qwen3.6-plus",
 )
 
 _CLOSED_SOURCE_MODEL_ALIASES = (

@@ -4,7 +4,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 
 | Model       | Score    | OS                 | LRM                | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
 | ----------- | -------- | ------------------ | ------------------ | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
-| qwen3.6-27b | **36.4** | :x:                | :white_check_mark: | :mage_woman: **4.5** | :mage_woman: **4.1** | :mage_woman: **5.2** | :mage_woman: **4.0** | :mage_woman: **4.0** | :mage_woman: **4.6** | :mage_woman: **5.1** | :mage_woman: **5.0** |
+| qwen3.6-27b | **36.4** | :white_check_mark: | :white_check_mark: | :mage_woman: **4.5** | :mage_woman: **4.1** | :mage_woman: **5.2** | :mage_woman: **4.0** | :mage_woman: **4.0** | :mage_woman: **4.6** | :mage_woman: **5.1** | :mage_woman: **5.0** |
 | qwen3.5-9b  | **25.7** | :white_check_mark: | :white_check_mark: | 3.4                  | 2.2                  | 3.3                  | 2.6                  | 2.7                  | 3.1                  | 4.6                  | 3.8                  |
 
 ### qwenqwen3.6-27b   => 36.4 points
