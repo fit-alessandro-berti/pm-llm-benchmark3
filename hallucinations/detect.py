@@ -281,7 +281,7 @@ if __name__ == '__main__':
         description="Process .txt files through OpenAI API with JSON validation"
     )
     parser.add_argument(
-        '--input_dir', type=str, default=str(REPO_ROOT / 'evaluation-gpt-5.4'),
+        '--input_dir', type=str, default=str(REPO_ROOT / 'evaluation-grok-4.5'),
         help='Path to the input directory containing .txt files'
     )
     parser.add_argument(
