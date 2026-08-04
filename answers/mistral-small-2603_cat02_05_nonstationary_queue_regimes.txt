@@ -1,0 +1,460 @@
+```python
+import pandas as pd
+import numpy as np
+from scipy import stats
+
+# =============================================================================
+# 1. Data audit and estimands
+# =============================================================================
+
+"""
+Queueing quantities and units:
+- arrivals, completed: counts during opening hours (07:00–19:00)
+- median_service_min, p90_service_min: active handling time in minutes (excluding waiting)
+- mean_wip: mean number of cases in system from 15-min snapshots (unitless count)
+- staff_fte: mean concurrently available full-time-equivalent capacity
+- complex_pct: percentage of arrivals following multi-step complex variant
+- outage_min: minutes of outage during opening hours
+- peak_08_10_pct: percentage of daily arrivals between 08:00–09:59
+
+Opening-hours convention: All metrics are computed only during 07:00–19:00.
+Cases can carry over overnight; no service occurs while closed.
+
+Limitations of aggregates:
+1. No backlog at 07:00 is supplied  cannot compute net inflow or true daily throughput.
+2. Completed cases may have arrived on prior days  daily completion  daily arrival.
+3. Median and p90 service times  mean flow time  Little’s Law cannot use median service as flow time.
+4. Complex_pct may reflect coding change, not real mix shift  interpret with caution.
+5. Representative hourly vectors are single-day snapshots  not robust to day-to-day variation.
+6. Daily rows are not independent  weekday/weekend patterns and carry-over create serial dependence.
+7. Outage on 2026-04-15 is logged but timing is approximate  recovery period unclear.
+8. Staffing intervention began on 2026-04-29 with no logged implementation time  change point uncertain.
+9. WIP is from 15-min snapshots  may miss short-lived bursts.
+10. Peak_08_10_pct uses 08:00–09:59, but hourly vectors show peak often in 09:00–10:00 bin  slight misalignment.
+
+Threats to naive inference:
+- Simpson’s paradox: pooling across regimes with different case mixes can reverse observed effects.
+- Backlog carry-over: high WIP may reflect prior-day backlog, not current capacity pressure.
+- Outlier days (e.g., 2026-04-15 outage, 2026-04-21 bursty) dominate pooled averages.
+- Staffing change on 2026-04-29 may be conflated with natural weekly variation.
+- Service-time medians understate tail behavior  underestimation of flow time.
+"""
+
+# =============================================================================
+# 2. Primary regime segmentation
+# =============================================================================
+
+primary_regimes = [
+    {
+        "label": "Weekday Normal",
+        "dates": "2026-04-06 to 2026-04-14 (Mon–Fri, pre-outage)",
+        "evidence": "Stable staffing (6.0 FTE), low outage, moderate complex_pct (~20%), mean_wip ~18–23, peak_08_10_pct ~26–33%",
+        "arrival_est": "~100/day (IQR 96–104)",
+        "completion_est": "~99/day (IQR 94–103)",
+        "service_behavior": "median ~24–26 min, p90 ~44–49 min",
+        "wip_capacity": "WIP ~18–23, staffing 6.0  capacity ~360 staff-minutes/day  utilization ~80–90%",
+        "confidence": "High for demand and service; low for flow time due to median proxy"
+    },
+    {
+        "label": "Outage Day",
+        "dates": "2026-04-15 (Wed)",
+        "evidence": "180-min outage (~11:00–14:00), WIP spike to 47, completions drop to 58 despite 105 arrivals, service times rise (median 31, p90 68)",
+        "arrival_est": "105",
+        "completion_est": "58",
+        "service_behavior": "median 31, p90 68  longer tails",
+        "wip_capacity": "WIP 47, staffing 6.0  severe congestion; recovery likely spills to next day",
+        "confidence": "High for outage impact; recovery period unclear"
+    },
+    {
+        "label": "Recovery & Post-Intervention",
+        "dates": "2026-04-16 to 2026-04-24 (Thu–Wed, post-outage, pre-staffing change)",
+        "evidence": "Staffing increases to 6.5–7.0 FTE, WIP remains elevated (35–52), complex_pct jumps to ~40–47%, service times increase (median 32–36, p90 72–88)",
+        "arrival_est": "~110–120/day (IQR 106–119)",
+        "completion_est": "~99–106/day (IQR 94–112)",
+        "service_behavior": "median 32–36 min, p90 72–88 min  heavier tail",
+        "wip_capacity": "WIP 35–52, staffing 6.0–7.0  utilization ~90–100%  chronic congestion",
+        "confidence": "Moderate; complex mix shift likely real; staffing increase may be reactive"
+    },
+    {
+        "label": "Staffing Intervention",
+        "dates": "2026-04-29 onward (Wed–Sun)",
+        "evidence": "Staffing increases to 7.0 FTE (Wed), then 6.5–7.0; complex_pct remains high (~44–47%); WIP stabilizes ~32–50; peak_08_10_pct ~39–50%",
+        "arrival_est": "~109–121/day (IQR 109–121)",
+        "completion_est": "~105–126/day (IQR 105–126)",
+        "service_behavior": "median 32–36 min, p90 72–88 min",
+        "wip_capacity": "WIP 32–50, staffing 6.5–7.0  utilization ~85–100%; still tight",
+        "confidence": "Moderate; intervention timing uncertain; complex mix persists"
+    },
+    {
+        "label": "Weekend",
+        "dates": "Sat/Sun throughout",
+        "evidence": "Staffing 2.5–3.0 FTE, arrivals ~36–53, completions ~38–51, WIP ~12–23, service times elevated (median 28–36, p90 53–85), peak_08_10_pct ~17–22%",
+        "arrival_est": "~40/day (IQR 36–53)",
+        "completion_est": "~40/day (IQR 38–51)",
+        "service_behavior": "median 28–36 min, p90 53–85 min  higher variability",
+        "wip_capacity": "WIP 12–23, staffing 2.5  utilization ~60–90%; less pressure but higher relative variability",
+        "confidence": "High for demand/service; low for flow time"
+    }
+]
+
+# =============================================================================
+# 3. Alternative segmentation
+# =============================================================================
+
+alternative_regimes = [
+    {
+        "label": "Case-Mix Driven",
+        "dates": "Cluster by complex_pct: low (<25%) vs high (>40%)",
+        "evidence": "complex_pct jumps from ~20% to ~45% after 2026-04-20; service times and WIP rise in high-complex group",
+        "arrival_est": "Low: ~95–105/day; High: ~106–121/day",
+        "completion_est": "Low: ~94–103/day; High: ~94–126/day",
+        "service_behavior": "Low: median 24–26, p90 44–49; High: median 32–36, p90 72–88",
+        "wip_capacity": "Low: WIP ~18–23; High: WIP ~35–52  capacity pressure driven by mix",
+        "confidence": "Moderate; assumes complex_pct reflects real case mix; ignores staffing changes",
+        "strengths": "Explains service-time inflation without invoking staffing; aligns with operational narrative of process change",
+        "weaknesses": "Ignores capacity changes; may overattribute to mix; complex_pct may be mismeasured"
+    },
+    {
+        "label": "Peak-Driven",
+        "dates": "High peak days (peak_08_10_pct >40%) vs low",
+        "evidence": "Peak days cluster after 2026-04-20; WIP and service times higher on high-peak days",
+        "arrival_est": "High peak: ~115–121/day; Low peak: ~92–107/day",
+        "completion_est": "High peak: ~101–126/day; Low peak: ~94–105/day",
+        "service_behavior": "High peak: median 34–36, p90 78–88; Low peak: median 24–29, p90 44–60",
+        "wip_capacity": "High peak: WIP ~37–52; Low peak: WIP ~18–23  early congestion drives backlog",
+        "confidence": "Moderate; peak may cause spillover and longer service times",
+        "strengths": "Explains WIP buildup via early congestion; actionable for staffing",
+        "weaknesses": "Peak may be consequence, not cause; ignores outage and mix"
+    }
+]
+
+# =============================================================================
+# 4. Pooled versus segmented statistics
+# =============================================================================
+
+# Construct daily data
+daily_data = pd.DataFrame({
+    'date': pd.to_datetime([
+        '2026-04-06','2026-04-07','2026-04-08','2026-04-09','2026-04-10',
+        '2026-04-11','2026-04-12','2026-04-13','2026-04-14','2026-04-15',
+        '2026-04-16','2026-04-17','2026-04-18','2026-04-19','2026-04-20',
+        '2026-04-21','2026-04-22','2026-04-23','2026-04-24','2026-04-25',
+        '2026-04-26','2026-04-27','2026-04-28','2026-04-29','2026-04-30',
+        '2026-05-01','2026-05-02','2026-05-03'
+    ]),
+    'day': ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']*4 + ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'],
+    'arrivals': [96,101,98,104,92,44,36,103,107,98,112,99,48,39,108,115,119,111,106,51,43,121,118,116,120,109,53,45],
+    'completed': [94,99,100,103,95,41,38,101,105,58,129,112,46,41,94,101,103,99,96,43,39,105,106,121,126,116,51,47],
+    'median_service_min': [24,25,24,25,26,29,28,25,26,31,33,29,30,29,34,35,36,34,35,36,35,36,35,33,32,33,35,34],
+    'p90_service_min': [44,46,45,47,49,55,53,48,50,68,72,60,58,56,78,82,86,80,83,85,81,88,84,76,72,74,80,78],
+    'mean_wip': [18,20,19,21,20,14,12,21,23,47,52,35,16,13,37,41,46,44,43,23,20,49,50,43,36,32,22,19],
+    'staff_fte': [6.0,6.0,6.0,6.0,5.5,2.5,2.5,6.0,6.0,6.0,7.0,6.5,2.5,2.5,6.0,6.0,6.0,6.0,5.5,2.5,2.5,6.0,6.0,7.0,7.0,6.5,3.0,3.0],
+    'complex_pct': [19,20,18,21,22,23,21,22,24,25,27,25,24,23,41,44,46,43,45,42,40,47,46,44,45,43,41,39],
+    'outage_min': [0]*14 + [180] + [0]*13,
+    'peak_08_10_pct': [28,31,29,30,26,18,17,30,33,32,34,29,19,18,42,47,49,45,40,22,20,50,48,44,43,39,21,19]
+})
+
+# Representative hourly vectors
+representative_hourly = pd.DataFrame({
+    'representative_day': ['2026-04-07','2026-04-15','2026-04-21','2026-04-25'],
+    'arrivals_by_hour': [
+        [3,5,12,20,16,10,8,7,6,5,5,4],
+        [4,6,13,22,17,11,9,7,6,4,4,2],
+        [2,3,8,34,8,5,24,5,3,14,5,4],
+        [1,2,4,7,8,7,6,5,4,3,2,2]
+    ],
+    'completions_by_hour': [
+        [4,7,10,14,15,11,9,8,7,6,5,3],
+        [5,7,10,8,0,0,0,4,6,7,6,5],
+        [3,4,7,13,10,8,12,10,8,9,9,8],
+        [1,2,3,5,6,6,5,4,4,3,2,2]
+    ],
+    'note': ['ordinary weekday','outage 11:00–14:00','bursty post-mix','weekend']
+})
+
+# Pooled summaries
+pooled_arrivals = daily_data['arrivals'].mean()
+pooled_completed = daily_data['completed'].mean()
+pooled_median_service = daily_data['median_service_min'].median()
+pooled_p90_service = daily_data['p90_service_min'].median()
+pooled_wip = daily_data['mean_wip'].median()
+pooled_staff = daily_data['staff_fte'].median()
+pooled_complex = daily_data['complex_pct'].median()
+pooled_peak = daily_data['peak_08_10_pct'].median()
+
+# Segmented summaries
+weekday_pre = daily_data[daily_data['date'] < pd.Timestamp('2026-04-15') & (daily_data['day'].isin(['Mon','Tue','Wed','Thu','Fri']))]
+weekend_pre = daily_data[daily_data['date'] < pd.Timestamp('2026-04-15') & (daily_data['day'].isin(['Sat','Sun']))]
+post_outage = daily_data[daily_data['date'] >= pd.Timestamp('2026-04-16')]
+post_staff = daily_data[daily_data['date'] >= pd.Timestamp('2026-04-29')]
+high_complex = daily_data[daily_data['complex_pct'] > 40]
+high_peak = daily_data[daily_data['peak_08_10_pct'] > 40]
+
+# =============================================================================
+# 5. Burstiness, autocorrelation, and stationarity
+# =============================================================================
+
+# Fano factor (index of dispersion) for daily arrivals
+arrivals_var = np.var(daily_data['arrivals'], ddof=1)
+arrivals_mean = np.mean(daily_data['arrivals'])
+fano_factor = arrivals_var / arrivals_mean
+
+# Coefficient of variation for hourly arrivals (from representative days)
+hourly_arrivals = np.concatenate(representative_hourly['arrivals_by_hour'].values)
+cv_hourly_arrivals = np.std(hourly_arrivals) / np.mean(hourly_arrivals)
+
+# Lag-1 autocorrelation for daily arrivals
+lag1_acf = np.corrcoef(daily_data['arrivals'].iloc[:-1], daily_data['arrivals'].iloc[1:])[0,1]
+
+# Change-point detection (simple heuristic: mean shift)
+pre_mean = daily_data[daily_data['date'] < pd.Timestamp('2026-04-29')]['arrivals'].mean()
+post_mean = daily_data[daily_data['date'] >= pd.Timestamp('2026-04-29')]['arrivals'].mean()
+change_point_effect = post_mean - pre_mean
+
+# =============================================================================
+# 6. Little's-Law applicability matrix
+# =============================================================================
+
+little_law_matrix = [
+    {
+        "window": "Weekday Normal (pre-outage)",
+        "boundary_stability": "Moderate; backlog carry-over possible",
+        "throughput_proxy": "Daily arrivals (arrivals) or completions (if no backlog)",
+        "wip_comparability": "15-min snapshots; representative",
+        "carry_over_risk": "High; cases can span days",
+        "stationarity": "Moderate; daily arrivals ~100, service ~25 min",
+        "implied_flow_time": "Not defensible using median service; would require mean flow time",
+        "verdict": "approximate only"
+    },
+    {
+        "window": "Outage Day (2026-04-15)",
+        "boundary_stability": "Low; outage disrupts flow",
+        "throughput_proxy": "Completions underestimate arrivals due to outage",
+        "wip_comparability": "High WIP due to outage; not steady state",
+        "carry_over_risk": "Very high; spillover to next day",
+        "stationarity": "None; transient",
+        "implied_flow_time": "not defensible",
+        "verdict": "not defensible"
+    },
+    {
+        "window": "Recovery Period (post-outage, pre-staffing)",
+        "boundary_stability": "Low; elevated WIP from outage",
+        "throughput_proxy": "Completions lag arrivals",
+        "wip_comparability": "High WIP; not representative",
+        "carry_over_risk": "High",
+        "stationarity": "Low; declining WIP?",
+        "implied_flow_time": "not defensible",
+        "verdict": "not defensible"
+    },
+    {
+        "window": "Staffing Intervention (post-2026-04-29)",
+        "boundary_stability": "Moderate; staffing increased, but complex mix persists",
+        "throughput_proxy": "Completions closer to arrivals",
+        "wip_comparability": "High WIP; still elevated",
+        "carry_over_risk": "Moderate",
+        "stationarity": "Moderate; elevated regime",
+        "implied_flow_time": "not defensible",
+        "verdict": "approximate only"
+    },
+    {
+        "window": "Weekend",
+        "boundary_stability": "High; low backlog carry-over expected",
+        "throughput_proxy": "Daily arrivals/completions",
+        "wip_comparability": "Low WIP; representative",
+        "carry_over_risk": "Low",
+        "stationarity": "High; consistent pattern",
+        "implied_flow_time": "not defensible",
+        "verdict": "approximate only"
+    }
+]
+
+# =============================================================================
+# 7. Operational implications
+# =============================================================================
+
+"""
+Staffing:
+- Primary segmentation suggests staffing should be regime-aware: 6.0 FTE for normal weekdays, 7.0 for high-demand/peak days, 2.5–3.0 for weekends.
+- A policy that uses pooled averages (e.g., 6.0 FTE every day) would understaff on high-peak days and overstaff on weekends, increasing WIP and flow time.
+
+Backlog recovery:
+- Outage on 2026-04-15 caused a 47-case backlog. Recovery should include buffer staffing for 1–2 days post-outage.
+- High-complex cases (40–47% after 2026-04-20) require longer service times  allocate experienced staff or dedicated lanes.
+
+Peak smoothing:
+- Peak_08_10_pct >40% on many post-intervention days suggests early congestion. Consider staggered start times or pre-peak staffing surges.
+- Representative hourly vectors show bursty arrivals (e.g., 2026-04-21: 34 arrivals in 09:00–10:00 bin)  deploy flexible staff during peak bins.
+
+Data collection:
+- Log backlog at 07:00 daily to compute net inflow and true throughput.
+- Track case variant coding consistency to validate complex_pct.
+- Record outage start/end times precisely to assess recovery impact.
+
+Policy that looks good pooled but risky segmented:
+- "Staff to 6.0 FTE every day"  pooled utilization ~85%, but on high-peak days utilization would exceed 100%, causing WIP explosion.
+"""
+
+# =============================================================================
+# 8. Reproducible Python
+# =============================================================================
+"""
+This code block constructs the data, computes pooled and regime-specific summaries,
+calculates burstiness and serial dependence indicators, applies a transparent segmentation heuristic,
+and computes Little’s-Law implied flow-time values for chosen windows.
+"""
+
+# --- Construct data in memory ---
+daily_df = pd.DataFrame({
+    'date': pd.to_datetime([
+        '2026-04-06','2026-04-07','2026-04-08','2026-04-09','2026-04-10',
+        '2026-04-11','2026-04-12','2026-04-13','2026-04-14','2026-04-15',
+        '2026-04-16','2026-04-17','2026-04-18','2026-04-19','2026-04-20',
+        '2026-04-21','2026-04-22','2026-04-23','2026-04-24','2026-04-25',
+        '2026-04-26','2026-04-27','2026-04-28','2026-04-29','2026-04-30',
+        '2026-05-01','2026-05-02','2026-05-03'
+    ]),
+    'day': ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']*4 + ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'],
+    'arrivals': [96,101,98,104,92,44,36,103,107,98,112,99,48,39,108,115,119,111,106,51,43,121,118,116,120,109,53,45],
+    'completed': [94,99,100,103,95,41,38,101,105,58,129,112,46,41,94,101,103,99,96,43,39,105,106,121,126,116,51,47],
+    'median_service_min': [24,25,24,25,26,29,28,25,26,31,33,29,30,29,34,35,36,34,35,36,35,36,35,33,32,33,35,34],
+    'p90_service_min': [44,46,45,47,49,55,53,48,50,68,72,60,58,56,78,82,86,80,83,85,81,88,84,76,72,74,80,78],
+    'mean_wip': [18,20,19,21,20,14,12,21,23,47,52,35,16,13,37,41,46,44,43,23,20,49,50,43,36,32,22,19],
+    'staff_fte': [6.0,6.0,6.0,6.0,5.5,2.5,2.5,6.0,6.0,6.0,7.0,6.5,2.5,2.5,6.0,6.0,6.0,6.0,5.5,2.5,2.5,6.0,6.0,7.0,7.0,6.5,3.0,3.0],
+    'complex_pct': [19,20,18,21,22,23,21,22,24,25,27,25,24,23,41,44,46,43,45,42,40,47,46,44,45,43,41,39],
+    'outage_min': [0]*14 + [180] + [0]*13,
+    'peak_08_10_pct': [28,31,29,30,26,18,17,30,33,32,34,29,19,18,42,47,49,45,40,22,20,50,48,44,43,39,21,19]
+})
+
+rep_hourly_df = pd.DataFrame({
+    'representative_day': ['2026-04-07','2026-04-15','2026-04-21','2026-04-25'],
+    'arrivals_by_hour': [
+        [3,5,12,20,16,10,8,7,6,5,5,4],
+        [4,6,13,22,17,11,9,7,6,4,4,2],
+        [2,3,8,34,8,5,24,5,3,14,5,4],
+        [1,2,4,7,8,7,6,5,4,3,2,2]
+    ],
+    'completions_by_hour': [
+        [4,7,10,14,15,11,9,8,7,6,5,3],
+        [5,7,10,8,0,0,0,4,6,7,6,5],
+        [3,4,7,13,10,8,12,10,8,9,9,8],
+        [1,2,3,5,6,6,5,4,4,3,2,2]
+    ],
+    'note': ['ordinary weekday','outage 11:00–14:00','bursty post-mix','weekend']
+})
+
+# --- Calculate pooled and regime summaries ---
+pooled_summary = {
+    'arrivals_mean': daily_df['arrivals'].mean(),
+    'completed_mean': daily_df['completed'].mean(),
+    'median_service_median': daily_df['median_service_min'].median(),
+    'p90_service_median': daily_df['p90_service_min'].median(),
+    'wip_median': daily_df['mean_wip'].median(),
+    'staff_median': daily_df['staff_fte'].median(),
+    'complex_median': daily_df['complex_pct'].median(),
+    'peak_median': daily_df['peak_08_10_pct'].median()
+}
+
+regime_summaries = []
+for regime in primary_regimes:
+    mask = (daily_df['date'] >= pd.Timestamp(regime['dates'].split('to')[0].strip())) & \
+           (daily_df['date'] <= pd.Timestamp(regime['dates'].split('to')[1].strip().split(' ')[0]))
+    if regime['label'] == 'Weekend':
+        mask = daily_df['day'].isin(['Sat','Sun'])
+    elif regime['label'] == 'Outage Day':
+        mask = (daily_df['date'] == pd.Timestamp('2026-04-15'))
+    elif regime['label'] == 'Recovery & Post-Intervention':
+        mask = (daily_df['date'] >= pd.Timestamp('2026-04-16')) & (daily_df['date'] < pd.Timestamp('2026-04-29'))
+    elif regime['label'] == 'Staffing Intervention':
+        mask = (daily_df['date'] >= pd.Timestamp('2026-04-29'))
+    elif regime['label'] == 'Weekday Normal':
+        mask = (daily_df['date'] < pd.Timestamp('2026-04-15')) & (daily_df['day'].isin(['Mon','Tue','Wed','Thu','Fri']))
+
+    subset = daily_df[mask]
+    regime_summaries.append({
+        'regime': regime['label'],
+        'n_days': len(subset),
+        'arrivals_mean': subset['arrivals'].mean(),
+        'completed_mean': subset['completed'].mean(),
+        'median_service_median': subset['median_service_min'].median(),
+        'p90_service_median': subset['p90_service_min'].median(),
+        'wip_median': subset['mean_wip'].median(),
+        'staff_median': subset['staff_fte'].median(),
+        'complex_median': subset['complex_pct'].median(),
+        'peak_median': subset['peak_08_10_pct'].median()
+    })
+
+# --- Burstiness and dispersion ---
+# Fano factor for daily arrivals
+fano_factor_daily = np.var(daily_df['arrivals'], ddof=1) / np.mean(daily_df['arrivals'])
+# CV for hourly arrivals
+all_hourly_arrivals = np.concatenate(rep_hourly_df['arrivals_by_hour'].values)
+cv_hourly = np.std(all_hourly_arrivals) / np.mean(all_hourly_arrivals)
+# Lag-1 autocorrelation for daily arrivals
+lag1_acf_daily = np.corrcoef(daily_df['arrivals'].iloc[:-1], daily_df['arrivals'].iloc[1:])[0,1]
+
+# --- Change-point heuristic (arrivals mean shift) ---
+pre_cp = daily_df[daily_df['date'] < pd.Timestamp('2026-04-29')]['arrivals'].mean()
+post_cp = daily_df[daily_df['date'] >= pd.Timestamp('2026-04-29')]['arrivals'].mean()
+cp_effect = post_cp - pre_cp
+
+# --- Little's Law implied flow-time for chosen windows ---
+# Window 1: Weekday Normal (pre-outage) using arrivals as throughput proxy
+# Assumption: steady state, no backlog carry-in/out, mean flow time = mean WIP / arrival rate
+# Units: daily
+w1_arrivals = regime_summaries[0]['arrivals_mean']  # ~100/day
+w1_wip = regime_summaries[0]['wip_median']         # ~20
+# Convert to daily flow time: WIP / lambda (in days)
+implied_flow_time_w1_days = w1_wip / w1_arrivals
+implied_flow_time_w1_hours = implied_flow_time_w1_days * 12  # 12 opening hours
+
+# Window 2: Weekend (low backlog carry-over assumed)
+w2_arrivals = regime_summaries[-1]['arrivals_mean']  # ~40/day
+w2_wip = regime_summarmaries[-1]['wip_median']      # ~19
+implied_flow_time_w2_days = w2_wip / w2_arrivals
+implied_flow_time_w2_hours = implied_flow_time_w2_days * 12
+
+# --- Print compact comparison tables ---
+print("=== Pooled vs Segmented: Arrival Intensity ===")
+print(f"Pooled arrivals mean: {pooled_summary['arrivals_mean']:.1f}")
+print("Regime arrivals means:")
+for rs in regime_summaries:
+    print(f"  {rs['regime']}: {rs['arrivals_mean']:.1f}")
+
+print("\n=== Pooled vs Segmented: Service Behavior ===")
+print(f"Pooled median service (median of daily medians): {pooled_summary['median_service_median']:.1f} min")
+print(f"Pooled p90 service (median of daily p90s): {pooled_summary['p90_service_median']:.1f} min")
+print("Regime service medians:")
+for rs in regime_summaries:
+    print(f"  {rs['regime']}: median={rs['median_service_median']:.1f}, p90={rs['p90_service_median']:.1f}")
+
+print("\n=== Pooled vs Segmented: WIP and Staffing ===")
+print(f"Pooled WIP median: {pooled_summary['wip_median']:.1f}")
+print(f"Pooled staff median: {pooled_summary['staff_median']:.0f} FTE")
+print("Regime WIP and staff:")
+for rs in regime_summaries:
+    print(f"  {rs['regime']}: WIP={rs['wip_median']:.1f}, staff={rs['staff_median']:.1f}")
+
+print("\n=== Burstiness and Dependence ===")
+print(f"Daily arrivals Fano factor (index of dispersion): {fano_factor_daily:.2f}")
+print(f"Hourly arrivals coefficient of variation: {cv_hourly:.2f}")
+print(f"Daily arrivals lag-1 autocorrelation: {lag1_acf_daily:.2f}")
+print(f"Change-point effect (arrivals mean shift at 2026-04-29): {cp_effect:+.1f}")
+
+print("\n=== Little's Law Implied Flow Time (chosen windows) ===")
+print(f"Weekday Normal (pre-outage): WIP={regime_summaries[0]['wip_median']:.1f}, arrivals={regime_summaries[0]['arrivals_mean']:.1f}/day")
+print(f"   Implied flow time = {implied_flow_time_w1_days:.2f} days = {implied_flow_time_w1_hours:.1f} hours")
+print(f"Weekend: WIP={regime_summaries[-1]['wip_median']:.1f}, arrivals={regime_summaries[-1]['arrivals_mean']:.1f}/day")
+print(f"   Implied flow time = {implied_flow_time_w2_days:.2f} days = {implied_flow_time_w2_hours:.1f} hours")
+
+# --- How PM4Py could be used (commented) ---
+"""
+# If we had raw event logs, we could use PM4Py like:
+# from pm4py.objects.log.util import dataframe_utils
+# from pm4py.objects.conversion.log import converter as log_converter
+# event_log = dataframe_utils.convert_dataframe_to_event_stream(daily_df, case_id='case_id', activity_key='activity', timestamp_key='timestamp')
+# features = pm4py.extract_temporal_features_dataframe(event_log)
+# arrival_rate = pm4py.get_case_arrival_average(event_log)
+# finish_rate = pm4py.insert_case_arrival_finish_rate(event_log)
+# Note: daily aggregates here are not event logs; this is illustrative.
+"""
+```
