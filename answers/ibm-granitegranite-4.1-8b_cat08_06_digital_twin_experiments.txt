@@ -1,0 +1,391 @@
+**1. Model scope and state variables**  
+
+**Boundary** – The digital twin models the *buildingpermit issuance* process for the municipality, covering all case types (Simple renovation, New residential, Commercial, Complex variance). It does **not** model upstream applicant initiative or downstream usage of the permit after issuance.  
+
+**Level of detail** –  
+- *Entity*: a *permit case* identified by `case_id`.  
+- *State variables per case*:  
+  - `stage` (e.g., *Submit application*, *Completeness check*, …).  
+  - `needs_docs`, `missing_docs_requested`, `has_docs`.  
+  - `fire_required`, `env_required`, `public_notice_required`.  
+  - `architect_id`, `district`, `area`, `application_value`.  
+  - `rework_type` (if any).  
+- *Time stamps*: arrival time (`submit_ts`), start and end timestamps for each activity (derived from log where present; otherwise modeled).  
+- *Crosscase dependencies*:  
+  - Same `architect_id` cases bundled for *Inspection scheduling*  reduces travel time.  
+  - Districtlevel *Publicnotice* can affect multiple cases simultaneously via a common `objection_event` flag.  
+- *Resources*: queues for clerks, planners, fire reviewers, env reviewers, inspectors, legal officers, and system tasks. Each queue holds resourcespecific calendars (working hours, peakmonth inspectors, special holidays).  
+- *External calendars*: public holidays, council meeting weeks, and the nonstationary seasonal demand pattern.  
+
+**Entities & Queues**  
+| Entity | Queue | Calendar Influence |
+|--------|-------|--------------------|
+| Clerk (portal & completeness) | `clerk_queue` | Monday 08:0016:00, extra clerk on Mondays |
+| Planner (Simple & other) | `planner_queue` | 8FTE, 2 dedicated to Simple renovation |
+| Fire reviewer | `fire_queue` | TueThu only |
+| Env reviewer | `env_queue` | 3FTE, 40% offshift time |
+| Inspector | `inspector_queue` | TueFri, districtbatching |
+| Legal officer | `legal_queue` | No work during councilmeeting weeks |
+| System task (issue/reject) | `system_queue` | Unlimited capacity |
+
+**2. Parameterestimation plan**  
+
+**Step1 – Load and format log** (using `pandas` and `pm4py.formulate_dataframe`):  
+
+```python
+import pandas as pd
+from pm4py.objects.log.importer.csv import view as csv_import
+log_df = pd.read_csv('permit_log.csv', parse_dates=['time:timestamp'])
+formatted_log = pm4py.format_dataframe(log_df,
+                                      event_attribute='concept:name',
+                                      timestamp_attribute='time:timestamp',
+                                      case_attribute='case:concept:name')
+```
+
+**Step2 – Build process model & variants**  
+- Use `pm4py.discover.dfg` to obtain the DirectlyFollows Graph (DFG) from the formatted log.  
+- Use `pm4py.discover.process_tree` on the DFG to automatically generate the highlevel tree matching the supplied string (note: the simplified string omitting explicit decision decisions will be reconciled by mapping observed branches).  
+
+```python
+dfg = pm4py.discover.dfg(formatted_log)
+process_tree = pm4py.discover.process_tree(dfg, activity_generalization=True)
+```
+
+**Step3 – Servicetime & waitingtime estimation**  
+- For each activity in the process tree, compute **median** and **p90** service times from the log (using `pm4py.statistical_analysis.service_time`).  
+- For missing start timestamps (e.g., many human activities), infer waiting time as *arrival_to_completion minus logged service time* and capture the heavytailed behaviour with a Pareto or shiftedlognormal distribution (see `pm4py.distributions.estimate_parameters`).  
+
+```python
+service_stats = pm4py.statistical_analysis.service_time(formatted_log,
+                                                        activities=[*process_tree.nodes])
+```
+
+**Step4 – Arrival pattern**  
+- Aggregate daily case counts per month.  
+- Fit a **nonstationary Poissontype** process: baseline  (JanFeb) × 1.7 for MarMay & SepNov (derived from log summary).  
+- Model weekday intensity (Mon = 2.2× Wed) by scaling _weekday.  
+
+```python
+arrival_data = pm4py.summarize_arrivals(formatted_log, resolution='day')
+seasonal_factor = pd.Series({1:1,2:1,3:1.7,4:1.7,5:1.7,6:1,7:1,8:1,9:1.7,10:1.7,11:1.7,12:1})
+# combine weekday factor similarly ...
+```
+
+**Step5 – Branching probabilities & rework**  
+- Rework occurrences are coded as activity names (`Completeness rework`, `Planning review rework …`).  
+- Count frequency of each rework after its parent activity in the log to get **rework rates** (µ_r).  
+
+```python
+rework_rates = pm4py.analyze_rework(formatted_log, parent_activity_pattern='Planning review')
+```
+
+**Step6 – Resource calendars & dependencies**  
+- **Load** the supplied calendar tables into the simulation engine (e.g., `ResourceCalendar` objects).  
+- **Architect bundling**: a rule engine checks queued cases with same `architect_id`  group into a *bundle* and apply reduced traveltime factor (`travel_factor = 0.7`).  
+- **Publicnotice length**: use `public_notice_duration = base 14d + objection_extension` where `objection_extension` follows the empirical distribution from the log (estimated via `pm4py.statistical_analysis.variable_distribution`).  
+
+**Step7 – Missingdata handling**  
+- For **objection events**, treat the *publicnotice* duration’s p90 as a proxy; apply a **confidence interval** (±30%) in the simulation to capture uncertainty.  
+- For **missing start timestamps**, adopt the inferred waitingtime distribution and run a **MonteCarlo propagation** of its variance (see Section5).  
+
+3. **Assumptions**  
+
+| Category | Assumption | Rationale |
+|----------|------------|-----------|
+| **Arrivals** | Nonstationary Poisson with seasonality factors (×1.7 MarMay, SepNov) and weekday multiplier (Mon2.2× Wed). | Directly supported by the log summary. |
+| **Service times** | Use median & p90 from the log; heavytailed behavior modeled with Pareto or shifted lognormal when start times are missing. | Captures observed variability (e.g., Inspection scheduling longtails). |
+| **Routing** | Binary decisions (`requires_fire`, `requires_environment`, `public_notice_required`) are deterministic per case attributes; policy D2 overrides `requires_fire` for lowvalue Simple renovations. | Aligns with known business rules. |
+| **Resources / Calendars** | Clerks work MondayFriday 0816, extra clerk on Mondays; planners 0917 with Simpleonly pair; fire reviewers TueThu; env reviewers 3FTE with 40% offshift; inspectors TueFri, districtbatching; legal officers off during council weeks; system unlimited. | Mirrors the supplied resource calendars. |
+| **Rework** | Rework events follow the observed frequencies; probability of rework after each activity is constant over time (estimated from log). | Provides a firstorder approximation; future stochastic variation can be added. |
+| **Applicant/Thirdparty response** | Applicantdriven `Receive missing documents` time drawn from empirical distribution (mean  5days delay). | Captures external delay that is not captured by municipal staff. |
+| **Crosscase dependencies** | Architectlevel bundling reduces inspection travel time by 30%; districtwide objections extend publicnotice uniformly for all pending cases in that district. | Reasonable proxy given partial log data. |
+| **Nonstationary demand** | Seasonal factors applied multiplicatively to the baseline arrival rate each simulated month. | Enforces the known demand spikes. |
+| **Missing data** | Objevent proxy used with ±30% uncertainty; starttime missingness treated with inferred waitingtime distributions. | Acknowledges gaps and quantifies their impact. |
+
+4. **Experiment matrix**  
+
+| Exp ID | Intervention(s) | Scenario | Arrival pattern | Resource impact | Expected tradeoffs |
+|--------|------------------|----------|-----------------|----------------|---------------------|
+| **B** | Baseline (no intervention) | Normal seasonality | + | Standard calendars | Median total time  45d (varies by case type). |
+| **D1** | Presubmission document checker | Normal | Baseline | Reduces completenesscheck rework queue (20% fewer requests). | Shorter median for Simple & New residential; higher applicant burden. |
+| **D2** | Noinspection rule for Simple<EUR50k | Normal | Baseline | Removes Site inspection for ~45% of Simple cases. | Median 8d for Simple; risk if policy misapplied (low risk). |
+| **D3** | Districtbatched inspection scheduling | Normal | Baseline | Bundles inspections by district D3/D5  traveltime factor 0.7. | Median 5d in D3/D5; negligible outside. |
+| **D4** | Temporary peakmonth inspector (JanFeb, AugSep) | Seasonal (×1.7) | Baseline | Adds 1 inspector in peak months only. | Median 12d in peakmonth Commercial & Complex; cost increase limited to months. |
+| **D5** | Parallel legal precheck for Commercial & Complex variance | Normal | Baseline | Adds 0.5FTE legal officer (shared pool). | Median 10d for Commercial/Complex; higher legal utilization. |
+| **D6** | Planner agingcase reserve (one planner each day >30d backlog) | Normal | Baseline | Dedicated planner slot for longawaiting cases. | Reduces tail of planning review (p90 4d) especially for Complex variance. |
+| **D7** | Architect appointment slots (MondayWed 0912) | Weekday pattern | Normal | Limits portal submissions to those slots, smoothing Monday spikes. | Median 3d overall; potential applicant inconvenience. |
+| **D8** | Environmentalreview triage (district + attribute) | Normal | Baseline | Prefilters env review via simple rule (30% less env cases). | Median 6d for Commercial; risk of missing nuanced cases mitigated by manual review. |
+| **D9** | Publicnotice objection earlywarning process | Normal | Baseline | Proactive notice to applicants 2d before publicnotice, reducing objectiondriven extensions. | Median 2d for cases where objections occur; added procedural cost. |
+| **D10** | Combined D1+D2+D3+D4 | Seasonal + weekday | Baseline | Simultaneous multiple policy effects. | Largest expected reduction (25% median overall), but higher complexity and potential interaction effects. |
+| **S1** | **Stress – High demand spike** (arrival ×2 in Mar) | Spike | Baseline | No extra resources | Tests resilience; expects queue buildup, possibly >60d tail. |
+| **S2** | **Stress – Legal bottleneck** (legal officers off for 2weeks) | Normal | Legal calendar reduced 40% | All legal tasks shift back | Shows impact of council meetings; tail 30d for Commercial/Complex. |
+| **S3** | **Stress – Missingdoc wave** (missingdoc requests surge 50%) | Normal | Rework queue enlarged | Extra clerk on Mondays (already present) | Assesses robustness of D1; tail 15d without D1. |
+
+5. **Warmup, replications, and uncertainty treatment**  
+
+- **Warmup**: Run the simulation for **1000 simulated days** (3×baseline median cycle length) to allow transient effects to dissipate.  
+- **Replication**: For each experimental setting, perform **N=200 independent replications** with distinct random seeds (`seed = i*13`).  
+- **Confidence intervals**: Use **90% bootstrap percentile intervals** on aggregated performance metrics (median, p90, 95th percentile).  
+- **Heavytailed durations**: Replace pure exponential servicetime draws with a **shiftedlognormal** fitted to the p90/p95 observations; propagate variance via MonteCarlo redrawing per replication.  
+- **Sensitivity analysis**: Vary the key seasonal factor (+/10%) and the legaloffweek length (0–3weeks) across an additional **10replication grid** to assess robustness of ranking decisions.  
+
+6. **Validation strategy**  
+
+| Validation type | Method | Data source | Pass criteria |
+|-----------------|--------|-------------|---------------|
+| **Face validation** | Domain expert review of process diagram, resource calendars, and policy interventions. | Interviews with municipal staff. | All major process steps and policies correctly represented. |
+| **Eventlog replay** | Regenerate a synthetic log from the calibrated model and compare with original log distributions. | `pm4py.replay.simulate_log`. | KStest pvalue>0.05 for arrival rates, activity durations, and rework frequencies. |
+| **Distributional validation** | Compare empirical CDFs of median and p90 service times, waiting times, and overall casecompletion times. | Postsimulation statistics vs. logderived statistics. | RMSE<5% for all key metrics. |
+| **Resourceutilization validation** | Check average queue lengths and utilization percentages against observed logs (where available). | Queue metrics from simulation vs. logimplied queues. | Utilization within ±10% of observed. |
+| **Bottleneck validation** | Identify topranked bottlenecks (e.g., Planning review, Publicnotice) and verify they match bottleneck analysis from log (e.g., highest average waiting). | Bottleneck analysis via `pm4py.analyze_bottlenecks`. | Same activities appear in top3 for both. |
+| **Outofsample validation** | Run the model on a holdout subset of the log (e.g., last 10% of cases) and compare predictions. | Separate test set. | Correlation between simulated and observed completion times 0.85. |
+
+7. **Decision criteria**  
+
+| Metric | Definition | Target / Threshold |
+|--------|------------|---------------------|
+| **Median total processing time** (days) | Average across case types. | 42d for baseline; lower for each Dintervention. |
+| **p90 (90th percentile) total time** | Capture tail performance. | 70d for baseline; 60d for top performers. |
+| **Casetype fairness** (_median between worst & best district) | Equality of service across D3/D5 vs. others. | 5d. |
+| **Rework rate** (rework events / total events) | Proportion of cases that experience rework. | 12% for baseline; lower for D1, D6, D8. |
+| **Resource utilization** (average queue length / capacity) | System load on key resources. | 70% for clerks, 80% for planners, 90% for inspectors. |
+| **SLA compliance** (90% of cases within 45d) | Businesslevel performance. | 92% for each experiment. |
+| **Cost / benefit ratio** (expected reduction in days vs. implementation cost) | Economic assessment of D10 vs. single policies. | Benefittocost>1.5 for combined policies. |
+| **Robustness index** (variation of ranking across sensitivity scenarios) | Stability of preferred intervention under uncertainty. | 0.85 (high consistency). |
+
+8. **Python skeleton**  
+
+Below is a modular Python skeleton that follows PM4Py conventions and separates log handling from the simulation engine. Comments explain each block; placeholders (`...`) indicate where the simulation logic will be inserted.
+
+```python
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import pm4py  # assumed to be installed
+from pm4py.objects.log.importer.csv import view as csv_import
+from pm4py.discover import dfg, process_tree
+from pm4py.statistical_analysis import service_time, rework
+from pm4py.util import defaults
+
+# -------------------------------------------------
+# 1  Load and format the event log (excerpt)
+# -------------------------------------------------
+log_raw = pd.read_csv('permit_log.csv', parse_dates=['time:timestamp'])
+# PM4Py expects specific column names; we map here
+log_raw.rename(columns={
+    'case:concept:name': 'case_id',
+    'concept:name': 'activity',
+    'time:timestamp': 'timestamp',
+    'org:resource': 'resource',
+    'case_type': 'case_type',
+    'district': 'district',
+    'architect_id': 'architect_id',
+    'application_value': 'application_value',
+    'requires_fire': 'requires_fire',
+    'requires_environment': 'requires_environment',
+    'requires_public_notice': 'requires_public_notice'
+}, inplace=True)
+
+# Format with PM4Py
+formatted_log = pm4py.format_dataframe(log_raw,
+                                      activity_attribute='activity',
+                                      timestamp_attribute='timestamp',
+                                      case_attribute='case_id',
+                                      resource_attribute='resource')
+
+# -------------------------------------------------
+# 2  Discover process model (DFG & process tree)
+# -------------------------------------------------
+dfg_obj = pm4py.discover.dfg(formatted_log)
+process_tree_obj = pm4py.discover.process_tree(dfg_obj, activity_generalization=True)
+
+# NOTE: the simplified string may not exactly match; we map observed branches manually if needed.
+
+# -------------------------------------------------
+# 3  Servicetime & waitingtime estimation
+# -------------------------------------------------
+service_stats = service_time(formatted_log,
+                             activities=[*process_tree_obj.nodes],
+                             distribution='shifted_lognormal')  # heavytailed handling
+print("Service statistics:", service_stats)
+
+# Rework rates (frequency of rework activities after each parent)
+rework_rates = rework(formatted_log, parent_pattern='Planning review')
+print("Rework rates:", rework_rates)
+
+# -------------------------------------------------
+# 4  Arrival pattern estimation (nonstationary Poisson)
+# -------------------------------------------------
+daily_counts = formatted_log.groupby(pd.Grouper(key='timestamp', freq='D'))['case_id'].count()
+# Apply seasonal multipliers (example)
+seasonal_factors = {
+    3: 1.7, 4: 1.7, 5: 1.7,
+    9: 1.7, 10: 1.7, 11: 1.7
+}
+monthly_factor = daily_counts.groupby([lambda x: x.month]) * \
+                 pd.Series({v: k for k, v in seasonal_factors.items()})
+# Build arrival generator function for the simulation engine
+def arrival_generator(sim_day):
+    month = sim_day.month
+    baseline = daily_counts.mean()  # average daily arrivals (from JanFeb)
+    seasonal = monthly_factor.get(month, 1.0)
+    weekday_mult = {1: 2.2, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0, 7: 1.0, 8: 1.0}[sim_day.weekday()+1]
+    return np.random.poisson(lam=baseline * seasonal * weekday_mult)
+
+# -------------------------------------------------
+# 5  Parameter placeholders for the simulation engine
+# -------------------------------------------------
+class ResourceCalendar:
+    def __init__(self, start, end, staff_fte):
+        self.start = start
+        self.end = end
+        self.staff_fte = staff_fte
+        # add specific dayoff logic (holidays, council meetings)
+        self.off_days = [datetime(2025,12,25)]
+
+    def is_available(self, day):
+        if day.weekday() in [0, 4] and day.hour == 17:  # example off time
+            return False
+        return day not in self.off_days
+
+# Example: instantiate clerk calendar (Mondays extra clerk is implicit here)
+clerk_cal = ResourceCalendar(start=datetime(2022,1,1), end=datetime(2023,12,31), staff_fte=5)
+
+# -------------------------------------------------
+# 6  Simulation experiment runner (placeholder)
+# -------------------------------------------------
+def run_experiment(experiment_id, params):
+    """
+    Highlevel driver that creates a simulation world,
+    injects arrivals, applies the given interventions,
+    and collects performance metrics.
+    """
+    # Initialize world (queues, calendars, policies)
+    world = SimulationWorld(
+        arrival_func=arrival_generator,
+        resource_calendars={
+            'clerk': clerk_cal,
+            'planner': ResourceCalendar(...),   # fill similarly
+            'fire': ResourceCalendar(...),
+            'env': ResourceCalendar(...),
+            'inspector': ResourceCalendar(...),
+            'legal': ResourceCalendar(...)
+        },
+        policies={**defaults.default_policies}
+    )
+    # Apply specific interventions
+    if 'D1' in experiment_id:
+        world.activate_policy(DOCUMENT_CHECKER)
+    if 'D2' in experiment_id:
+        world.activate_policy(SIMPLE_NO_INSPECTION)
+    # ... add other policies similarly
+    # Run for required duration (warmup + replications)
+    results = world.simulate(n_replications=params['replications'],
+                             warm_up_days=params['warm_up'],
+                             run_days=params['run_duration'],
+                             seed=params['seed'])
+    return results
+
+# -------------------------------------------------
+# 7  Example call for a single experiment (Baseline)
+# -------------------------------------------------
+baseline_params = {
+    'experiment_id': 'B',
+    'replications': 200,
+    'warm_up': 1000,          # days
+    'run_duration': 10000,   # days
+    'seed_offset': 0
+}
+baseline_results = run_experiment('B', baseline_params)
+
+# -------------------------------------------------
+# 8  Placeholder classes (to be completed by the team)
+# -------------------------------------------------
+class SimulationWorld:
+    def __init__(self, arrival_func, resource_calendars, policies):
+        self.arrival_func = arrival_func
+        self.resource_calendars = resource_calendars
+        self.policies = policies
+        self.queues = self._init_queues()
+        self.clock = None
+
+    def _init_queues(self):
+        # create empty queues for each resource type
+        return {
+            'clerk': Queue(...),
+            'planner': Queue(...),
+            'fire': Queue(...),
+            'env': Queue(...),
+            'inspector': Queue(...),
+            'legal': Queue(...)
+        }
+
+    def activate_policy(self, policy):
+        # attach a concrete function to the world
+        setattr(self, policy.__name__, policy)
+
+    def simulate(self, replications, warm_up, run_duration, seed_offset):
+        # loop over replications, warmup, then collect metrics
+        results = []
+        for i in range(replications):
+            np.random.seed(seed_offset + i)
+            print(f"Replication {i+1}/{replications} – warmup")
+            self._warm_up(warm_up)
+            print(f"Replication {i+1} – run")
+            metrics = self._run(run_duration)
+            results.append(metrics)
+        return results
+
+    def _warm_up(self, days):
+        # discard transient behaviour
+        pass
+
+    def _run(self, days):
+        # iterate daybyday, generate arrivals, update queues, apply policies
+        metrics = {
+            'median_total_time': None,
+            'p90_total_time': None,
+            'rework_rate': None,
+            'utilizations': {}
+        }
+        # simulation logic goes here
+        return metrics
+
+# ----- Utility Queue class (very simplistic) -----
+class Queue:
+    def __init__(self, capacity=float('inf')):
+        self.items = []          # list of (case_id, start_time, end_time)
+        self.capacity = capacity
+
+    def push(self, case_id, start_time):
+        if len(self.items) < self.capacity:
+            self.items.append((case_id, start_time, None))
+        else:
+            raise RuntimeError("Queue overflow")
+
+    def pop(self):
+        return self.items.pop(0) if self.items else None
+
+    @property
+    def current_length(self):
+        return len(self.items)
+
+# -------------------------------------------------
+# End of skeleton
+# -------------------------------------------------
+```
+
+**Explanation of sections in the skeleton**
+
+* **Loading & formatting** – Uses a CSV, renames columns to PM4Pyexpected names, and calls `pm4py.format_dataframe`.  
+* **Process model discovery** – Extracts the DFG and automatically builds a process tree that approximates the supplied simplified tree string.  
+* **Servicetime & rework estimation** – Calls PM4Py statistical functions to obtain medians, p90s, and rework frequencies; heavytailed distributions are requested via `shifted_lognormal`.  
+* **Arrival pattern** – Computes daily counts, applies seasonal multipliers (derived from the eventlog summary), and returns a generator function (`arrival_generator`).  
+* **Resource calendars** – A simple `ResourceCalendar` class captures working hours, holidays, and peakmonth inspectors; additional calendars are instantiated in the `SimulationWorld` constructor.  
+* **Experiment runner** – `run_experiment` orchestrates creating a `SimulationWorld`, applying any demanded interventions (e.g., `DOCUMENT_CHECKER`), and looping over replications with warmup.  
+* **Placeholder classes** – `SimulationWorld` and `Queue` illustrate where the detailed daybyday simulation logic will be inserted; they contain hooks (`activate_policy`, `_run`) that match the design requirements.  
+* **Modularity** – All PM4Pyrelated tasks are isolated from the simulation engine, satisfying the “separate PM4Pybased log/model handling from the simulation engine” constraint.
+
+---
+
+**End of answer**
