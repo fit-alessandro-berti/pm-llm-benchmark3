@@ -1,0 +1,390 @@
+## 1. Modeling assumptions
+
+**Object types and capitalization.** I use PM4Py-friendly snake-case type identifiers so that `pm4py.ocel_get_object_types` returns a stable, machine-readable vocabulary: `Order`, `Item`, `Package`, `Delivery`, `Invoice`, `Payment`. The instance `ocel:oid` keeps the business identifiers (`O100`, `I1`, …) so type and identity are not conflated. Object IDs are unique by construction.
+
+**E2O qualifier vocabulary.** The qualifiers name *why* an object participates in an event rather than *what kind of object* it is (the type already does that). I use a small, closed set:
+
+- `primary_target` — the object that the event *acts on* (e.g., the Order being created, the Package being packed).
+- `operand` — an item-like object that is operated upon by the event (items added to an order, items packed into a package, items reserved jointly).
+- `container_of` — a packaging/logistics object that holds the operands (Package for items, Delivery for Packages).
+- `bill_target` — an Order being billed by an Invoice.
+- `settles` / `partially_settles` — Payments against an Invoice.
+- `shared_by` — a secondary Order that *co-owns* an event whose `primary_target` is another Order; used for the joint stock reservation and the P1 packing event that operationally bridges O100 and O200.
+
+**O2O direction conventions.** Every O2O row is stored with the *semantically upstream* object on the left (`ocel:oid`) and the *downstream* object on the right (`ocel:oid_2`): `Order  Item`, `Package  Item`, `Delivery  Package`, `Invoice  Order`, `Payment  Invoice`. This matches typical OCEL2 mining semantics where an outgoing arrow means "consumes / contains / is paid by". Qualifiers carry the verb (`contains`, `packs`, `carries`, `bills`, `partially_settles`, `completes_settlement`).
+
+**Logistics and finance events on Orders/Items.** I deliberately do **not** add direct `Order`-touching rows for every downstream event (Dispatch, Confirm Delivery, Issue Invoice, Record Payment). Each downstream event has an *immediate* E2O link to its primary object (Package, Delivery, Invoice, Payment). Direct Order links are added only where the narrative says so:
+
+- Pack Package P1  both O100 and O200 (operationally shared).
+- Reserve Stock for I1+I3  both O100 and O200 (joint reservation).
+- Issue Invoice V1  both O100 and O200 (single bill for two orders).
+- Create Order / Add Item  the respective Order.
+- Close Order  the respective Order.
+
+Items appear on Reserve Stock, Add Item, and Pack Package (where they are operands or co-operands). I rely on O2O propagation to connect Deliveries, Packages, and Invoice back to Orders/Items analytically. This is the core trade-off: **direct source relations are auditable facts; O2O propagation is inferred**. I separate them by qualifier — direct facts use business verbs, propagation paths are derived only at analysis time (e.g., via `ocel_objects_interactions_summary` or traversal), never written into `relations`.
+
+**Preventing propagation from masquerading as observation.** O2O rows are *static structural facts* (a Package always contains its items, an Invoice always bills its orders). E2O rows are *event-scoped facts*. I never duplicate an O2O link as an E2O row, and I never store an "indirect" qualifier like `inherited_from_order`. Indirect reachability is recovered by the discovery algorithms, not asserted in the dataset.
+
+**PM4Py version assumption.** I assume a recent PM4Py release that supports `OCEL(events=..., objects=..., relations=..., o2o=...)` and the named discovery/flattening functions (`ocel_flattening`, `discover_ocdfg`, `discover_otg`, `discover_etot`, `discover_oc_petri_net`, `ocel_objects_interactions_summary`, `ocel_object_type_activities`, `ocel_get_object_types`). If the installed PM4Py exposes these under slightly different names (e.g., `OCEL.from_df` or `pm4py.objects.ocel.importer`), the single `OCEL(...)` line is the only thing to adjust; the four DataFrames are semantically valid OCEL 2.0 either way.
+
+## 2. Complete Python pipeline
+
+```python
+# ---------------------------------------------------------------
+# OCEL 2.0 in-memory construction + object-centric analysis
+# Retailer scenario: O100, O200 with shared packing & invoicing
+# ---------------------------------------------------------------
+
+import pandas as pd
+import pm4py
+from pm4py.objects.ocel.obj import OCEL
+
+# ---------- 1. Objects ----------
+objects = pd.DataFrame([
+    {"ocel:oid": "O100", "ocel:type": "Order"},
+    {"ocel:oid": "O200", "ocel:type": "Order"},
+    {"ocel:oid": "I1",   "ocel:type": "Item"},
+    {"ocel:oid": "I2",   "ocel:type": "Item"},
+    {"ocel:oid": "I3",   "ocel:type": "Item"},
+    {"ocel:oid": "P1",   "ocel:type": "Package"},
+    {"ocel:oid": "P2",   "ocel:type": "Package"},
+    {"ocel:oid": "D1",   "ocel:type": "Delivery"},
+    {"ocel:oid": "D2",   "ocel:type": "Delivery"},
+    {"ocel:oid": "V1",   "ocel:type": "Invoice"},
+    {"ocel:oid": "M1",   "ocel:type": "Payment"},
+    {"ocel:oid": "M2",   "ocel:type": "Payment"},
+])
+
+# ---------- 2. Events ----------
+# event_id, activity, timestamp (UTC, tz-aware), optional attributes
+event_rows = [
+    ("e01", "Create Order",       "2026-04-06 08:00:00", {"order_id": "O100"}),
+    ("e02", "Add Item",           "2026-04-06 08:05:00", {"item_id": "I1"}),
+    ("e03", "Add Item",           "2026-04-06 08:06:00", {"item_id": "I2"}),
+    ("e04", "Create Order",       "2026-04-06 08:10:00", {"order_id": "O200"}),
+    ("e05", "Add Item",           "2026-04-06 08:12:00", {"item_id": "I3"}),
+    ("e06", "Reserve Stock",      "2026-04-06 08:30:00", {"joint": True}),
+    ("e07", "Pack Package",       "2026-04-06 09:00:00", {"package_id": "P1"}),
+    ("e08", "Pack Package",       "2026-04-06 09:05:00", {"package_id": "P2"}),
+    ("e09", "Dispatch Package",   "2026-04-06 10:00:00", {"delivery_id": "D1"}),
+    ("e10", "Dispatch Package",   "2026-04-06 10:15:00", {"delivery_id": "D2"}),
+    ("e11", "Issue Invoice",      "2026-04-06 11:00:00", {"invoice_id": "V1", "total": 250}),
+    ("e12", "Record Payment",     "2026-04-06 11:30:00", {"payment_id": "M1", "amount": 100}),
+    ("e13", "Confirm Delivery",   "2026-04-06 13:00:00", {"delivery_id": "D1"}),
+    ("e14", "Confirm Delivery",   "2026-04-07 09:00:00", {"delivery_id": "D2"}),
+    ("e15", "Record Payment",     "2026-04-07 10:00:00", {"payment_id": "M2", "amount": 150}),
+    ("e16", "Close Order",        "2026-04-07 10:30:00", {"order_id": "O200"}),
+    ("e17", "Close Order",        "2026-04-07 10:35:00", {"order_id": "O100"}),
+]
+
+events = pd.DataFrame([
+    {
+        "ocel:eid": eid,
+        "ocel:activity": act,
+        "ocel:timestamp": pd.Timestamp(ts, tz="UTC"),
+        **attrs,
+    }
+    for (eid, act, ts, attrs) in event_rows
+])
+
+# ---------- 3. E2O relations (event -> object) ----------
+# Each row repeats activity + timestamp from `events` for consistency.
+def rel_rows(eid, oid, otype, qualifier):
+    row = events.loc[events["ocel:eid"] == eid].iloc[0]
+    return {
+        "ocel:eid": eid,
+        "ocel:activity": row["ocel:activity"],
+        "ocel:timestamp": row["ocel:timestamp"],
+        "ocel:oid": oid,
+        "ocel:type": otype,
+        "ocel:qualifier": qualifier,
+    }
+
+e2o_specs = [
+    # Order lifecycle
+    ("e01", "O100", "Order", "primary_target"),
+    ("e02", "O100", "Order", "operand"),       # item added into order
+    ("e02", "I1",   "Item",  "operand"),
+    ("e03", "O100", "Order", "operand"),
+    ("e03", "I2",   "Item",  "operand"),
+    ("e04", "O200", "Order", "primary_target"),
+    ("e05", "O200", "Order", "operand"),
+    ("e05", "I3",   "Item",  "operand"),
+
+    # Joint stock reservation: shared by both orders
+    ("e06", "O100", "Order", "primary_target"),
+    ("e06", "O200", "Order", "shared_by"),
+    ("e06", "I1",   "Item",  "operand"),
+    ("e06", "I3",   "Item",  "operand"),
+
+    # Packing
+    ("e07", "P1", "Package", "primary_target"),
+    ("e07", "I1", "Item",    "operand"),
+    ("e07", "I3", "Item",    "operand"),
+    ("e07", "O100", "Order", "container_of"),   # P1 is packed on behalf of O100 (I1)
+    ("e07", "O200", "Order", "container_of"),   # P1 is packed on behalf of O200 (I3)
+
+    ("e08", "P2", "Package", "primary_target"),
+    ("e08", "I2", "Item",    "operand"),
+    ("e08", "O100", "Order", "container_of"),
+
+    # Dispatch
+    ("e09", "P1", "Package", "primary_target"),
+    ("e09", "D1", "Delivery","container_of"),
+    ("e10", "P2", "Package", "primary_target"),
+    ("e10", "D2", "Delivery","container_of"),
+
+    # Invoicing: V1 bills both orders
+    ("e11", "V1",   "Invoice","primary_target"),
+    ("e11", "O100","Order",   "bill_target"),
+    ("e11", "O200","Order",   "bill_target"),
+
+    # Payments: each pays against V1
+    ("e12", "M1", "Payment",  "primary_target"),
+    ("e12", "V1", "Invoice",  "partially_settles"),
+    ("e15", "M2", "Payment",  "primary_target"),
+    ("e15", "V1", "Invoice",  "completes_settlement"),
+
+    # Confirmations
+    ("e13", "D1", "Delivery","primary_target"),
+    ("e14", "D2", "Delivery","primary_target"),
+
+    # Close order
+    ("e16", "O200","Order","primary_target"),
+    ("e17", "O100","Order","primary_target"),
+]
+
+relations = pd.DataFrame([rel_rows(eid, oid, otype, q) for (eid, oid, otype, q) in e2o_specs])
+
+# ---------- 4. O2O relations ----------
+o2o = pd.DataFrame([
+    # Order contains Item
+    {"ocel:oid": "O100", "ocel:oid_2": "I1", "ocel:qualifier": "contains"},
+    {"ocel:oid": "O100", "ocel:oid_2": "I2", "ocel:qualifier": "contains"},
+    {"ocel:oid": "O200", "ocel:oid_2": "I3", "ocel:qualifier": "contains"},
+    # Package packs Item
+    {"ocel:oid": "P1", "ocel:oid_2": "I1", "ocel:qualifier": "packs"},
+    {"ocel:oid": "P1", "ocel:oid_2": "I3", "ocel:qualifier": "packs"},
+    {"ocel:oid": "P2", "ocel:oid_2": "I2", "ocel:qualifier": "packs"},
+    # Delivery carries Package
+    {"ocel:oid": "D1", "ocel:oid_2": "P1", "ocel:qualifier": "carries"},
+    {"ocel:oid": "D2", "ocel:oid_2": "P2", "ocel:qualifier": "carries"},
+    # Invoice bills Order
+    {"ocel:oid": "V1", "ocel:oid_2": "O100", "ocel:qualifier": "bills"},
+    {"ocel:oid": "V1", "ocel:oid_2": "O200", "ocel:qualifier": "bills"},
+    # Payments settle Invoice
+    {"ocel:oid": "M1", "ocel:oid_2": "V1", "ocel:qualifier": "partially_settles"},
+    {"ocel:oid": "M2", "ocel:oid_2": "V1", "ocel:qualifier": "completes_settlement"},
+])
+
+# ---------- 5. Validation ----------
+assert events["ocel:eid"].is_unique, "duplicate event ids"
+assert objects["ocel:oid"].is_unique, "duplicate object ids"
+
+event_ids   = set(events["ocel:eid"])
+object_ids  = set(objects["ocel:oid"])
+
+assert set(relations["ocel:eid"]).issubset(event_ids),        "orphan event in relations"
+assert set(relations["ocel:oid"]).issubset(object_ids),       "orphan object in relations"
+assert set(o2o["ocel:oid"]).issubset(object_ids),             "orphan object in o2o (LHS)"
+assert set(o2o["ocel:oid_2"]).issubset(object_ids),           "orphan object in o2o (RHS)"
+
+# activity / timestamp must agree with events
+merged = relations.merge(
+    events[["ocel:eid", "ocel:activity", "ocel:timestamp"]],
+    on="ocel:eid", suffixes=("_rel", "_evt")
+)
+assert (merged["ocel:activity_rel"] == merged["ocel:activity_evt"]).all(), \
+    "activity mismatch between relations and events"
+assert (merged["ocel:timestamp_rel"] == merged["ocel:timestamp_evt"]).all(), \
+    "timestamp mismatch between relations and events"
+
+# no duplicate relation rows
+assert not relations.duplicated(
+    subset=["ocel:eid", "ocel:oid", "ocel:qualifier"]
+).any(), "duplicate (event, object, qualifier) relation rows"
+
+print("Validation passed.")
+
+# ---------- 6. Build the OCEL ----------
+ocel = OCEL(events=events, objects=objects, relations=relations, o2o=o2o)
+
+print("\n=== OCEL summary ===")
+print(ocel)
+
+print("\n=== Activity frequencies ===")
+print(pm4py.ocel_object_type_activities_count(ocel)
+      if hasattr(pm4py, "ocel_object_type_activities_count")
+      else events["ocel:activity"].value_counts())
+
+print("\n=== Object-type frequencies ===")
+print(objects["ocel:type"].value_counts())
+
+print("\n=== Object types from pm4py ===")
+print(pm4py.ocel_get_object_types(ocel))
+
+print("\n=== Activities per object type ===")
+print(pm4py.ocel_object_type_activities(ocel))
+
+# ---------- 7. Flattening + per-type DFG & log skeleton ----------
+flat_results = {}
+for otype in ["Order", "Package", "Delivery", "Invoice"]:
+    log = pm4py.ocel_flattening(ocel, otype)
+    dfg, start_acts, end_acts = pm4py.discover_dfg(log)
+    skeleton = pm4py.discover_log_skeleton(log)
+    flat_results[otype] = {
+        "log": log,
+        "dfg": (dfg, start_acts, end_acts),
+        "skeleton": skeleton,
+        "num_traces": len(log),
+        "num_events": sum(len(t) for t in log) if hasattr(log, "__iter__") else None,
+    }
+    print(f"\n--- {otype} ---")
+    print("traces:", flat_results[otype]["num_traces"])
+    print("start activities:", start_acts)
+    print("end activities:", end_acts)
+
+# ---------- 8. Object-centric discovery ----------
+ocdfg = pm4py.discover_ocdfg(ocel)
+otg   = pm4py.discover_otg(ocel)
+etot  = pm4py.discover_etot(ocel)
+ocpn  = pm4py.discover_oc_petri_net(ocel)
+interactions = pm4py.ocel_objects_interactions_summary(ocel)
+
+print("\n=== OC-DFG edges ===")
+print(ocdfg)
+print("\n=== OTG edges ===")
+print(otg)
+print("\n=== ET-OT edges ===")
+print(etot)
+print("\n=== Object interactions summary ===")
+print(interactions)
+
+# ---------- 9. Optional visualizations (commented; require graphviz) ----------
+# pm4py.view_ocdfg(ocdfg, format="png")
+# pm4py.view_oc_petri_net(ocpn, format="png")
+```
+
+## 3. Data-model audit
+
+**Object types and instances.**
+
+| Object type | Instances |
+|---|---|
+| Order    | O100, O200 |
+| Item     | I1, I2, I3 |
+| Package  | P1, P2 |
+| Delivery | D1, D2 |
+| Invoice  | V1 |
+| Payment  | M1, M2 |
+
+**O2O qualifiers and cardinalities.**
+
+| Qualifier | LHS | RHS | Count | Notes |
+|---|---|---|---|---|
+| contains | Order | Item | 3 | O100I1, O100I2, O200I3 |
+| packs | Package | Item | 3 | P1I1, P1I3, P2I2 |
+| carries | Delivery | Package | 2 | D1P1, D2P2 |
+| bills | Invoice | Order | 2 | V1O100, V1O200 |
+| partially_settles | Payment | Invoice | 1 | M1V1 (100 / 250) |
+| completes_settlement | Payment | Invoice | 1 | M2V1 (150 / 250) |
+
+**Activities and the object types they touch.**
+
+| Activity | Object types in E2O | Role of touch |
+|---|---|---|
+| Create Order (e01, e04) | Order | primary_target |
+| Add Item (e02, e03, e05) | Order, Item | order = operand container, item = operand |
+| Reserve Stock (e06) | Order, Order, Item, Item | O100=primary_target, O200=shared_by, I1/I3=operands |
+| Pack Package (e07, e08) | Package, Item, Order | package=primary_target, items=operands, order=container_of |
+| Dispatch Package (e09, e10) | Package, Delivery | package=primary_target, delivery=container_of |
+| Confirm Delivery (e13, e14) | Delivery | primary_target |
+| Issue Invoice (e11) | Invoice, Order | invoice=primary_target, orders=bill_target |
+| Record Payment (e12, e15) | Payment, Invoice | payment=primary_target, invoice=settles |
+| Close Order (e16, e17) | Order | primary_target |
+
+**Especially consequential relation set.** Event `e07` (Pack Package P1) is the pivot of the dataset: it has the largest E2O footprint (5 rows) and is the only event that touches *both* O100 and O200 *and* their items via the same Package. Any flattening on Order or Package that mishandles `e07` will collapse the cross-order convergence incorrectly. `e06` (Reserve Stock) is structurally similar but only binds items, not a package. `e11` (Issue Invoice V1) is the second pivot, linking finance to both Orders.
+
+## 4. Expected flattened behavior
+
+**Flatten on Order.** Two traces, one per order. Each trace begins with `Create Order` and ends with `Close Order`. The shared events `Reserve Stock` (e06), `Pack Package` (e07), and `Issue Invoice` (e11) appear in **both** traces because each of those events directly touches both Orders. This is the expected consequence of attaching a shared event to multiple orders at the source. `Record Payment` does *not* appear in either order trace because no direct E2O row links M1/M2 to an Order — they are reachable only through O2O propagation, which flattening typically does not follow. So Order traces look like:
+
+- O100: Create Order  Add Item(I1)  Add Item(I2)  Reserve Stock  Pack Package(P1)  Pack Package(P2)  Issue Invoice  Close Order.
+- O200: Create Order  Add Item(I3)  Reserve Stock  Pack Package(P1)  Issue Invoice  Close Order.
+
+DFG edges will show CreateAddReservePackIssueClose on both, with O100 carrying an extra Pack Package(P2) branch. **Misleading interpretation**: a reader may wrongly infer that O200 itself was "packed into P2" or that O100 "confirmed D2" — neither is true; the shared events are operationally about *both* orders but produce *separate* downstream logistics for each.
+
+**Flatten on Package.** Two traces (P1, P2). P1 contains `Pack Package(P1)  Dispatch Package(D1)  Confirm Delivery(D1)` (Dispatch and Confirm appear via the Delivery relation only if E2O includes them; here they do — PackPackage, DispatchPackage+Delivery, ConfirmDelivery). Because Pack Package(P1) directly references O100 *and* O200, those Orders also surface in the Package trace attributes; analysts may double-count the customer-facing consequence. P2 trace is simpler: Pack Package(P2)  Dispatch Package(D2)  Confirm Delivery(D2). **Omitted aspect**: items packed into the package are visible only via O2O; a flat event log loses the "what was inside" semantic, so a Package-only DFG cannot distinguish P1 (2 items, 2 orders) from P2 (1 item, 1 order).
+
+**Flatten on Delivery.** Two traces (D1, D2). Each is short: Dispatch Package  Confirm Delivery, with the Package and its indirectly associated Order/Item reachable only through O2O. Because Dispatch Package is the first event on each Delivery trace and Confirm Delivery the last, the DFG is the trivial two-node chain. **Misleading interpretation**: the apparent simplicity hides that D1 carries a *cross-order* package; flattening on Delivery alone makes the convergence invisible.
+
+**Flatten on Invoice.** One trace (V1): `Issue Invoice  Record Payment(M1)  Record Payment(M2)`. The two payments are naturally serialized by timestamp and by qualifier (`partially_settles` then `completes_settlement`). V1 also directly touches both Orders via `bill_target`, so an Invoice flattening that surfaces related Orders will show O100 and O200 side-by-side. **Omitted aspect**: which items belong to which order line on the invoice is not represented at all — that would require per-item invoice lines, which the scenario does not provide.
+
+**Why Payment flattening is particularly weak.** Each Payment object is touched by exactly one event (`Record Payment`). The resulting "trace" is a single event. A DFG on Payment has one node and no edges; a log skeleton has one trace of length 1. There is no sequential structure to mine. Worse, because M1 and M2 share the Invoice V1, flattening on Payment alone hides the fact that they together complete a single settlement. The *interesting* structure for payments is *between* M1 and M2 (sequential against V1) — only visible when flattening on Invoice or in the OTG/ET-OT.
+
+## 5. Expected object-centric structures
+
+**OC-DFG.** Two clusters separated by a single cross-cluster bridge. The Order side starts with `Create Order  Add Item  Reserve Stock  Pack Package` and ends with `Close Order`; the Package/Delivery side is `Pack Package  Dispatch Package  Confirm Delivery`; the Invoice/Payment chain is `Issue Invoice  Record Payment`. The bridge edges are produced by the shared events: `Reserve Stock` and `Pack Package(P1)` connect OrderItem; `Pack Package(P1)` also connects OrderPackage; `Issue Invoice` connects OrderInvoice; `Dispatch Package` and `Confirm Delivery` connect PackageDelivery. The OT side of the OC-DFG should show edges `OrderItem`, `PackageItem`, `DeliveryPackage`, `InvoiceOrder`, `PaymentInvoice`. The unusual cross-cluster edge is `OrderOrder` (via `shared_by` qualifier on e06) and `PackageOrder` via the `container_of` qualifier on e07/e08.
+
+**OTG.** A directed graph over object types. Expected edges (with qualifiers):
+
+- `Order  Item` (contains)
+- `Package  Item` (packs)
+- `Delivery  Package` (carries)
+- `Invoice  Order` (bills) — *reversed* direction relative to containment, reflecting that an invoice is downstream of orders.
+- `Payment  Invoice` (settles).
+
+Crucially, `Package  Order` does **not** appear in the OTG because O2O is between Package and Item (and Delivery and Package); the link PackageOrder is mediated by shared event e07, not by an O2O row. The OTG therefore *understates* Order's reach into logistics. This is a known property: OTGs reflect structural relations, not event-mediated ones.
+
+**ET-OT.** Bipartite graph over activities and object types. Expected connections:
+
+- `Create Order`, `Add Item`, `Close Order` connect to `Order`.
+- `Add Item`, `Reserve Stock`, `Pack Package` connect to `Item`.
+- `Reserve Stock`, `Pack Package`, `Dispatch Package` connect to `Order` (via shared_by/container_of).
+- `Pack Package`, `Dispatch Package` connect to `Package`.
+- `Dispatch Package`, `Confirm Delivery` connect to `Delivery`.
+- `Issue Invoice` connects to `Invoice` and `Order`.
+- `Record Payment` connects to `Payment` and `Invoice`.
+
+`Issue Invoice` is the only activity touching both `Invoice` and `Order`. `Reserve Stock` and `Pack Package(P1)` are the only activities that link two distinct `Order` instances through one event.
+
+**Object-centric Petri net.** A net where transitions are activities and places are typed by object types (or by E2O qualifiers, depending on the discovery variant). P1's packing produces the cross-order synchronization point: the transition `Pack Package` consumes one Item token from O100 and one from O200, and produces a Package token that flows through `Dispatch Package` and `Confirm Delivery` on the Delivery side. The net has *multiple* sound interpretations — e.g., one could equivalently see `Pack Package` as a parallel split feeding both deliveries, or as a join that synchronizes two otherwise independent order flows. The OC-net should not be presented as having a unique execution semantics.
+
+**Object-interactions summary.** A matrix/table counting how often pairs of objects co-occur in events. The most frequent pair should be `(O100, I1)` and `(O100, I2)` (twice: Add Item + container_of Pack Package), followed by `(O200, I3)` and `(P1, I1)`/`(P1, I3)`. The `(O100, O200)` pair appears once (Reserve Stock) and again via V1 (Issue Invoice). The `(V1, M1)` and `(V1, M2)` pairs each appear once. The summary makes the cross-order convergence at V1 and at Reserve Stock conspicuous — exactly the structural insight a traditional log would lose.
+
+## 6. Modeling alternatives
+
+1. **Source-minimal relations.** Drop the `container_of` rows on e07/e08 and the `shared_by` row on e06; keep only `primary_target` + `operand` for items. Pros: relations mirror exactly what a system would have logged; the dataset is the smallest defensible one. Cons: flattening on Order loses `Pack Package` and `Reserve Stock`; convergence only emerges from OTG/ET-OT/OCPN analysis. Discovery results on flattened logs look "thinner", but object-centric discovery still recovers most of the story.
+
+2. **Full operational involvement.** Add a direct `Order` relation to *every* downstream event that transitively involves it — Dispatch, Confirm Delivery, Issue Invoice, Record Payment, and even Close Order via M1/M2. Pros: every flattening becomes maximally informative; Order traces contain the full lifecycle. Cons: relations become redundant with O2O; the dataset conflates *observed* involvement with *derived* involvement; PM4Py may count spurious edges in OC-DFG because the same `(Order, activity)` pair appears via two different qualifiers. The business story is unchanged but the discovered models become noisier and the relation table balloons.
+
+3. **O2O-propagated analytical relations.** Do not add any direct `Order` rows on e06/e07/e11; instead, compute and store an `inherited_from` set of E2O rows derived by walking O2O from each event's operands. Pros: relation table is smaller and consistent (each object's only E2O rows are the *immediate* ones); discovery still finds cross-order paths because the propagated rows are explicit. Cons: those propagated rows are now indistinguishable from source rows in the OCEL — a reviewer cannot tell fact from inference. This is the policy most likely to mislead consumers of the dataset later.
+
+4. **(Bonus) Finance-only on Payment, ignore O2O to Order.** Skip the `bill_target` qualifier on `Issue Invoice`; let payment-to-order reachability emerge through O2O at analysis time. Pros: keeps finance events focused on financial objects; O2O becomes the single source of orderinvoice truth. Cons: Invoice flattening loses the multi-order context, and ET-OT will not show `Issue Invoice` connected to `Order`. The OC-DFG still finds the path through O2O at analysis time, but only if the discovery implementation traverses O2O.
+
+## 7. Failure modes
+
+1. **Relation inflation.** Adding direct `Order` rows to every logistics/finance event duplicates information already in O2O and makes OC-DFG counts unreliable because the same logical interaction is counted multiple times.
+2. **Missing direct E2O links.** Forgetting the `Order` rows on e06/e07/e11 (the shared events) means Order flattening loses convergence entirely; the OC-net still recovers it, but flattened DFGs become misleading.
+3. **Treating O2O propagation as observation.** Writing derived E2O rows into `relations` and labelling them like source rows destroys the audit trail; downstream analysts cannot distinguish facts from inferences.
+4. **Duplicate shared events after flattening.** When two traces both contain the same event id (because that event directly touches two objects), naive trace concatenation creates apparent duplication. A correct flattening treats the *same* event id appearing in two traces as one logical event witnessed by two cases; PM4Py handles this, but custom post-processing can corrupt it.
+5. **Ambiguous payment allocation.** M1 and M2 are both linked to V1 with the same qualifier family; without an explicit `partially_settles` vs `completes_settlement` distinction, an analyst cannot tell that V1 went from partially paid to fully paid. The qualifier vocabulary must capture this, otherwise the financial lifecycle is invisible.
+6. **Overly short Payment traces.** Each Payment has a single event, so flattening on Payment yields traces of length 1 — useless for DFG/skeleton mining. Mitigation: analyse Payment through OTG/ET-OT or flatten on Invoice instead.
+7. **Constructor/API version mismatch.** Older PM4Py releases may not accept `o2o=` or may name the function differently. Isolating the single `OCEL(events=..., objects=..., relations=..., o2o=...)` line is the correct adaptation point; changing data semantics to fit an older API would be wrong.
+8. **False total order for same-time events.** Two events at identical timestamps are not ordered; OCEL 2.0 represents partial order. Forcing an arbitrary tie-break (e.g., lexicographic eid) silently introduces ordering that does not exist in reality. Here we have no timestamp ties, but the construction must not introduce one (e.g., by sorting and reindexing).
+9. **Qualifier drift.** Using `bill_target` on one Invoice event and `billed_by` on another breaks aggregation because qualifiers are not normalized. A closed vocabulary is mandatory.
+10. **Orphan IDs from typing errors.** A misspelled `Order` vs `order` in `ocel:type` silently splits one object type into two, fragmenting discovery. Type values must be exact and centralized.
+
+## 8. Final semantic checks
+
+1. `len(events) == 17` and `events["ocel:eid"].is_unique`.
+2. `len(objects) == 12` and `objects["ocel:oid"].is_unique`.
+3. Every event id in `relations["ocel:eid"]` exists in `events["ocel:eid"]`, and every object id in `relations["ocel:oid"]` exists in `objects["ocel:oid"]`.
+4. For each row in `relations`, `ocel:activity` and `ocel:timestamp` equal those of the matching `events` row with the same `ocel:eid`.
+5. O2O contains exactly: 3 `contains` rows, 3 `packs` rows, 2 `carries` rows, 2 `bills` rows, and 2 paymentinvoice rows with qualifiers `partially_settles` and `completes_settlement`.
+6. Event `e07` has E2O rows for `P1`, `I1`, `I3`, `O100`, `O200` (cross-order convergence).
+7. Event `e11` has E2O rows for `V1`, `O100`, `O200` (single invoice, two orders).
+8. Events `e12` and `e15` each have one Invoice E2O row with different qualifiers (`partially_settles` vs `completes_settlement`), and the `Record Payment` event carries an `amount` attribute in `events` (not modelled as a separate object).
+9. `pm4py.ocel_get_object_types(ocel)` returns the six types in §1.
+10. No relation row is duplicated on `(ocel:eid, ocel:oid, ocel:qualifier)`.
+11. Flattening on Order produces exactly 2 traces; flattening on Invoice produces exactly 1 trace; flattening on Payment produces 2 single-event traces.

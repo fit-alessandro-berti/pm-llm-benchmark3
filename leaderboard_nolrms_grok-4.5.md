@@ -6,7 +6,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | ------------------------------ | -------- | ------------------ | --- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
 | gpt-5.6-sol-NONE               | **42.4** | :x:                | :x: | :mage_woman: **5.1** | :mage_woman: **5.0** | **5.3**              | :mage_woman: **5.1** | :mage_woman: **5.3** | :mage_woman: **5.5** | :mage_woman: **5.6** | **5.7**              |
 | gpt-5.6-terra-NONE             | **41.4** | :x:                | :x: | **4.9**              | **4.9**              | :mage_woman: **5.4** | 4.7                  | 4.9                  | :mage_woman: **5.5** | **5.3**              | :mage_woman: **5.8** |
-| claude-sonnet-5                | **36.9** | :x:                | :x: | 4.6                  | 3.3                  | **5.2**              | 4.2                  | 3.8                  | 5.1                  | **5.3**              | 5.4                  |
+| claude-sonnet-5                | **37.1** | :x:                | :x: | 4.6                  | 3.5                  | **5.2**              | 4.2                  | 3.8                  | 5.1                  | **5.3**              | 5.4                  |
 | claude-haiku-4-5               | **31.9** | :x:                | :x: | 4.1                  | 3.5                  | 4.2                  | 3.6                  | 3.5                  | 4.1                  | 4.5                  | 4.4                  |
 | ministral-14b-2512             | **22.7** | :white_check_mark: | :x: | 2.7                  | 2.1                  | 2.4                  | 2.1                  | 2.5                  | 3.1                  | 4.0                  | 3.8                  |
 | ministral-8b-2512              | **22.3** | :white_check_mark: | :x: | 2.9                  | 2.1                  | 2.8                  | 1.9                  | 2.3                  | 3.0                  | 3.7                  | 3.5                  |
@@ -136,7 +136,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 7.2   |
 | cat08_07_contradictory_evidence_memo           | 8.4   |
 
-### claude-sonnet-5   => 36.9 points
+### claude-sonnet-5   => 37.1 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -147,6 +147,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat01_05_mixed_drift_attribution               | 7.5   |
 | cat01_06_intervention_transportability         | 7.0   |
 | cat01_07_case_counterfactuals                  | 7.0   |
+| cat02_01_reconstruct_partial_queue             | 2.0   |
 | cat02_02_infer_queue_disciplines               | 3.0   |
 | cat02_03_fork_join_delay_decomposition         | 7.8   |
 | cat02_04_batching_vs_bulk_logging              | 8.4   |

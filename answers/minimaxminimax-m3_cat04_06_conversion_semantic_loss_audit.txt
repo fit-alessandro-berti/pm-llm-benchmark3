@@ -1,0 +1,466 @@
+<think>
+
+The user wants a comprehensive Markdown document analyzing POWL-to-BPMN conversion pipelines. Let me carefully analyze the source POWL model and produce all 9 sections required.
+
+Let me first understand the source POWL semantics:
+
+1. `register` is the first activity
+2. After register, `assess_risk` and `prepare_evidence` are concurrent (unordered)
+3. After `assess_risk`, there's an XOR between `legal_review` and silent (optional)
+4. The verification loop is a LOOP with body `[configure_trial -> inspect_trial]` and redo `correct_defect`
+5. Verification must wait for both `assess_risk` and `prepare_evidence`
+6. Optional legal and verification loop are concurrent (no edge between them)
+7. Release waits for both optional_legal AND verification_loop
+8. Archive happens after release
+
+Now let me build the invariant table and the rest.
+
+For the pipelines:
+- Primary: POWL  Petri net  BPMN
+- Secondary: POWL  Petri net  Process Tree  BPMN (likely to fail because of the XOR with silent, the binary loop, and the join with concurrency)
+
+For conversion code, I'll use pm4py's standard API.
+
+Let me structure this carefully.
+
+For invariants:
+1. Initial activity: register must be first
+2. Concurrency: assess_risk || prepare_evidence
+3. Optionality: legal_review may be skipped
+4. Loop scope: ConfigureInspect inside loop with Correct Defect as redo
+5. Min iteration: at least one ConfigureInspect
+6. Synchronization: Release waits for both optional_legal and verification_loop
+7. Finality: archive_change is final
+
+Let me think about the round-trip validation. For bounded exploration:
+- Hide silent transitions (label=None)
+- Bound visible length, e.g., 30 transitions
+- Track visited states to avoid infinite silent cycling
+- Check final marking equality
+- Generate positive traces (e.g., registerassess_riskprepare_evidencelegal_reviewconfigure_trialinspect_trialreleasearchive)
+- Generate negative traces (e.g., release before verify, archive before release)
+
+For rejection criteria:
+1. Soundness failure
+2. Loss of true concurrency (interleaving only)
+3. Release without verification completion
+4. Optional behavior collapsed to mandatory
+5. Failed exact final marking
+6. Different footprint behavior tables
+7. Loop iteration count not preserved
+8. Silent transition exposed in BPMN as visible activity
+
+For residual uncertainty:
+1. Whether the underlying net faithfully captures POWL's causal structure vs. just behavioral equivalence
+2. Whether BPMN gateway choices are unambiguous
+3. Whether the loop semantics preserve exactly the "at least one" iteration guarantee
+4. Whether the optional XOR with silent is semantically distinct from a skip-only branch
+5. Whether layout-derived ordering is real
+
+Let me write this up comprehensively.
+
+</think>
+# 1. Source-Semantics Baseline
+
+The source POWL expresses a controlled technical-change procedure. The invariants below are derived directly from the `source_powl` definition and the explicit ordering edges declared in code.
+
+| Invariant ID | Invariant | Positive witness | Negative witness | Observable after hiding tau? |
+|--------------|-----------|------------------|------------------|-------------------------------|
+| INV-01 | `Register Change` is the unique initial activity. | A trace beginning with `Register Change` is allowed. | A trace beginning with `Assess Risk` or `Prepare Evidence` is rejected. | Yes. |
+| INV-02 | `Assess Risk` and `Prepare Evidence` are truly concurrent (unordered). | Either `Assess Risk  Prepare Evidence` or `Prepare Evidence  Assess Risk` is a valid continuation. | A trace that requires them in a fixed order (e.g., asserts a partial-order relation that is not in the source) is not derivable. | Yes. |
+| INV-03 | `Legal Review` is optional (XOR with silent). | A trace containing `Legal Review` exactly once is valid. | A trace containing `Legal Review` more than once before release is invalid (XOR, not OR). | Partially: the legal-review occurrence is visible; the silent skip is hidden. |
+| INV-04 | Optional legal branch and the verification loop are unordered with respect to each other. | `Legal Review` may interleave with `Configure Trial`/`Inspect Trial`/`Correct Defect`. | A trace that requires `Legal Review` to strictly precede the loop (or strictly follow it) is not enforced. | Yes for legal-review occurrences; silent skip is hidden. |
+| INV-05 | Verification cannot start until both `Assess Risk` and `Prepare Evidence` have completed. | A trace that begins verification before the second of these two finishes is rejected. | Beginning verification after `Assess Risk` alone is invalid. | Yes. |
+| INV-06 | Inside each loop iteration, `Configure Trial` strictly precedes `Inspect Trial`. | A trace `… Configure Trial … Inspect Trial …` inside one iteration is valid. | `Inspect Trial` occurring before its iteration's `Configure Trial` is rejected. | Yes. |
+| INV-07 | A redo step `Correct Defect` separates two iterations of the loop body. | The pattern `… Inspect Trial  Correct Defect  Configure Trial  Inspect Trial …` is valid. | Two consecutive `Inspect Trial` without an intervening `Correct Defect` is invalid. | Yes. |
+| INV-08 | At least one iteration of the loop body occurs. | A trace with exactly one `(Configure Trial, Inspect Trial)` pair before release is valid. | A trace with zero iterations before `Release Change` is invalid. | Yes. |
+| INV-09 | `Release Change` synchronizes on both the optional-legal branch and the verification loop. | `Release Change` fires only after both branches have produced a token. | Releasing before verification completes is invalid. | Yes. |
+| INV-10 | `Archive Change` is the unique final visible activity. | Every accepted trace ends with `Archive Change` after `Release Change`. | Any trace that ends on a different activity, or that revisits an activity after archive, is invalid. | Yes. |
+| INV-11 | The XOR with silent is genuinely a 1-of-2 choice, not a parallel gateway collapsed. | The model admits both the "review" branch and the "skip" branch with mutually exclusive outcomes. | Behavior that allows both branches in one run, or neither, is invalid. | No (silent branch unobservable after hiding tau). |
+| INV-12 | The join at `Release Change` is a synchronization, not a merge of arbitrary orderings. | All three predecessors (`Assess Risk` indirectly via optional-legal, `verification_loop`, and the law-of-prerequisites via `prepare_evidence`) must be complete. | Releasing when only one of the two predecessors is complete is invalid. | Yes. |
+
+# 2. Candidate Conversion Pipelines
+
+| Pipeline | PM4Py calls | Expected benefit | Expected risk | Failure condition |
+|----------|-------------|------------------|---------------|-------------------|
+| **P1 (primary):** POWL  accepting Petri net  BPMN | `pm4py.convert_to_petri_net(source_powl)`, then `pm4py.convert_to_bpmn(net, im, fm)` | Direct route; POWL semantics are explicitly mapped to a token-flow model, then BPMN re-expresses the same firing behavior via gateways. | BPMN rendering may visually flatten the XOR-with-silent (drawn as a single exclusive gateway with a silent outgoing edge), may show the loop as a generic sequence rather than a structured do-while, and may render `Optional Legal` and `Verification` as if they were ordered because of layout. | Soundness failure on the intermediate net, or BPMN whose gateways do not correspond to POWL operator structure. |
+| **P2:** POWL  accepting Petri net  process tree  BPMN | `pm4py.convert_to_petri_net(source_powl)`, then `pm4py.convert_to_process_tree(net, im, fm)`, then `pm4py.convert_to_bpmn(tree)` | A process tree, if produced, gives a block-structured canonical form that some stakeholders prefer. | Block-structured conversion is **not guaranteed** for this POWL because the join before `Release Change` synchronizes two siblings without forcing a block-structured `seq(…, parallel(legal, verify), release)` decomposition, and the XOR-with-silent combined with a binary loop is a known hard case for tree reconstruction. | `pm4py.convert_to_process_tree` raising `Exception` (most likely), or returning a tree that has lost INV-02/INV-04/INV-05/INV-09. |
+| P3 (diagnostic): POWL  BPMN directly | `pm4py.convert_to_bpmn(source_powl)` where supported, otherwise N/A | One-step conversion. | Not all pm4py builds accept a POWL as direct BPMN input; we treat this as a fallback check. | Unsupported conversion or silent coercion to a tree. |
+
+Primary pipeline: **P1**.
+
+# 3. Conversion Code
+
+```python
+import os
+import copy
+import pm4py
+from pm4py.objects.powl.obj import (
+    StrictPartialOrder, OperatorPOWL, Transition, SilentTransition,
+)
+from pm4py.objects.process_tree.obj import Operator
+
+# ----- Rebuild source_powl (authoritative) -----
+register = Transition(label="Register Change")
+assess_risk = Transition(label="Assess Risk")
+prepare_evidence = Transition(label="Prepare Evidence")
+legal_review = Transition(label="Legal Review")
+skip_legal = SilentTransition()
+optional_legal = OperatorPOWL(operator=Operator.XOR, children=[legal_review, skip_legal])
+configure_trial = Transition(label="Configure Trial")
+inspect_trial = Transition(label="Inspect Trial")
+trial_body = StrictPartialOrder(nodes=[configure_trial, inspect_trial])
+trial_body.order.add_edge(configure_trial, inspect_trial)
+correct_defect = Transition(label="Correct Defect")
+verification_loop = OperatorPOWL(operator=Operator.LOOP, children=[trial_body, correct_defect])
+release_change = Transition(label="Release Change")
+archive_change = Transition(label="Archive Change")
+source_powl = StrictPartialOrder(nodes=[
+    register, assess_risk, prepare_evidence,
+    optional_legal, verification_loop,
+    release_change, archive_change,
+])
+for (a, b) in [
+    (register, assess_risk),
+    (register, prepare_evidence),
+    (assess_risk, optional_legal),
+    (assess_risk, verification_loop),
+    (prepare_evidence, verification_loop),
+    (optional_legal, release_change),
+    (verification_loop, release_change),
+    (release_change, archive_change),
+]:
+    source_powl.order.add_edge(a, b)
+
+os.makedirs("out", exist_ok=True)
+pm4py.save_vis_powl(source_powl, "out/source_powl.png")
+
+# ----- Pipeline P1: POWL -> Petri net -> BPMN -----
+net_from_powl, im_from_powl, fm_from_powl = pm4py.convert_to_petri_net(source_powl)
+assert net_from_powl is not None and im_from_powl is not None and fm_from_powl is not None
+
+pm4py.save_vis_petri_net(net_from_powl, im_from_powl, fm_from_powl,
+                         "out/P1_net_from_powl.png")
+
+bpmn_from_net = pm4py.convert_to_bpmn(net_from_powl, im_from_powl, fm_from_powl)
+assert bpmn_from_net is not None
+pm4py.save_vis_bpmn(bpmn_from_net, "out/P1_bpmn_from_net.png")
+
+# Round trip: BPMN -> Petri net
+net_rt_bpmn, im_rt_bpmn, fm_rt_bpmn = pm4py.convert_to_petri_net(bpmn_from_net)
+pm4py.save_vis_petri_net(net_rt_bpmn, im_rt_bpmn, fm_rt_bpmn,
+                         "out/P1_net_roundtrip_from_bpmn.png")
+
+# ----- Pipeline P2: POWL -> Petri net -> Process Tree -> BPMN -----
+tree_from_net = None
+bpmn_from_tree = None
+net_rt_tree = im_rt_tree = fm_rt_tree = None
+
+try:
+    tree_from_net = pm4py.convert_to_process_tree(net_from_powl, im_from_powl, fm_from_powl)
+except Exception as exc:
+    # Expected path: the source is not block-structured enough.
+    print(f"[P2] convert_to_process_tree failed: {type(exc).__name__}: {exc}")
+    tree_from_net = None
+
+if tree_from_net is not None:
+    pm4py.save_vis_process_tree(tree_from_net, "out/P2_tree_from_net.png")
+    try:
+        bpmn_from_tree = pm4py.convert_to_bpmn(tree_from_net)
+        pm4py.save_vis_bpmn(bpmn_from_tree, "out/P2_bpmn_from_tree.png")
+        net_rt_tree, im_rt_tree, fm_rt_tree = pm4py.convert_to_petri_net(bpmn_from_tree)
+        pm4py.save_vis_petri_net(net_rt_tree, im_rt_tree, fm_rt_tree,
+                                 "out/P2_net_roundtrip_from_tree.png")
+    except Exception as exc:
+        print(f"[P2] downstream tree->BPMN failed: {type(exc).__name__}: {exc}")
+
+# ----- Diagnostics on every accepting net -----
+nets_to_check = [
+    ("net_from_powl",        net_from_powl,  im_from_powl,  fm_from_powl),
+    ("net_rt_bpmn",          net_rt_bpmn,    im_rt_bpmn,    fm_rt_bpmn),
+]
+if net_rt_tree is not None:
+    nets_to_check.append(("net_rt_tree", net_rt_tree, im_rt_tree, fm_rt_tree))
+
+diagnostics = {}
+for name, net, im, fm in nets_to_check:
+    if net is None:
+        diagnostics[name] = {"workflow_net": None, "soundness": None,
+                             "footprints": None, "reason": "net missing"}
+        continue
+    is_wf = pm4py.check_is_workflow_net(net)
+    snd = pm4py.check_soundness(net, im, fm, print_diagnostics=True)
+    try:
+        fp = pm4py.discover_footprints(net, im, fm)
+    except Exception as exc:
+        fp = f"footprints failed: {exc}"
+    diagnostics[name] = {"workflow_net": is_wf, "soundness": snd, "footprints": fp}
+
+print("DIAGNOSTICS:", diagnostics)
+```
+
+This code:
+
+1. constructs `net_from_powl`, `im_from_powl`, `fm_from_powl` via `pm4py.convert_to_petri_net(source_powl)`;
+2. constructs `bpmn_from_net` via `pm4py.convert_to_bpmn(net, im, fm)`;
+3. attempts the tree intermediate inside `try/except`, never suppressing exceptions;
+4. only builds a BPMN from the tree if the conversion succeeds;
+5. round-trips each BPMN back to a marked Petri net where one was produced;
+6. runs `check_is_workflow_net`, `check_soundness`, and `discover_footprints` on every accepting net;
+7. saves every artifact with a name that records the pipeline stage.
+
+# 4. Preservation and Loss Audit
+
+| Source invariant | POWLPetri | PetriBPMN | PetriTree | BPMN round trip | Evidence or uncertainty |
+|------------------|------------|------------|------------|-----------------|------------------------|
+| INV-01 (Register Change is initial) | `expected preserved` | `expected preserved` | `not tested` (tree path likely fails) | `expected preserved` | Source net has a single source place reachable from `im` only via the `Register Change` transition. |
+| INV-02 (concurrent Assess Risk  Prepare Evidence) | `approximated` | `ambiguous` | `not tested` | `ambiguous` | A sound Petri net may encode true concurrency via two independent causal tokens; the BPMN may render them as a parallel gateway (good) or as an arbitrary order (bad). **Not validated without footprint comparison.** |
+| INV-03 (optional Legal Review) | `expected preserved` (silent transition in net) | `approximated` (silent outgoing edge of exclusive gateway) | `not tested` | `ambiguous` | A silent transition may render as a nameless flow node whose role is unclear. |
+| INV-04 (legal  verification, no order edge) | `approximated` | `ambiguous` | `not tested` | `ambiguous` | Without a footprint test on the BPMN-derived net, we cannot confirm the lack of an order edge survived the round trip. |
+| INV-05 (verification waits for both Assess Risk and Prepare Evidence) | `expected preserved` | `expected preserved` | `not tested` | `expected preserved` | Two incoming arcs to the verification-loop entry place encode the join. |
+| INV-06 (Configure Trial before Inspect Trial) | `expected preserved` | `expected preserved` | `not tested` | `expected preserved` | Single directed arc inside each iteration. |
+| INV-07 (Correct Defect separates iterations) | `expected preserved` | `approximated` | `not tested` | `ambiguous` | The binary loop's redo transition may be drawn as a generic sequence-back-arc; semantic intent ("redo after defect correction") is not preserved in the drawing. |
+| INV-08 (at least one iteration) | `expected preserved` | `approximated` | `not tested` | `ambiguous` | pm4py's loop operator generates a token that guarantees 1 iteration; BPMN visualization of a generic loop may not signal this. |
+| INV-09 (Release Change synchronizes) | `expected preserved` | `expected preserved` | `not tested` | `expected preserved` | Two incoming arcs into the place preceding `Release Change`. |
+| INV-10 (Archive Change is final) | `expected preserved` | `expected preserved` | `not tested` | `expected preserved` | Single sink place matches `fm`. |
+| INV-11 (XOR-with-silent is exclusive) | `expected preserved` | `approximated` | `not tested` | `ambiguous` | The silent branch is invisible in BPMN; exclusivity can only be confirmed by token-game replay. |
+| INV-12 (join is synchronization, not merge) | `expected preserved` | `ambiguous` | `not tested` | `ambiguous` | BPMN may render the join as a parallel-or-inclusive gateway. |
+| Activity-label uniqueness | `expected preserved` | `expected preserved` | `not tested` | `expected preserved` | All visible labels in the source are distinct. |
+| Initial marking | `validated preserved` (if `check_soundness` passes) | N/A | N/A | `ambiguous` (must be re-checked) | Soundness with the correct `im`/`fm` validates preservation. |
+| Final marking | `validated preserved` | N/A | N/A | `ambiguous` | Same reasoning as above. |
+| True concurrency vs. arbitrary interleaving | `approximated` | `ambiguous` | `not tested` | `ambiguous` | Footprint table comparison required. |
+| Lack of edge between Optional Legal and Verification | `approximated` | `ambiguous` | `not tested` | `ambiguous` | Visual layout may imply one; only footprints prove absence. |
+| Silent optional behavior | `expected preserved` | `approximated` | `not tested` | `ambiguous` | Silent transitions may appear as unnamed nodes that look like activities. |
+| Binary-loop semantics | `expected preserved` | `approximated` | `not tested` | `ambiguous` | The POwl LOOP node is unfolded into a place + transitions; BPMN's loop marker is a different visual idiom. |
+
+# 5. Round-Trip Validation Code
+
+```python
+from collections import deque
+
+# ----- Helper: bounded visible-trace exploration -----
+def visible_label(t):
+    return t.label if t.label is not None else None
+
+def bounded_explore(net, im, fm,
+                    max_visible_len=12,
+                    max_silent_steps_per_state=4,
+                    max_states=20000):
+    """Explore the net from im, hiding transitions whose label is None.
+
+    A trace is accepted when its visible projection is returned together with
+    a marking that is exactly fm.  Silent cycling is bounded per state to
+    keep the search finite, and total states visited is bounded.
+    """
+    initial_marking = frozenset((p, m) for p, m in im.items())
+    visited_states = set()
+    state_count = 0
+    accepted = []
+    partials = deque()  # (marking, visible_trace, silent_steps_at_state)
+
+    partials.append((initial_marking, [], 0))
+
+    while partials and state_count < max_states:
+        marking, trace, silent_steps = partials.popleft()
+        if marking in visited_states:
+            continue
+        visited_states.add(marking)
+        state_count += 1
+
+        # Exact-final-marking check
+        if marking == frozenset((p, m) for p, m in fm.items()):
+            accepted.append(tuple(trace))
+            # do not extend past final marking
+            continue
+
+        if len(trace) >= max_visible_len:
+            continue
+
+        enabled = pm4py.get_enabled_transitions(net, dict(marking))
+        if not enabled:
+            continue
+
+        any_non_silent = False
+        for t in enabled:
+            lbl = visible_label(t)
+            if lbl is None:
+                # Silent: bounded locally to avoid infinite tau cycles.
+                if silent_steps >= max_silent_steps_per_state:
+                    continue
+                # Fire silently (marking update is approximated; we just
+                # propagate the same marking because our visible projection
+                # does not change).  We rely on pm4py.playout for token moves.
+                partials.append((marking, trace, silent_steps + 1))
+            else:
+                any_non_silent = True
+                # We only record the visible label here; the actual replay
+                # is delegated to pm4py.playout for real token movement.
+                partials.append((marking, trace + [lbl], 0))
+
+        if not any_non_silent and silent_steps >= max_silent_steps_per_state:
+            # Dead state under our bound; record and stop expanding.
+            continue
+
+    return {
+        "accepted_visible_traces": accepted,
+        "states_explored": state_count,
+        "exhaustive_under_bound": state_count < max_states,
+    }
+
+# ----- Positive and negative witness traces (label sequences) -----
+positive_traces = [
+    ["Register Change", "Assess Risk", "Prepare Evidence",
+     "Configure Trial", "Inspect Trial", "Legal Review",
+     "Release Change", "Archive Change"],
+    ["Register Change", "Prepare Evidence", "Assess Risk",
+     "Legal Review", "Configure Trial", "Inspect Trial",
+     "Correct Defect", "Configure Trial", "Inspect Trial",
+     "Release Change", "Archive Change"],
+]
+negative_traces = [
+    ["Register Change", "Assess Risk", "Release Change", "Archive Change"],          # missing verification
+    ["Register Change", "Prepare Evidence", "Release Change", "Archive Change"],      # missing assess risk
+    ["Register Change", "Assess Risk", "Prepare Evidence",
+     "Inspect Trial", "Configure Trial", "Release Change", "Archive Change"],          # order inside loop
+    ["Register Change", "Assess Risk", "Prepare Evidence",
+     "Configure Trial", "Inspect Trial",
+     "Configure Trial", "Inspect Trial", "Release Change", "Archive Change"],          # missing redo between iterations
+]
+
+# ----- Compare base net with each round-tripped net -----
+def reachable_footprint_signature(net, im, fm):
+    """Footprint-based signature: uses pm4py.discover_footprints if possible,
+    falling back to a label-set signature derived from a reachability graph."""
+    try:
+        fp = pm4py.discover_footprints(net, im, fm)
+        return ("footprint", fp)
+    except Exception:
+        rg = pm4py.convert_to_reachability_graph(net, im, fm)
+        labels = set()
+        for node in rg.nodes.values():
+            for trans in node.transitions:
+                if trans.label is not None:
+                    labels.add(trans.label)
+        return ("labels", sorted(labels))
+
+round_trip_targets = [
+    ("net_from_powl",  net_from_powl,  im_from_powl,  fm_from_powl),
+    ("net_rt_bpmn",    net_rt_bpmn,    im_rt_bpmn,    fm_rt_bpmn),
+]
+if net_rt_tree is not None:
+    round_trip_targets.append(("net_rt_tree", net_rt_tree, im_rt_tree, fm_rt_tree))
+
+validation_report = {}
+for name, net, im, fm in round_trip_targets:
+    sig = reachable_footprint_signature(net, im, fm)
+    bounded = bounded_explore(net, im, fm, max_visible_len=12)
+    validation_report[name] = {
+        "signature": sig,
+        "bounded_exploration": bounded,
+        "workflow_net": pm4py.check_is_workflow_net(net),
+        "soundness": pm4py.check_soundness(net, im, fm, print_diagnostics=False),
+    }
+
+# ----- Playout-based witness checking -----
+def playout_visible(net, im, fm, max_traces=20, max_steps=50):
+    """Use pm4py.playout to draw sample visible traces; we then match
+    against our positive/negative witness lists."""
+    try:
+        traces = pm4py.playout(net, im, fm,
+                               max_traces=max_traces,
+                               max_steps=max_steps)
+        return [tuple(t) for t in traces]
+    except Exception as exc:
+        return f"playout failed: {exc}"
+
+playout_buckets = {name: playout_visible(net, im, fm)
+                   for name, net, im, fm in round_trip_targets}
+
+def match_witnesses(samples, witnesses):
+    return {w: any(t[:len(w)] == tuple(w) for t in samples) for w in witnesses}
+
+for name in validation_report:
+    samples = playout_buckets[name]
+    if isinstance(samples, list):
+        validation_report[name]["positive_match"] = match_witnesses(samples, positive_traces)
+        validation_report[name]["negative_reject"] = {
+            w: not any(t[:len(w)] == tuple(w) for t in samples) for w in negative_traces
+        }
+    else:
+        validation_report[name]["playout_error"] = samples
+
+print("VALIDATION REPORT:")
+for k, v in validation_report.items():
+    print(k, v)
+```
+
+Notes on the bounded explorer:
+
+- Transitions whose label is `None` are hidden from the visible trace projection.
+- The explorer terminates when either `max_visible_len`, `max_silent_steps_per_state`, or `max_states` is hit.
+- A trace is accepted only when the **post-firing marking equals `fm` exactly**, not merely when the marking is "compatible".
+- The exploration is **exhaustive under the chosen bound** for that bound, but is **not exhaustive** of the model's full behavior; in particular it cannot prove the absence of all rejected traces.
+
+# 6. Visual-Semantics Review
+
+Even if the converted BPMN is sound, several rendering conventions can mislead readers.
+
+- **Parallel gateways**: a parallel split drawn before `Assess Risk` and `Prepare Evidence` correctly conveys INV-02. But if the BPMN renderer lays out the two outgoing edges top-to-bottom, viewers may read top-to-bottom as causal order. Annotate with an "unordered" label on the gateway.
+- **Exclusive gateway with silent branch**: the XOR between `Legal Review` and the silent skip is rendered as an exclusive gateway with one labeled outgoing edge and one edge to a small circle or unlabeled node. Stakeholders routinely mistake that circle for "another task". Add a tooltip / annotation: *“silent branch: skips legal review”*.
+- **Loop visualization**: BPMN offers two loop idioms — the standard sequence loop marker and the multi-instance marker. pm4py's converter may emit neither and instead draw the loop as a back-edge from `Correct Defect` to `Configure Trial`. The semantic intent ("at least one iteration, redo by Correct Defect") must be documented beside the diagram, not inferred from the picture.
+- **Silent routing nodes**: a token-routing place that exists purely to express the join before `Release Change` may appear as a small unlabeled rectangle or diamond. Viewers will look for an activity; document it as *“synchronization place”*.
+- **Apparent ordering from layout**: the BPMN tool may draw `Legal Review` strictly above the verification loop, suggesting that legal review must complete first even though INV-04 says otherwise. Reorder the layout (or add a note) to keep the "no edge" property visually honest.
+- **Initial and final nodes**: an unlabeled start circle may be drawn; viewers may forget that the only way in is `Register Change`. Label it explicitly.
+- **End node vs. `Archive Change`**: if the BPMN ends at a generic "end" event rather than at the `Archive Change` activity, INV-10 is visually violated even though the underlying net may still terminate at `fm`. Ensure the converter's final node is the labeled activity, not a generic terminator.
+
+Proposed annotations:
+
+1. Add a legend mapping gateway shapes to POWL operators (XOR, AND, LOOP).
+2. Add an inline note on every silent branch ("skip path; not an activity").
+3. Add an "Iteration  1" badge near the loop.
+4. Add a "Synchronization point" badge at the join before `Release Change`.
+5. Add a "Concurrency: unordered" badge between `Assess Risk` and `Prepare Evidence`.
+
+# 7. Rejection Criteria
+
+A conversion result must be **rejected or quarantined** if any of the following hold.
+
+1. **Workflow-net failure**: `pm4py.check_is_workflow_net(net)` returns `False`. The artifact is no longer an accepting Petri net and is not directly comparable to the POWL semantics.
+2. **Unsoundness**: `pm4py.check_soundness(net, im, fm)` reports a soundness violation. In particular, the presence of a dead transition, an unreachable marking, or the lack of option to complete means the artifact admits fewer traces than the source — a direct INV violation.
+3. **Loss of true concurrency** (INV-02, INV-04): footprint analysis shows that two source-concurrent activities are now sequentially related, or that an unordered pair is now ordered.
+4. **Release before verification** (INV-05, INV-09): footprint analysis or playout shows a trace where `Release Change` is reachable while `verification_loop` has not produced its closing token.
+5. **Collapse of optional behavior** (INV-03, INV-11): the silent-skip path is missing, so `Legal Review` becomes mandatory, or the silent path is duplicated so the XOR becomes an OR.
+6. **Failed exact-final-marking test**: `bounded_explore` cannot produce any accepted trace whose final marking equals `fm`, or produces accepted traces that do not end at `fm` (e.g., they end in a partial marking).
+7. **Loop iteration count regression** (INV-08): a trace with zero iterations of `(Configure Trial, Inspect Trial)` is admitted, or conversely a trace with the intended number of iterations is rejected.
+8. **Silent transition exposed as a visible activity** in BPMN (label leakage), causing stakeholder confusion.
+9. **Process-tree round-trip produced a tree that misrepresents the join before release** (INV-09): the most likely failure mode of Pipeline P2; quarantine the tree-derived BPMN.
+10. **Activity-label collisions**: a converter deduplicates labels and silently merges two distinct activities. Reject the artifact.
+11. **Initial/final marking drift**: `im`/`fm` of a round-tripped net differs from `im_from_powl`/`fm_from_powl` in cardinality, even by one token. Reject.
+12. **Playout mismatch on witnesses**: positive witnesses are not produced by the artifact, or negative witnesses are produced. Reject.
+
+# 8. Canonical Representation Recommendation
+
+- **Authoritative canonical model**: the original `source_powl` (POWL StrictPartialOrder with operator nodes). POWL is the only representation in the chain that **explicitly** carries the operator semantics (XOR, LOOP) and the partial-order edges without round-trip drift. Treat it as the source of truth.
+- **Derivative artifacts**:
+  - `net_from_powl` / `im_from_powl` / `fm_from_powl` — derivative, regenerated from POWL.
+  - `bpmn_from_net` — derivative for stakeholder visualization.
+  - Any tree-derived BPMN (Pipeline P2) — derivative and **non-canonical**; if produced at all, it is a debugging aid, not a stored artifact.
+- **Validation evidence that must accompany each derivative**:
+  - `pm4py.check_soundness(net, im, fm)` output.
+  - `pm4py.discover_footprints(net, im, fm)` output, byte-equivalent to the POWL-derived footprint.
+  - Positive witness matches and negative witness rejections from playout.
+  - Bounded-exploration report stating the bound and exhaustiveness.
+- **Process-tree intermediate**: **disallowed** as a canonical artifact. The join-before-release synchronization with two unordered predecessors is not block-structured for the converter used in pm4py; allowing the tree would silently lose INV-02 / INV-04 / INV-05 / INV-09. If a tree is produced at all, it must be quarantined and clearly labeled "non-canonical, debug-only".
+- **Stakeholder visualization model**: `bpmn_from_net`, accompanied by the legend and annotations described in Section 6, plus a sidecar JSON file enumerating the invariants and the test report. The BPMN is the visual aid; it is **never** the canonical artifact.
+- **Edit discipline to avoid round-trip drift**: future edits must be made on the POWL, then re-run the conversion pipeline. The pipeline must regenerate all derivatives in one batch and re-run the full validation report; the report's diff against the previous report is the audit trail. No edits should ever be made on `net_from_powl` or `bpmn_from_net` directly — those are projections.
+
+# 9. Residual Uncertainty
+
+Even if every test above passes, the following claims cannot be established.
+
+1. **Behavioral equivalence beyond the bound**: `bounded_explore` is exhaustive only for `max_visible_len  12`, `max_silent_steps_per_state  4`, and `max_states  20000`. The model may admit long traces (e.g., many loop iterations) that we never enumerate; equivalence on those is unproven.
+2. **True concurrency vs. arbitrary interleaving in the BPMN round trip**: even with identical footprints, the BPMN-derived net might realize concurrency through choice plus merge, which has the same footprint but a different branching structure. We cannot distinguish this without explicit causal-net analysis, which pm4py does not expose here.
+3. **Semantic identity of the silent XOR branch**: hiding silent transitions eliminates the observable difference between "skip the legal review" and "perform an unobserved legal-review-like activity". If the source's silent transition ever carried hidden data (e.g., a payload), that data is not represented in any derivative.
+4. **Loop-exit nondeterminism preservation**: POWL's LOOP node has an implicit choice between "exit" and "redo" at every iteration boundary. The Petri net encodes this with a silent or visible choice; whether the choice is fair, biased, or unconstrained by the converter is not validated by soundness alone.
+5. **Layout-induced misreading of the BPMN**: even if the underlying net is correct, the BPMN visualization may visually suggest ordering that does not exist. No automated test catches this; it requires a human visual-semantics review.
+6. **Equivalence under future edits**: round-trip validation at one point in time does not guarantee that a future edit on `bpmn_from_net` (which we forbid but cannot prevent) would not silently diverge from `source_powl`. Drift is policy-controlled, not test-controlled.

@@ -1,0 +1,724 @@
+<think>
+The user wants a comprehensive uncertainty-aware predictive process monitoring study design. Let me work through each required section carefully.
+
+Key issues to confront:
+1. The labeled export is 21,600 activated accounts only - massive selection bias
+2. Rejected/withdrawn/transferred/open have no default outcome because they weren't activated
+3. Policy change on 1 July 2025 - regime change
+4. System migration on 15 October 2025
+5. Future events in the data file (contract signed, activation, default recorded)
+6. documents_total snapshot can leak same-day future documents
+7. Resource experience uses extraction time, not event time
+8. Treating rejected as non-default is wrong
+
+Primary target selection: I think the most operationally defensible is **default within 90 days among accounts that are eventually activated**, with proper handling of:
+- Right-censored immature activated accounts
+- Acknowledgment that this is a conditional on activation, not causal
+- Alternative: a multi-state competing risks target on the full application population
+
+Actually, the question requires confronting that "default for every application" is not well-defined. Let me think about which primary target is best:
+
+Option A: Default among activated (current operational scope)
+- Pros: Uses observed data; aligns with current business request; binary 90d default after activation
+- Cons: Selection on activation; can't rank rejected applications
+- Defensible if explicitly framed as "post-activation risk scoring"
+
+Option B: Multi-state competing risks on full population
+- States: ApprovedActiveDefault, ApprovedActiveNo Default, Rejected, Withdrawn, Transferred, Open
+- More complete but harder to deploy; what does a "score" mean across states?
+- Need to define: probability of eventually defaulting under the current activation policy
+
+Option C: Time-to-default with right censoring
+- Activated accounts only, survival analysis with censoring at 90 days
+- Better statistical use of information
+- Still selection on activation
+
+Option D: Policy-specific counterfactual
+- "Default within 90d if this application were activated under current policy"
+- Strongest assumptions, requires modeling the activation gate
+
+I'll choose Option B (multi-state competing risks on the full application population with the estimand being probability-weighted eventual default under observed policy) as primary, with Option C (survival on activated subset) as sensitivity, and Option D explicitly mentioned as requiring stronger assumptions.
+
+Wait, let me reconsider. The business request is specifically "early warning model predicting 90-day default from the first few events of every credit application." So they want to score all applications. But we need to be honest about what's observed.
+
+I think the cleanest primary target is:
+- **Primary**: Multi-state competing risk on the full population with target = P(default within 90d of activation | application started, current policy environment)
+  - For rejected/withdrawn/transferred: this probability is structurally zero (or undefined) under observed policy
+  - For activated: estimated from data with right censoring
+  - For open: censored or treated as competing
+  - The model output is a *risk score* that is interpretable only conditional on activation
+
+Actually, the most defensible primary target is probably the **conditional activation-then-default probability** (Option B framed as a stacked model or as a single joint distribution), with a clear caveat that for non-activated paths the score represents risk under the counterfactual of activation.
+
+Let me go with: **Primary target = probability of default within 90 days of activation, conditional on the application being activated under the current policy**, with explicit acknowledgment that for non-activated applications the score is a hypothetical/policy-conditional estimate. We estimate this via:
+1. A two-stage model: P(activated) × P(default|activated) using a cause-specific competing risks framework on the full cohort
+2. Or a single cause-specific hazard model
+
+Alternative targets:
+- Restricted to activated accounts with 90-day maturity (cleaner but biased cohort)
+- Time-to-default survival on activated subset
+- Counterfactual: "would default under the new policy if the application were re-evaluated under the current threshold"
+
+Let me draft the full answer now.
+
+For the cohort flow table, I need to account for all 48,000 applications:
+
+| Category | Count | Status in labeled export | Notes |
+|----------|-------|--------------------------|-------|
+| Activated, mature, non-default | 18,900 | Labeled | default_90d=0, label_matured before 15 Feb 2026 |
+| Activated, mature, default | 2,700 | Labeled | default_90d=1, label_matured |
+| Activated, immature (90d not matured) | 3,600 | Omitted | Right-censored; would need activation by 18 Nov 2025 to be mature by 15 Feb 2026 |
+| Rejected | 9,100 | Omitted | Competing outcome / no credit exposure |
+| Withdrawn | 5,700 | Omitted | Competing outcome / self-selection |
+| Transferred | 2,900 | Omitted | Competing outcome; ~60% linked; elevated missing feed rate |
+| Open (still open) | 5,100 | Omitted | Administrative censoring |
+| Total | 47,600 | | Hmm doesn't add to 48,000... |
+
+Wait: 18,900 + 2,700 + 3,600 + 9,100 + 5,700 + 2,900 + 5,100 = 48,000. Yes! Let me verify: 
+18900+2700 = 21600
+21600+3600 = 25200
+25200+9100 = 34300
+34300+5700 = 40000
+40000+2900 = 42900
+42900+5100 = 48000 
+
+Great.
+
+For the prediction time / prefix time: "first few events" - let's say prediction point is end of Credit Review (first time the case reaches Credit Review or returns to it). Or even earlier - the first few events. Let me use the end of the first Credit Review (i.e., when the application first becomes decidable under the current process).
+
+Actually, for prefix extraction, I'll use both: fixed-prefix-length (first k events) and as-of-time (events up to time t). The primary should probably be at "credit review decision point" or just a fixed prefix of 3-5 events.
+
+Let me settle on prediction time: end of the first occurrence of "Credit Review" (the moment the case is first eligible for a decision). This is the most natural business interpretation of "from the first few events."
+
+Now for the PM4Py code skeleton - I need to be concrete, ~80-160 lines, use only documented PM4Py APIs. Let me think about what's available:
+- `pm4py.read_csv` or `pd.read_csv` then `pm4py.format_dataframe`
+- `pm4py.get_event_log` or just work with dataframe
+- `pm4py.get_prefixes_from_log(log, length=k)` for fixed prefixes
+- `pm4py.split_train_test` for random split baseline
+- `pm4py.discover_dfg`
+- `pm4py.get_variants`
+- `pm4py.extract_temporal_features_dataframe`
+- `pm4py.insert_case_service_waiting_time`
+- `pm4py.get_case_arrival_average` etc.
+- `pm4py.filtering` for date ranges
+
+I should be careful to only use APIs that actually exist. Let me write conservative code.
+
+Now let me draft the full answer carefully. I'll aim for thorough but not bloated.
+
+For section 3, key distinctions:
+- Ordinary right censoring: activated accounts < 90 days from activation as of cutoff
+- Delayed labels: activated accounts whose feed hasn't arrived yet (overlaps with above)
+- Selection through activation: the major issue - the export only includes activated
+- Transfer as competing event/missing follow-up: 2,900 transferred, 60% linked, partner-originated has elevated missing feed
+- Permanently missing outcome feeds: partner-originated activated accounts
+
+Primary analysis: Cause-specific competing risks on full population
+- Event 1: activation, then default within 90d
+- Competing events: rejection, withdrawal, transfer, still-open (censored)
+- Hazard: time from application start to default, with activation as an intermediate state
+- For activated but immature: censored at min(age, 90d)
+
+Sensitivity: 
+1. Restrict to activated mature cohort only (current practice, biased)
+2. Two-stage model P(activated under current policy) × P(default|activated) with IPTW
+3. Treat transfers as a separate state with partial observation
+
+Assumptions:
+- Activation decisions are stable within policy regime (testable within regime)
+- Missing outcome feeds are MAR given observed features (partially testable)
+- Transferpartnerdefault has same mechanism as direct (largely untestable)
+- 60% linked transfers can stand in for 40% unlinked (very strong, untestable)
+
+For section 4 (prefix extraction):
+- Fixed-count prefixes: first k events (k=3 or 5)
+- Elapsed-time prefixes: events with timestamp  prediction time
+- Short cases: < k events  keep with shorter prefix, document
+- Document loops: collapse consecutive "Document Requested"/"Document Received" pairs into features
+- Activity renaming: build canonicalization map pre/post Oct 15 2025, validate
+
+For section 5 (process-aware features):
+Control-flow: variant ID, current activity, # of Credit Review entries, # of document request cycles
+Timing: time-since-start, time-in-current-state, inter-event gaps, service waiting time
+Resource/queue: resource experience, # of distinct resources, queue position proxy
+Rework: # of rework loops, time spent in rework
+Cohort/calendar: month, day-of-week, pre/post policy change flag, pre/post migration flag, application channel, region
+Static case attributes: requested amount, channel, region (known at start)
+
+For section 6 (leakage audit table): see structure
+
+For section 7 (validation):
+- Temporal split: train on 2024 H1 + 2024 H2 (pre-policy change), validate on 2025 H1 (pre-change and pre-migration), test on 2025 H2 (post-policy change, post-migration) OR
+- Multiple folds: rolling origin with 3-month windows
+- Why random split is bad: policy change, migration, regime shift, maturation
+- Calibration: calibration plot, Brier score
+- Subgroup: by channel, region, pre/post policy
+- Distribution shift: PSI/KS on key features between train and test
+
+Metrics:
+- For binary default: AUROC, AUPRC, Brier, calibration
+- For competing risks: C-index (cause-specific), Brier at 90d, calibration of CIF
+- For survival: concordance, time-dependent AUC
+
+For section 8 (limitations):
+- Cannot claim: causal effect, counterfactual default for non-activated
+- Can claim: predictive association for activated applications under current policy
+- Deployment effects: 
+  1. Model-driven rejections change the activation mix (self-selection)
+  2. Resource/automation decisions change based on score
+  3. Applicant behavior change if score is shared
+
+For section 9 (code), let me write a clean skeleton:
+
+```python
+import pandas as pd
+import pm4py
+from datetime import datetime
+
+# ---- Configuration ----
+DATA_PATH = "applications_events.csv"
+PRED_CUTOFF = pd.Timestamp("2026-02-15")
+PRED_TIME_HORIZON_DAYS = 90
+PREFIX_LENGTH = 5
+ACTIVITY_RENAME_MIGRATION = pd.Timestamp("2025-10-15")
+POLICY_CHANGE = pd.Timestamp("2025-07-01")
+TRAIN_END = pd.Timestamp("2025-04-01")  # temporal split boundary
+
+# Columns that must NOT appear as features
+LEAKY = {"final_limit", "decision_reason", "collection_status",
+         "default_90d", "label_available_at"}
+
+# ---- 1. Load & parse ----
+df = pd.read_csv(DATA_PATH)
+df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+df["data_extract_time"] = pd.to_datetime(df["data_extract_time"])
+
+# ---- 2. PM4Py format ----
+df = pm4py.format_dataframe(
+    df, case_id="case:concept:name",
+    activity_key="concept:name", timestamp_key="time:timestamp"
+)
+
+# ---- 3. Activity canonicalization for migration ----
+rename_map = {"Legacy KYC": "Identity/KYC Check", "Credit Assess v2": "Credit Review"}
+df["concept:name"] = df["concept:name"].replace(rename_map)
+
+# ---- 4. De-duplicate (migration duplicates) ----
+df = df.drop_duplicates(subset=["case:concept:name", "concept:name", "time:timestamp"])
+
+# ---- 5. Build case-level summary as of PRED_CUTOFF ----
+# Per-case, find: start, first credit review, activation, terminal event
+case_summary = (
+    df.sort_values(["case:concept:name", "time:timestamp"])
+      .groupby("case:concept:name")
+      .agg(start=("time:timestamp", "min"),
+           last_event=("time:timestamp", "max"),
+           n_events=("time:timestamp", "count"),
+           requested_amount=("case:requested_amount", "first"),
+           channel=("case:channel", "first"),
+           region=("case:region", "first"),
+           default_90d=("default_90d", "last"),
+           label_available_at=("label_available_at", "max"),
+           final_limit=("final_limit", "last"),
+           decision_reason=("decision_reason", "last"),
+           collection_status=("collection_status", "last"))
+      .reset_index()
+)
+
+# Terminal activity of each case
+terminal_act = (
+    df.sort_values("time:timestamp")
+      .groupby("case:concept:name")["concept:name"].last().rename("terminal_activity")
+)
+case_summary = case_summary.merge(terminal_act, on="case:concept:name", how="left")
+
+# Activation time (first Account Activated)
+activation = (
+    df[df["concept:name"] == "Account Activated"]
+      .groupby("case:concept:name")["time:timestamp"].min()
+      .rename("activation_time")
+)
+case_summary = case_summary.merge(activation, on="case:concept:name", how="left")
+
+# ---- 6. Label maturity & competing-outcome flags ----
+matured_horizon = case_summary["activation_time"] + pd.Timedelta(days=PRED_TIME_HORIZON_DAYS)
+case_summary["matured_by_cutoff"] = matured_horizon <= PRED_CUTOFF
+case_summary["label_mature"] = case_summary["label_available_at"].notna() & case_summary["matured_by_cutoff"]
+
+# Competing outcome categories
+def categorize(row):
+    if row["terminal_activity"] == "Account Activated":
+        if row["label_mature"]:
+            return "activated_mature"
+        return "activated_immature"  # ordinary right censoring or delayed feed
+    if row["terminal_activity"] == "Rejected":
+        return "rejected"
+    if row["terminal_activity"] == "Withdrawn":
+        return "withdrawn"
+    if row["terminal_activity"] == "Transferred":
+        return "transferred"
+    return "open"
+
+case_summary["outcome_state"] = case_summary.apply(categorize, axis=1)
+
+# ---- 7. Cohort flow (48,000) ----
+cohort_counts = case_summary["outcome_state"].value_counts().to_dict()
+print("Cohort flow:", cohort_counts)
+assert sum(cohort_counts.values()) == 48000  # adjust if total differs
+
+# ---- 8. Temporal split ----
+case_summary["split"] = "test"
+case_summary.loc[case_summary["start"] < TRAIN_END, "split"] = "train"
+# Additional: pre/post policy change as evaluation slice
+case_summary["post_policy"] = case_summary["start"] >= POLICY_CHANGE
+case_summary["post_migration"] = case_summary["start"] >= ACTIVITY_RENAME_MIGRATION
+
+# ---- 9. Prefix extraction (PM4Py) ----
+# Filter to events strictly before the prediction point
+# Use first N events per case
+prefix_log = pm4py.get_prefixes_from_log(df, length=PREFIX_LENGTH)
+# (PM4Py returns an EventLog object containing prefix sub-cases)
+
+# ---- 10. Block post-prefix leakage from feature table ----
+# Remove any column that is not "available at prediction time"
+prefix_features_safe = [c for c in df.columns if c not in LEAKY]
+
+# ---- 11. Process-aware feature engineering (as-of only) ----
+# Use only events with timestamp <= PRED_CUTOFF for training samples
+# (For deployment, the prediction cutoff is the application's prediction time.)
+# DFG on training subset
+train_cases = case_summary.loc[case_summary["split"] == "train", "case:concept:name"]
+train_events = df[df["case:concept:name"].isin(train_cases) &
+                  (df["time:timestamp"] <= PRED_CUTOFF)]
+dfg, sa, ea = pm4py.discover_dfg(train_events)
+
+# Temporal features (no future leakage if applied to prefix subset)
+df_features = pm4py.extract_temporal_features_dataframe(
+    train_events, include_case_id=True
+)
+
+# Service waiting time per case
+df_features = pm4py.insert_case_service_waiting_time(df_features)
+
+# ---- 12. Variants (control-flow abstraction) ----
+variants = pm4py.get_variants(train_events)
+print("Top variants (train):", list(variants.items())[:5])
+
+# ---- 13. Leakage audit ----
+audit = pd.DataFrame({
+    "feature": ["final_limit", "decision_reason", "collection_status",
+                "documents_total", "default_90d", "label_available_at",
+                "risk_score", "future_events", "resource_experience"],
+    "leakage_risk": ["high (post-decision)", "high (post-decision)",
+                     "high (post-activation outcome)",
+                     "medium (same-day future docs)",
+                     "definitional (label)", "definitional (label availability)",
+                     "medium if updated post-prediction",
+                     "high (post-prediction events)",
+                     "medium (uses extract-time experience)"],
+    "action": ["drop", "drop", "drop", "as-of cap at prediction time",
+               "label only", "label only",
+               "use earliest pre-prediction value",
+               "filter to prediction point",
+               "reconstruct historical experience (caveat)"]
+})
+print(audit)
+
+# ---- 14. Placeholders for downstream survival/competing-risks models ----
+# At this point, a cause-specific Cox PH or Aalen-Johansen estimator would
+# consume (case_summary + df_features) and estimate the CIF for default within
+# 90d post-activation, conditional on covariates, while properly handling
+# - ordinary right-censoring (activated_immature),
+# - competing risks (rejected/withdrawn/transferred/open),
+# - delayed feed (label_mature=False with label_available_at NaT),
+# - permanently missing feeds (flagged via partner_activated flag).
+```
+
+That's about 110 lines, decent. Let me clean it up and make sure I add good comments.
+
+Let me also double-check: the user wants "approximately 80-160 lines" so we're in the sweet spot. Good.
+
+Let me think about the audit table more carefully. The user wants columns: `Feature or data element | Leakage or bias risk | Valid availability rule | Keep/repair/drop | Rationale`
+
+For documents_total: it's a nightly snapshot, so if the prediction is mid-day, it could include docs uploaded later that day. Repair: use the previous midnight's snapshot, or apply a same-day cap using time-of-day of the prediction vs upload time.
+
+For risk_score: it's "may be updated at several events" - so it can be updated after the prediction point. Repair: take the value as of the prediction point. Also risk_score pre-policy-change and post-policy-change are different constructs - need a regime indicator.
+
+For resource experience: it's stored as experience at extraction time. This is "delayed" - we don't have experience at event time. Repair: try to reconstruct, or treat as caveat. Most defensible: drop or impute with strong caveat.
+
+OK let me now write the final answer. I'll be careful about formatting and length.
+</think>
+## 1. Target definition
+
+**Primary target (cause-specific competing-risks, full cohort):**
+For every application that has started, define the multi-state outcome observed from the application start to the data-extraction cutoff (15 February 2026):
+
+- *State 0*: alive in the application funnel.
+- *State A*: Activated  mature label (default or no default within 90 days of Account Activated).
+- *State B*: Activated  label not yet mature (right-censored at min(age, 90 d) or at feed arrival if feed is delayed).
+- *State C*: Rejected (competing event).
+- *State D*: Withdrawn (competing event).
+- *State E*: Transferred (competing event; partly lost to follow-up).
+- *State F*: Still open at cutoff (administrative censoring).
+
+**Estimand.** Cause-specific cumulative incidence function (CIF) of default within 90 days post-activation, conditional on the covariates available up to the prediction point, conditional on the policy regime that applies at the application’s start. Formally, the target is
+
+$$
+\mathbb{P}\!\left(\text{default within 90d of activation} \,\bigm|\, X_{\text{prefix}}, \text{policy}=p(\text{start})\right),
+$$
+
+which is well-defined only *after* an activation event. For applications observed in states C/D/E/F this probability is structurally zero (or undefined) under the observed activation policy; the model still produces a *policy-conditional* score for them, which must be reported as such.
+
+**Prediction time.** End of the first occurrence of “Credit Review” (the moment the application is first decidable). For cases whose decision involves re-entries into Credit Review, the prediction time is fixed at the *first* exit from Credit Review to keep the prediction prefix consistent.
+
+**Unit of analysis.** The application (`case:concept:name`), not the activation or the partner record.
+
+**Why this is defensible.** It is the only formulation that (a) preserves the as-of semantics required for an early warning, (b) treats rejection, withdrawal, transfer, and open as *competing* or *censoring* events rather than as false negatives, and (c) lets the same prefix yield both a pre-activation risk screen and a post-activation default hazard. The unconditional “default in 90 days” business request is reinterpreted as the CIF, which collapses to a single probability once the activation gate has been crossed.
+
+**Alternative target A (sensitivity, simpler and biased).** Default within 90 d post-activation *restricted to the 21,600 mature activated cases*. This is what the current export supports. It answers a different question: “given that the application already produced an active account, what is its 90-day default risk under the policy that approved it?” Useful as a stress test and a baseline the regulator will understand, but it cannot rank applications before activation and is selection-on-activation-biased.
+
+**Alternative target B (counterfactual, requires stronger assumptions).** “Default within 90 d of activation if the application had been activated under today’s policy thresholds.” Requires modelling the activation gate separately and assuming exchangeability between the post-1 July 2025 activation mechanism and any pre-policy-change counterfactual. Useful only for a what-if simulation; should not be the deployed model’s primary target.
+
+## 2. Cohort construction
+
+**As-of rule.** Everything below is evaluated at the data-extraction cutoff C = 2026-02-15. A case is *mature* if its activation occurred on or before C  90 days. A case is *labelled* if `label_available_at` is non-null and  C.
+
+**Inclusion.** Every `case:concept:name` in `applications_events.csv` (48,000). All cases contribute to censoring and competing-risk structure; only mature activated cases contribute a binary default outcome.
+
+**Exclusions.** None — keeping the funnel intact is the whole point of the multi-state design. Cases that are dropped *only* from the binary-default head (e.g., for AUROC reporting) are tagged in a `analysis_role` column, not deleted.
+
+**Cohort-flow table** (counts from the supplied snapshot):
+
+| Outcome state at cutoff | Count | Role in analysis | Observation | Selection concern |
+|---|---:|---|---|---|
+| Activated, label mature, `default_90d = 0` | 18,900 | Labelled non-event (state A) | Full | None beyond maturity |
+| Activated, label mature, `default_90d = 1` | 2,700 | Labelled event (state A) | Full | 12.5% prevalence; imbalance expected |
+| Activated, label **not** mature (< 90d elapsed or feed delayed) | 3,600 | Right-censored or pending feed (state B) | Partial | Delayed label; partially testable |
+| Rejected | 9,100 | Competing event (state C) | Full outcome, no default | Treated as competing risk |
+| Withdrawn | 5,700 | Competing event (state D) | Full outcome, no default | Self-selection; partially testable |
+| Transferred (linkage  60%) | 2,900 | Competing event / partial LTFU (state E) | 60% linked; 40% unknown downstream | Permanent missing feed for partner-originated |
+| Still open | 5,100 | Administrative censoring (state F) | Right-censored at C | None |
+| **Total** | **48,000** | | | |
+
+The 21,600 currently in the labelled export are exactly the union of the first two rows.
+
+## 3. Censoring and missing-label strategy
+
+Five mechanisms are distinguishable and must not be conflated.
+
+| Mechanism | Examples in this data | How it is encoded |
+|---|---|---|
+| Ordinary right-censoring (event horizon not reached) | The 3,600 activated accounts < 90 days old at C | `censor_time = min(age_at_C, 90d)`; event indicator = 0 |
+| Delayed labels (event horizon reached, feed late) | Activated mature accounts whose `label_available_at > C` | Same encoding as censoring, but flagged via `feed_delayed` so a later refresh can resolve them |
+| Selection through activation | The whole labelled export is 21,600 of 48,000 | Cause-specific hazard with activation as a non-failure transition; competing events absorb the other 26,400 |
+| Transfer as competing event / partial LTFU | 2,900 transferred, 60% linked, partner-originated has elevated permanent LTFU | A two-layer treatment: as a competing event when `outcome_state = transferred` *and* `linkage_status = linked`; otherwise flagged as a separate `missing_followup` stratum and analysed via inverse-probability-of-censoring weights (IPCW) using region, channel, requested_amount, and policy regime |
+| Permanently missing outcome feeds | Partner-originated activated accounts (subset of the 2,700 defaults and 18,900 non-defaults) | Same IPCW treatment; weights bounded (truncated) to avoid variance explosion |
+
+**Primary analysis strategy.** Cause-specific Cox proportional hazards (or Aalen–Johansen for non-proportional hazards) on the full 48,000-case cohort, with the cause of interest being “default within 90 days of activation,” activation itself treated as a left-truncation time, and rejection/withdrawal/transfer/open as competing events that remove the case from the default risk set under the *observed* policy. The CIF at 90 days post-activation is the reported score; for cases observed in competing states the model still produces a policy-conditional hypothetical that is reported as such.
+
+**Sensitivity analyses.**
+1. **Two-stage head.** P(activated | X) × P(default | activated, X) using a logistic head on the activated subset; this is the closest match to how the lender currently uses the model and exposes the activation-selection bias.
+2. **IPCW-only on the mature activated cohort.** Reweight the 21,600 to the activation-mix distribution, acknowledging the unlinkable transfers as missing-not-at-random.
+3. **Pre/post policy regimes fitted separately.** Two cause-specific models, one for starts before 1 July 2025 and one for starts on or after, with a shared baseline and a regime indicator tested as an interaction.
+
+**Testability of assumptions.**
+- *Testable*: the proportional-hazards and competing-risk independence assumptions (Schoenfeld residuals, cause-specific subdistribution checks).
+- *Partially testable*: missing-at-random for delayed feeds (compare predictors of `label_available_at` non-null vs null among activated mature cases).
+- *Fundamentally untestable*: counterfactual default of the 9,100 rejected and 5,700 withdrawn cases; we cannot observe a default that would only have occurred had the policy approved them. This is why the counterfactual target is *not* the primary one.
+
+## 4. Prefix extraction
+
+**Prediction point.** End of the first `Credit Review` activity per case; if no `Credit Review` is observed, the prediction point is the latest event with timestamp  C. All features are computed using only events with `time:timestamp  prediction_point`.
+
+**Two prefix schemes, both implemented.**
+- *Fixed event-count prefixes*: `pm4py.get_prefixes_from_log(log, length=k)` for k  {3, 5}. Cases with fewer than k events are kept with their full (shorter) prefix and tagged `short_case=True` so the model can treat them explicitly.
+- *Elapsed-time prefixes*: events with `time:timestamp  min(first_credit_review_end, prediction_horizon)`, with the horizon configurable (default: end of first credit review). This is the *operationally* correct scheme because it is the only one aligned with the calendar.
+
+**Document loops.** Consecutive `Document Requested` / `Document Received` pairs are collapsed into a single `document_cycle_completed` feature plus a count. Unmatched `Document Requested` events are kept as a separate counter so rework is visible.
+
+**Short cases.** Cases that have not yet reached `Credit Review` at the prediction time are kept but flagged; their prefix is the entire observed trace. They are not deleted, because they are the most decision-relevant cases in practice.
+
+**Activity renaming.** Build a canonicalisation map from the 15 October 2025 migration (e.g., `Legacy KYC`  `Identity/KYC Check`, `Credit Assess v2`  `Credit Review`). Apply the map before variant discovery and DFG computation. For training stability, fit the rename map on a hand-coded reference table rather than learning it from the data.
+
+**Duplicate events.** Deduplicate on `(case:concept:name, concept:name, time:timestamp)` after canonicalisation; keep the row with the lowest `org:resource` id to make the choice deterministic.
+
+## 5. Process-aware features
+
+All features are computed on the prefix only. The list is organised by data dependency.
+
+**Static case attributes (known at case start).**
+- `requested_amount` (log-transformed, bucketed)
+- `channel`, `region`
+- `application_dow`, `application_month`, `application_quarter`
+
+**Prefix-derived features (computed from the event prefix).**
+- Control-flow: current activity; `n_credit_review_entries`; `n_document_cycles_completed`; `n_open_document_requests`; trace length; presence of rework loop indicator.
+- Variant: top-N one-hot over the most frequent prefix variants in the *training* period (pre-computed from a frozen variant dictionary to prevent leakage).
+- Timing: `time_since_start`, `time_in_current_state`, average and max inter-event gap, prefix span (last event  first event).
+- Service waiting: `pm4py.insert_case_service_waiting_time` (case-level service time).
+- Temporal aggregates: `pm4py.extract_temporal_features_dataframe` for hour-of-day, day-of-week, month aggregates per case.
+- DFG-derived: in-degree and out-degree of the current activity in the *training* DFG; these are static, pre-computed from `pm4py.discover_dfg` on the training fold.
+
+**Cohort / calendar features (require historical reference data).**
+- `days_to_policy_change = policy_change_date  case_start` and a `post_policy_change` flag.
+- `post_migration` flag.
+- Rolling default rate over the prior 30 days at the *case’s* prediction time, computed on the training-period label-mature cohort only.
+- Channel × region × month default rate from the same frozen reference.
+
+**Resource features.**
+- `n_distinct_resources_seen`.
+- A reconstructed `resource_experience_at_event` derived from `org:resource` and a static tenure table (see Section 6 for caveat).
+
+**Explicitly excluded.** Any feature whose value depends on an event whose timestamp is strictly greater than the prediction point.
+
+## 6. Leakage audit
+
+| Feature / data element | Leakage or bias risk | Valid availability rule | Keep / repair / drop | Rationale |
+|---|---|---|---|---|
+| `final_limit` | Post-decision; only known after Accept | Available only at the Accept event, which is after the prediction point by construction | **Drop** from feature table; never use for ranking before Accept | Including it makes the model trivially good on the labelled subset but useless at the prediction point |
+| `decision_reason` | Post-decision; explains Accept/Reject | Available only at or after the decision event | **Drop** | Same reason; also leaks policy regime |
+| `collection_status` | Post-activation outcome proxy | Only meaningful after Account Activated | **Drop** | Direct default proxy; using it is target leakage |
+| Events after prediction point (Contract Signed, Account Activated, Collections Contact, Default Recorded) | Future information | Only events with `time:timestamp  prediction_point` | **Repair** by filtering; reject any feature whose source event is post-prefix | This is the single largest source of silent leakage in this dataset |
+| `documents_total` (nightly snapshot) | Same-day future documents included | Use the snapshot from the previous midnight relative to the prediction time, or cap by per-document upload timestamp | **Repair** with same-day cut at `prediction_time  1 day` and a flag for same-day predictions | Without the cap, a doc uploaded at 16:00 on a 09:00 prediction day leaks |
+| `risk_score` (updated at several events) | Updated post-prediction in some cases | Use the value as of the latest event with `time:timestamp  prediction_point`; tie-break by event order | **Repair** by taking the pre-prefix value; if multiple updates exist, take the last *pre-prefix* one | The score is informative, but only the pre-decision update |
+| Resource experience (stored at extract time) | Uses future experience of the employee | Reconstruct tenure at the event timestamp from a static hire-date table; if unavailable, fall back to a coarse bucket | **Repair** with a static tenure lookup; otherwise **drop** and add a missingness flag | Without repair, the feature encodes time since the case was processed, which is a proxy for cohort drift |
+| `default_90d` | The label | n/a | **Label only**; never a feature | The label is the target; treat as read-only |
+| `label_available_at` | Reveals whether the feed has arrived | Used only for as-of eligibility, not as a feature | **Drop** from feature table; keep in cohort table for the audit only | Otherwise the model can learn that some cases are merely unlabelled-yet |
+| Migration-era duplicates | Inflated event counts near 15 Oct 2025 | Deduplicate on (case, activity, timestamp) after canonicalisation | **Repair** | Deduplication is a precondition for any timing feature being meaningful |
+| `source_system` and `data_extract_time` | Cohort / pipeline metadata | Allowed as cohort feature; never as a per-event feature | **Repair / keep as cohort feature** | `source_system` may legitimately be a cohort signal; `data_extract_time` must not be |
+
+## 7. Validation design
+
+**Why a random case split is misleading here.** A random split would (a) train on policy regime A and test on regime B (and vice versa) without flagging it, (b) put cases started in early 2024 in the test fold whose 90-day labels were determined under a stricter policy than the 2025 cases in the train fold, (c) shuffle cases across the 15 October 2025 migration, and (d) include some immature cases in training and some in test for accidental, not label-maturity, reasons. A model that looked brilliant in random-split CV would be silently wrong in deployment.
+
+**Primary temporal validation scheme.** A *blocked, gap-aware* temporal split that respects both the policy change and the label-maturity horizon:
+
+| Fold | Case-start window | Notes |
+|---|---|---|
+| Train | 2024-01-01  2025-01-31 | Pre-policy-change, well-matured; primary training data |
+| Validation | 2025-02-01  2025-06-30 | Pre-policy-change, mid-2025; for early-stopping and threshold tuning |
+| Gap | 2025-07-01  2025-09-30 | Post-policy-change, pre-migration; **excluded from training** to avoid blending the two regimes in the optimiser |
+| Test A (in-regime) | 2025-10-01  2025-12-31 (post-migration) | For post-policy, post-migration performance |
+| Test B (out-of-time) | applications started in Dec 2025 with labels matured at C | For checking label-maturity handling |
+
+A second *rolling-origin* backtest at quarterly cadence (train on all matured cases up to t, predict on starts in [t, t+90d)) reports the model’s stability over time, not just one split.
+
+**Calibration.** Calibration plot and Brier score on Test A and Test B, separately for the activated subset. Expected Calibration Error (ECE) reported by channel, region, and pre/post policy era.
+
+**Subgroup performance.** AUROC, AUPRC, Brier, and the cause-specific CIF calibration, by `channel`, `region`, `requested_amount` decile, and `post_policy_change`. Disparity flags if any subgroup’s calibration error exceeds the pooled error by more than 1.5×.
+
+**Distribution-shift diagnostics.** Population Stability Index (PSI) and Kolmogorov–Smirnov on the top-20 prefix features between train and Test A. A shift > 0.2 PSI on any feature triggers a re-fit decision.
+
+**Metrics for the chosen target.**
+- Cause-specific C-index (Harrell) for the default hazard.
+- Time-dependent AUC at 90 days post-activation.
+- Brier score at 90 days post-activation.
+- CIF calibration at 90 days.
+- AUPRC on the activated mature subset, used as a secondary headline number because the prevalence is only 12.5%.
+
+**Migration sanity check.** Re-run training on the renamed-and-deduplicated data and on the raw data; if the AUROC delta is > 0.02, the migration handling is the problem, not the model.
+
+## 8. Limitations and decision-use boundary
+
+**What this study can claim.**
+- A calibrated estimate of the cumulative incidence of default within 90 days of activation, conditional on the covariates available at the prediction point and on the policy regime in effect at the application’s start.
+- A ranking of *activated* applications by their post-activation default risk, which is the population the historical export supports.
+- A policy-conditional hypothetical score for *non-activated* applications, clearly labelled as a counterfactual risk under the current activation gate.
+
+**What it cannot claim.**
+- A causal effect of any feature on default. Hazard ratios are associational, not causal; the activation gate is a strong collider.
+- The default probability of an individual rejected or withdrawn application as a factual quantity. That probability is undefined without a counterfactual activation policy.
+- Out-of-regime generalisation. A model trained on pre-July 2025 data does not automatically transfer to a post-July 2025 policy, and a model trained on the union does not identify either regime cleanly.
+
+**Three ways deployment changes the data-generating process.**
+1. **Self-selection on the score.** If the score is used to decline borderline applications, the activated cohort becomes more positively selected on observable risk, so future observed default rates fall even if the model is unchanged. The activation gate’s selection effect must be re-estimated on every refresh.
+2. **Behavioural response.** If applicants learn the score is shared, channel mix and document behaviour shift; the prefix distributions used in training become unrepresentative.
+3. **Resource steering.** If the score drives staffing or routing (e.g., higher-risk applications get senior reviewers), the resource/queue features become endogenous to the prediction, and the same model with the same features is now a different model. A refit is required after any such workflow change.
+
+## 9. PM4Py-oriented Python implementation skeleton
+
+```python
+"""
+Predictive process monitoring study for 90-day default early warning.
+Implements: as-of cohort construction, leakage-safe prefix extraction,
+temporal split, PM4Py feature engineering, and a leakage audit.
+
+Survival/competing-risks models are NOT implemented here; the skeleton
+ends at feature-table assembly and clearly marks where they would attach.
+"""
+import pandas as pd
+import pm4py
+from datetime import timedelta
+
+# ---- Configuration -----------------------------------------------------
+DATA_PATH = "applications_events.csv"
+CUTOFF = pd.Timestamp("2026-02-15")      # data-extraction date
+HORIZON_D = 90                            # default prediction horizon
+PRED_ACT = "Credit Review"                # activity marking the decision gate
+PREFIX_K = 5                              # fixed-prefix length
+TRAIN_END = pd.Timestamp("2025-01-31")
+VAL_END   = pd.Timestamp("2025-06-30")
+POLICY_CHANGE = pd.Timestamp("2025-07-01")
+MIGRATION     = pd.Timestamp("2025-10-15")
+
+# Columns that must NEVER appear as features (definitional or post-decision)
+LEAKY_COLS = {"final_limit", "decision_reason", "collection_status",
+              "default_90d", "label_available_at", "data_extract_time"}
+
+# ---- 1. Load & parse ---------------------------------------------------
+df = pd.read_csv(DATA_PATH)
+df["time:timestamp"]    = pd.to_datetime(df["time:timestamp"])
+df["label_available_at"]= pd.to_datetime(df["label_available_at"])
+df["data_extract_time"] = pd.to_datetime(df["data_extract_time"])
+
+# ---- 2. PM4Py formatting ----------------------------------------------
+df = pm4py.format_dataframe(
+    df,
+    case_id="case:concept:name",
+    activity_key="concept:name",
+    timestamp_key="time:timestamp",
+)
+# After this call the dataframe has a `case:concept:name` column; rename for clarity.
+df = df.rename(columns={"case:concept:name": "case_id"})
+
+# ---- 3. Migration canonicalisation & de-duplication -------------------
+RENAME_MAP = {
+    "Legacy KYC": "Identity/KYC Check",
+    "Credit Assess v2": "Credit Review",
+    "Doc Requested": "Document Requested",   # example; populate from migration log
+}
+df["concept:name"] = df["concept:name"].replace(RENAME_MAP)
+df = df.drop_duplicates(subset=["case_id", "concept:name", "time:timestamp"])
+
+# ---- 4. Case-level summary as of CUTOFF --------------------------------
+def first_or_nat(series):
+    s = series.dropna()
+    return s.iloc[0] if len(s) else pd.NaT
+
+# Per-case start and activation
+case_start = df.groupby("case_id")["time:timestamp"].min().rename("case_start")
+act_time = (df[df["concept:name"] == "Account Activated"]
+            .groupby("case_id")["time:timestamp"].min().rename("activation_time"))
+# First exit from Credit Review is the prediction point
+credit_review = df[df["concept:name"] == PRED_ACT].copy()
+credit_review = credit_review.sort_values(["case_id", "time:timestamp"])
+pred_time = (credit_review.groupby("case_id")["time:timestamp"]
+             .first().rename("pred_time"))
+
+# Terminal activity (state of the case at CUTOFF)
+df_sorted = df.sort_values(["case_id", "time:timestamp"])
+terminal = df_sorted.groupby("case_id")["concept:name"].last().rename("terminal_act")
+
+# Static case attributes
+static = (df.groupby("case_id")
+            .agg(requested_amount=("case:requested_amount", "first"),
+                 channel=("case:channel", "first"),
+                 region=("case:region", "first"),
+                 source_system=("source_system", "first")))
+
+case = (pd.concat([case_start, act_time, pred_time, terminal, static], axis=1)
+          .reset_index())
+
+# ---- 5. Label maturity & outcome state --------------------------------
+maturation = case["activation_time"] + timedelta(days=HORIZON_D)
+case["matured"] = maturation <= CUTOFF
+case["label_mature"] = case["matured"] & case["activation_time"].notna()
+
+def state(row):
+    if row["terminal_act"] == "Account Activated":
+        return "activated_immature" if pd.isna(row["activation_time"]) else \
+               ("activated_mature" if row["label_mature"] else "activated_pending_feed")
+    if row["terminal_act"] == "Rejected":     return "rejected"
+    if row["terminal_act"] == "Withdrawn":   return "withdrawn"
+    if row["terminal_act"] == "Transferred": return "transferred"
+    return "open"
+
+case["outcome_state"] = case.apply(state, axis=1)
+
+# ---- 6. Cohort flow check ---------------------------------------------
+flow = case["outcome_state"].value_counts().to_dict()
+print("Cohort flow (must sum to 48000):", flow)
+assert sum(flow.values()) == 48000, "cohort size mismatch"
+
+# ---- 7. Temporal split -------------------------------------------------
+case["split"] = "test_A"
+case.loc[case["case_start"] <= TRAIN_END, "split"] = "train"
+case.loc[(case["case_start"] > TRAIN_END) & (case["case_start"] <= VAL_END), "split"] = "val"
+# Gap window (post-policy, pre-migration) is deliberately unused in training
+case.loc[(case["case_start"] > VAL_END) & (case["case_start"] < MIGRATION), "split"] = "gap"
+case["post_policy"] = case["case_start"] >= POLICY_CHANGE
+case["post_migration"] = case["case_start"] >= MIGRATION
+
+# ---- 8. Prefix extraction (no future leakage) -------------------------
+# Filter to events strictly at or before each case's prediction time.
+# For deployment, pred_time is the model's clock; for training we
+# only use cases whose pred_time <= CUTOFF.
+train_cases = case.loc[case["split"] == "train", "case_id"]
+train_df = df[df["case_id"].isin(train_cases)].copy()
+train_df = train_df.merge(case[["case_id", "pred_time"]], on="case_id", how="left")
+train_df = train_df[train_df["time:timestamp"] <= train_df["pred_time"]]
+
+# Fixed-length prefixes (k events) via PM4Py
+prefix_log = pm4py.get_prefixes_from_log(train_df, length=PREFIX_K)
+
+# Elapsed-time prefixes: events up to and including the first Credit Review
+# (already enforced by the merge+filter above, kept explicit for clarity)
+elapsed = train_df  # alias
+
+# ---- 9. Process-aware features (training fold only) -------------------
+# Control-flow shape: DFG and variants computed ONLY on the training prefix
+dfg, sa, ea = pm4py.discover_dfg(elapsed)
+variants = pm4py.get_variants(elapsed)
+
+# Temporal aggregates (case-level, no future events by construction)
+tfeat = pm4py.extract_temporal_features_dataframe(elapsed, include_case_id=True)
+tfeat = pm4py.insert_case_service_waiting_time(tfeat)
+
+# ---- 10. Leakage-safe feature table ------------------------------------
+feature_cols = [c for c in elapsed.columns
+                if c not in LEAKY_COLS
+                and c not in {"time:timestamp", "case_id"}]
+features = elapsed[elapsed["case_id"].duplicated(keep="first") == False][
+    ["case_id"] + feature_cols
+]
+features = features.merge(tfeat, on="case_id", how="left")
+
+# ---- 11. Merge cohort metadata (labels live ONLY in `case`, not in X) -
+out = features.merge(
+    case[["case_id", "outcome_state", "label_mature",
+          "activation_time", "split", "post_policy", "post_migration"]],
+    on="case_id", how="left",
+)
+
+# ---- 12. Leakage audit report -----------------------------------------
+audit = pd.DataFrame([
+    ("final_limit",        "post-decision",            "drop"),
+    ("decision_reason",    "post-decision",            "drop"),
+    ("collection_status",  "post-outcome proxy",       "drop"),
+    ("events > pred_time", "future information",       "filter at extraction"),
+    ("documents_total",    "same-day future docs",     "cap at previous midnight"),
+    ("risk_score (post)",  "updated post-prediction",  "use last pre-prefix value"),
+    ("resource_experience","uses extract-time tenure", "rebuild from hire-date table"),
+    ("default_90d",        "label",                    "label only"),
+    ("label_available_at", "label-availability leak",  "cohort-only, not feature"),
+    ("migration duplicates","inflated event counts",   "deduplicate after rename"),
+], columns=["element", "risk", "action"])
+print(audit)
+
+# ---- 13. Where survival / competing-risks models would attach ---------
+# At this point the analyst has:
+#   - out:  one row per case with a leakage-safe feature vector, the
+#           outcome_state label, and a time-to-event / censoring indicator
+#           constructed as:
+#               event_time = activation_time + min(observed_default_time, 90d)
+#               event_ind  = 1 if outcome_state == "activated_mature" and
+#                                  default_90d == 1 else 0
+#           For states C/D/E/F, the case never reaches activation under the
+#           observed policy and is handled via cause-specific hazards
+#           (competing event) or IPCW (transferred-without-linkage).
+# A cause-specific Cox model or an Aalen-Johansen estimator would consume
+# (out, event_time, event_ind, cause) and report CIF@90d, Brier@90d,
+# time-dependent AUC, and per-subgroup calibration.
+```
+
+The skeleton intentionally stops at the feature/cohort table because the modelling step depends on a chosen survival library (lifelines, scikit-survival, or statsmodels) and on the cause-specific coding, which a PM4Py-only snippet cannot honestly fabricate. The handover point — `(out, event_time, event_ind, cause)` — is the single, well-defined contract that the rest of the study consumes.
