@@ -1,7 +1,7 @@
 # PM-LLM-Benchmark 3.0
 
 **This repository contains PM-LLM-Benchmark 3.0**, a new generation of the benchmark with a harder, more open-ended set of prompts than [PM-LLM-Benchmark v 2.2](https://github.com/fit-alessandro-berti/pm-llm-benchmark) and v 1.0.
-The paper describing PM-LLM-Benchmark v 1.0 is available [here](https://arxiv.org/pdf/2407.13244).
+The paper describing PM-LLM-Benchmark 3.0 is available [here](https://www.alessandroberti.it/new_papers/2026_Berti_PMLLMBenchmark3.pdf).
 
 Process mining benefits significantly from the domain knowledge provided by LLMs. *PM-LLM-Benchmark* is a qualitative benchmark for PM-on-LLM: model answers are graded by another expert LLM (**LLM-as-a-Judge**). Version 3.0 keeps that design but replaces the older category mix with eight process-mining reasoning themes, each identified by a stable three-letter code.
 
