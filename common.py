@@ -2,7 +2,9 @@ import os.path
 import traceback
 import threading
 import time
+import contextvars
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import requests
@@ -11,7 +13,7 @@ import json
 import base64
 import sys
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from file_utils import read_file_with_fallback
 
@@ -199,8 +201,8 @@ class RateLimiter:
             }
 
 
-# Global rate limiter instance
-RATE_LIMITER = RateLimiter(
+# Default / process-wide rate limiter (used when no model session is active).
+_GLOBAL_RATE_LIMITER = RateLimiter(
     requests_per_minute=100,
     requests_per_hour=20000,
     tokens_per_minute=900000,
@@ -208,13 +210,14 @@ RATE_LIMITER = RateLimiter(
     max_concurrent=50
 )
 
-
-class Shared:
-    API_KEY = None
-    MODEL_NAME = None
-    ALIAS_MODEL_NAME = None
-    MAX_REQUESTED_TOKENS = 32000
-    API_URL = "https://api.x.ai/v1/"
+# Per-model session state. Each concurrent model run installs its own session so
+# Shared settings and the limited response-pool (RateLimiter) stay isolated.
+_SHARED_DEFAULTS = {
+    "API_KEY": None,
+    "MODEL_NAME": None,
+    "ALIAS_MODEL_NAME": None,
+    "MAX_REQUESTED_TOKENS": 32000,
+    "API_URL": "https://api.x.ai/v1/",
     # API_URL = "https://openrouter.ai/api/v1/"
     # API_URL = "https://generativelanguage.googleapis.com/v1beta/"
     # API_URL = "https://api.openai.com/v1/"
@@ -228,23 +231,131 @@ class Shared:
     # API_URL = "https://api.perplexity.ai/"
     # API_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/"
     # API_URL = "https://integrate.api.nvidia.com/v1/"
-    SYSTEM_PROMPT = None
+    "SYSTEM_PROMPT": None,
     # SYSTEM_PROMPT = "You are a helpful and harmless assistant. You should think step-by-step."
     # SYSTEM_PROMPT = "You are a helpful and harmless assistant."
     # SYSTEM_PROMPT = "detailed thinking on"
     # SYSTEM_PROMPT = "Enable deep thinking subroutine."
-    TRIAL_CHANGE_EVALUATION_LRM = False
-    CUSTOM_TEMPERATURE = None
+    "TRIAL_CHANGE_EVALUATION_LRM": False,
+    "CUSTOM_TEMPERATURE": None,
     #CUSTOM_TEMPERATURE = 0.6
-    TRIAL_SEVERE_EVALUATION = True
-    ANTHROPIC_THINKING_TOKENS = 16000
-    ANTHROPIC_THINKING_TOKENS = None
-    PAYLOAD_REASONING_EFFORT = "low"
-    PAYLOAD_REASONING_EFFORT = None
-    TOOLS_PAYLOAD = None
-    ADDED_TO_PAYLOAD = None
-    ADDED_TO_PROMPT = " /no_think"
-    ADDED_TO_PROMPT = None
+    "TRIAL_SEVERE_EVALUATION": True,
+    "ANTHROPIC_THINKING_TOKENS": None,
+    # ANTHROPIC_THINKING_TOKENS = 16000
+    "PAYLOAD_REASONING_EFFORT": None,
+    # PAYLOAD_REASONING_EFFORT = "low"
+    "TOOLS_PAYLOAD": None,
+    "ADDED_TO_PAYLOAD": None,
+    "ADDED_TO_PROMPT": None,
+    # ADDED_TO_PROMPT = " /no_think"
+}
+
+
+class ModelSession:
+    """Isolated Shared settings + optional response-pool for one model run."""
+
+    __slots__ = ("rate_limiter",) + tuple(_SHARED_DEFAULTS.keys())
+
+    def __init__(self, rate_limiter=None, **overrides):
+        for key, default in _SHARED_DEFAULTS.items():
+            setattr(self, key, overrides[key] if key in overrides else default)
+        self.rate_limiter = rate_limiter
+
+
+_current_session: contextvars.ContextVar[Optional[ModelSession]] = contextvars.ContextVar(
+    "pm_model_session", default=None
+)
+_global_shared_state = ModelSession(rate_limiter=None)
+
+
+def get_current_session() -> Optional[ModelSession]:
+    return _current_session.get()
+
+
+def _active_shared_store() -> ModelSession:
+    session = _current_session.get()
+    return session if session is not None else _global_shared_state
+
+
+def get_rate_limiter() -> RateLimiter:
+    """Return the session-local response-pool, or the process-wide limiter."""
+    session = _current_session.get()
+    if session is not None and session.rate_limiter is not None:
+        return session.rate_limiter
+    return _GLOBAL_RATE_LIMITER
+
+
+@contextmanager
+def model_session(rate_limiter=None, **shared_overrides):
+    """Install an isolated Shared + response-pool for the current context.
+
+    If rate_limiter is omitted, a nested session keeps the parent's pool.
+    """
+    parent = _current_session.get()
+    base = _active_shared_store()
+    values = {key: getattr(base, key) for key in _SHARED_DEFAULTS}
+    values.update(shared_overrides)
+    if rate_limiter is None and parent is not None:
+        rate_limiter = parent.rate_limiter
+    session = ModelSession(rate_limiter=rate_limiter, **values)
+    token = _current_session.set(session)
+    try:
+        yield session
+    finally:
+        _current_session.reset(token)
+
+
+def run_in_current_context(fn, *args, **kwargs):
+    """Run fn with the caller's contextvars (for ThreadPoolExecutor workers)."""
+    ctx = contextvars.copy_context()
+    return ctx.run(fn, *args, **kwargs)
+
+
+def submit_with_context(executor, fn, *args, **kwargs):
+    """Submit work that inherits the caller's model session / Shared state."""
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, fn, *args, **kwargs)
+
+
+class _SharedProxy:
+    """Attribute proxy: session-local Shared when a model_session is active."""
+
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        store = _active_shared_store()
+        if hasattr(store, name):
+            return getattr(store, name)
+        if name in _SHARED_DEFAULTS:
+            return _SHARED_DEFAULTS[name]
+        raise AttributeError(f"Shared has no attribute {name!r}")
+
+    def __setattr__(self, name, value):
+        if name in _SHARED_DEFAULTS or hasattr(_active_shared_store(), name):
+            setattr(_active_shared_store(), name, value)
+            return
+        raise AttributeError(f"Shared has no attribute {name!r}")
+
+    def __dir__(self):
+        return sorted(set(_SHARED_DEFAULTS.keys()) | set(object.__dir__(self)))
+
+
+Shared = _SharedProxy()
+
+
+class _RateLimiterProxy:
+    """Forwards to the active session's RateLimiter or the global default."""
+
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        return getattr(get_rate_limiter(), name)
+
+
+# Backward-compatible name: resolves to the current session's pool when set.
+RATE_LIMITER = _RateLimiterProxy()
 
 
 MODELS_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models_config.json")
@@ -1464,19 +1575,37 @@ def get_base_evaluation_path(model_name):
     return "evaluation-grok41-fast" if ("grok-4.1-fast" in model_name or "grok-4-1-fast" in model_name) else "evaluation-" + clean_model_name(model_name)
 
 
-def configure_rate_limiter(requests_per_minute=60, requests_per_hour=1000,
-                          tokens_per_minute=90000, tokens_per_hour=2000000,
-                          max_concurrent=10):
-    """Configure the global rate limiter with new settings."""
-    global RATE_LIMITER
-    RATE_LIMITER = RateLimiter(
+def create_rate_limiter(requests_per_minute=60, requests_per_hour=1000,
+                        tokens_per_minute=90000, tokens_per_hour=2000000,
+                        max_concurrent=10):
+    """Create a new limited response-pool (RateLimiter instance)."""
+    return RateLimiter(
         requests_per_minute=requests_per_minute,
         requests_per_hour=requests_per_hour,
         tokens_per_minute=tokens_per_minute,
         tokens_per_hour=tokens_per_hour,
         max_concurrent=max_concurrent
     )
-    return RATE_LIMITER
+
+
+def configure_rate_limiter(requests_per_minute=60, requests_per_hour=1000,
+                          tokens_per_minute=90000, tokens_per_hour=2000000,
+                          max_concurrent=10):
+    """Configure the active session's response-pool, or the process-wide default."""
+    global _GLOBAL_RATE_LIMITER
+    limiter = create_rate_limiter(
+        requests_per_minute=requests_per_minute,
+        requests_per_hour=requests_per_hour,
+        tokens_per_minute=tokens_per_minute,
+        tokens_per_hour=tokens_per_hour,
+        max_concurrent=max_concurrent
+    )
+    session = _current_session.get()
+    if session is not None:
+        session.rate_limiter = limiter
+    else:
+        _GLOBAL_RATE_LIMITER = limiter
+    return limiter
 
 
 if __name__ == "__main__":
