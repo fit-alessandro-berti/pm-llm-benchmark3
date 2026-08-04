@@ -17,6 +17,9 @@ from typing import Dict, Any, Optional
 
 from file_utils import read_file_with_fallback
 
+# HTTP timeout for provider API requests (60 minutes)
+REQUEST_TIMEOUT = 60 * 60
+
 PROVIDER_API_KEY_ENVS = {
     "openrouter": "OPENROUTER_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -787,7 +790,7 @@ def query_text_simple_openai_new(question, api_url, target_file):
 
     dump_payload(payload, target_file)
 
-    response = requests.post(complete_url, headers=headers, json=payload, timeout=30*60)
+    response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
     if response.status_code != 200:
         print(response)
         print(response.status_code)
@@ -865,7 +868,7 @@ def query_text_simple_generic(question, api_url, target_file):
         chunk_count = 0
 
         # Use stream=True to process response chunks as they arrive
-        with requests.post(ollama_url, headers=headers, json=payload, stream=True) as resp:
+        with requests.post(ollama_url, headers=headers, json=payload, stream=True, timeout=REQUEST_TIMEOUT) as resp:
             # Iterate over each line in the streamed response
             for line in resp.iter_lines():
                 if not line:
@@ -913,7 +916,7 @@ def query_text_simple_generic(question, api_url, target_file):
             chunk_count = 0
 
             # We add stream=True to requests so we can iterate over chunks
-            with requests.post(complete_url, headers=headers, json=payload, stream=True) as resp:
+            with requests.post(complete_url, headers=headers, json=payload, stream=True, timeout=REQUEST_TIMEOUT) as resp:
                 #print(resp)
                 #print(resp.status_code)
                 #print(resp.text)
@@ -981,7 +984,7 @@ def query_text_simple_generic(question, api_url, target_file):
                 payload["reasoning_effort"] = Shared.PAYLOAD_REASONING_EFFORT
 
             # Non-streaming call
-            response = requests.post(complete_url, headers=headers, json=payload)
+            response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
 
             response = response.json()
 
@@ -1044,7 +1047,7 @@ def query_text_simple_anthropic(question, api_url, target_file):
         chunk_count = 0
 
         # Make a streaming POST request
-        with requests.post(complete_url, headers=headers, json=payload, stream=True) as resp:
+        with requests.post(complete_url, headers=headers, json=payload, stream=True, timeout=REQUEST_TIMEOUT) as resp:
             for line in resp.iter_lines():
                 if not line:
                     continue
@@ -1076,7 +1079,7 @@ def query_text_simple_anthropic(question, api_url, target_file):
                     traceback.print_exc()
                     continue
     else:
-        with requests.post(complete_url, headers=headers, json=payload) as resp:
+        with requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT) as resp:
             if resp.status_code != 200:
                 print(resp)
                 print(resp.text)
@@ -1115,7 +1118,7 @@ def query_text_simple_google(question, api_url, target_file):
 
     dump_payload(payload, target_file)
 
-    response = requests.post(complete_url, headers=headers, json=payload).json()
+    response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT).json()
     dump_response(response, target_file)
 
     try:
@@ -1256,7 +1259,7 @@ def query_image_simple_openai_new(base64_image, api_url, target_file, text):
 
     dump_payload(payload, target_file)
 
-    response = requests.post(complete_url, headers=headers, json=payload, timeout=30*60)
+    response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
     if response.status_code != 200:
         print(response)
         print(response.status_code)
@@ -1306,7 +1309,7 @@ def query_image_simple_generic(base64_image, api_url, target_file, text):
         chunk_count = 0
 
         # We add stream=True to requests so we can iterate over chunks
-        with requests.post(complete_url, headers=headers, json=payload, stream=True) as resp:
+        with requests.post(complete_url, headers=headers, json=payload, stream=True, timeout=REQUEST_TIMEOUT) as resp:
             if resp.status_code != 200:
                 print(resp)
                 print(resp.status_code)
@@ -1339,7 +1342,7 @@ def query_image_simple_generic(base64_image, api_url, target_file, text):
                         # Possibly a keep-alive or incomplete chunk
                         traceback.print_exc()
     else:
-        response = requests.post(complete_url, headers=headers, json=payload)
+        response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
         #print(response)
         #print(response.status_code)
         #print(response.text)
@@ -1389,7 +1392,7 @@ def query_image_simple_anthropic(base64_image, api_url, target_file, text):
 
     payload["messages"] = messages
 
-    response = requests.post(complete_url, headers=headers, json=payload).json()
+    response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT).json()
     dump_response(response, target_file)
 
     try:
@@ -1426,7 +1429,7 @@ def query_image_simple_google(base64_image, api_url, target_file, text):
             }
         }
 
-    response = requests.post(complete_url, headers=headers, json=payload).json()
+    response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT).json()
     dump_response(response, target_file)
 
     try:
@@ -1497,7 +1500,7 @@ def get_models():
 
     complete_url = Shared.API_URL+"models"
 
-    response = requests.get(complete_url, headers=headers)
+    response = requests.get(complete_url, headers=headers, timeout=REQUEST_TIMEOUT)
 
     models = response.json()
 
