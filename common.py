@@ -397,7 +397,6 @@ _CLOSED_SOURCE_MODEL_ALIASES = (
     "cypher",
     "mistral-medium",
     "magistral-medium",
-    "ministral-3b",
     "sonoma",
     "mimo",
     "muse",

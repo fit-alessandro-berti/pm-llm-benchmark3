@@ -8,7 +8,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | gpt-5.6-terra-NONE | **41.4** | :x:                | :x: | **4.9**              | **4.9**              | :mage_woman: **5.4** | 4.7                  | 4.9                  | :mage_woman: **5.5** | **5.3**              | :mage_woman: **5.8** |
 | ministral-14b-2512 | **22.7** | :white_check_mark: | :x: | 2.7                  | 2.1                  | 2.4                  | 2.1                  | 2.5                  | 3.1                  | 4.0                  | 3.8                  |
 | ministral-8b-2512  | **22.3** | :white_check_mark: | :x: | 2.9                  | 2.1                  | 2.8                  | 1.9                  | 2.3                  | 3.0                  | 3.7                  | 3.5                  |
-| ministral-3b-2512  | **18.5** | :x:                | :x: | 2.3                  | 1.6                  | 2.1                  | 1.6                  | 2.0                  | 2.2                  | 3.3                  | 3.4                  |
+| ministral-3b-2512  | **18.5** | :white_check_mark: | :x: | 2.3                  | 1.6                  | 2.1                  | 1.6                  | 2.0                  | 2.2                  | 3.3                  | 3.4                  |
 
 ### gpt-5.6-sol-NONE   => 42.4 points
 
