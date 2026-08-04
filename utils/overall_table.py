@@ -265,6 +265,7 @@ def write_evaluation(base_path, extra=True):
         os.path.join(base_path, "leaderboard_" + get_suffix_name(e_m_name) + ".md"),
         include_closed_source=True,
         leaderboard_title="Overall Leaderboard",
+        json_file=os.path.join(base_path, "hallucinations/leaderboard_stats.md"),
         model_results=model_results,
     )
 
