@@ -510,7 +510,6 @@ _CLOSED_SOURCE_MODEL_ALIASES = (
     "optimus",
     "horizon",
     "cypher",
-    "mistral-medium",
     "magistral-medium",
     "sonoma",
     "mimo",
