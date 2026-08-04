@@ -2,11 +2,12 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 
 ## Large Reasoning Models Leaderboard (Models with CoT) (1-shot; grok-4.5 used as a judge)
 
-| Model           | Score    | OS                 | LRM                | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
-| --------------- | -------- | ------------------ | ------------------ | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
-| qwen3.6-27b     | **36.7** | :white_check_mark: | :white_check_mark: | :mage_woman: **4.5** | :mage_woman: **4.1** | :mage_woman: **5.2** | :mage_woman: **4.0** | :mage_woman: **4.3** | **4.6**              | :mage_woman: **5.1** | :mage_woman: **5.0** |
-| qwen3.6-35b-a3b | **29.8** | :white_check_mark: | :white_check_mark: | **4.2**              | 1.2                  | 3.7                  | 3.0                  | **4.0**              | :mage_woman: **4.7** | 4.3                  | **4.7**              |
-| qwen3.5-9b      | **25.7** | :white_check_mark: | :white_check_mark: | 3.4                  | 2.2                  | 3.3                  | 2.6                  | 2.7                  | 3.1                  | 4.6                  | 3.8                  |
+| Model                  | Score    | OS                 | LRM                | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
+| ---------------------- | -------- | ------------------ | ------------------ | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
+| qwen3.6-27b            | **36.7** | :white_check_mark: | :white_check_mark: | :mage_woman: **4.5** | **4.1**              | :mage_woman: **5.2** | :mage_woman: **4.0** | :mage_woman: **4.3** | 4.6                  | :mage_woman: **5.1** | :mage_woman: **5.0** |
+| qwen3.6-35b-a3b        | **33.4** | :white_check_mark: | :white_check_mark: | **4.2**              | 3.2                  | 4.3                  | 3.2                  | **4.0**              | **4.7**              | **5.0**              | **4.7**              |
+| deepseek-v4-flash-0731 | **29.2** | :white_check_mark: | :white_check_mark: | 3.9                  | :mage_woman: **4.2** | 2.8                  | **3.8**              | 1.8                  | :mage_woman: **4.9** | 4.2                  | 3.7                  |
+| qwen3.5-9b             | **25.7** | :white_check_mark: | :white_check_mark: | 3.4                  | 2.2                  | 3.3                  | 2.6                  | 2.7                  | 3.1                  | 4.6                  | 3.8                  |
 
 ### qwenqwen3.6-27b   => 36.7 points
 
@@ -69,7 +70,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 6.8   |
 | cat08_07_contradictory_evidence_memo           | 7.2   |
 
-### qwenqwen3.6-35b-a3b   => 29.8 points
+### qwenqwen3.6-35b-a3b   => 33.4 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -80,8 +81,12 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat01_05_mixed_drift_attribution               | 6.7   |
 | cat01_06_intervention_transportability         | 6.1   |
 | cat01_07_case_counterfactuals                  | 5.8   |
+| cat02_01_reconstruct_partial_queue             | 3.3   |
+| cat02_02_infer_queue_disciplines               | 4.4   |
 | cat02_03_fork_join_delay_decomposition         | 3.3   |
+| cat02_04_batching_vs_bulk_logging              | 5.6   |
 | cat02_05_nonstationary_queue_regimes           | 5.6   |
+| cat02_06_sla_survival_censoring                | 6.7   |
 | cat02_07_robust_multiskill_staffing            | 2.8   |
 | cat03_01_case_notion_tradeoffs                 | 6.7   |
 | cat03_02_relation_repair                       | 6.7   |
@@ -89,6 +94,8 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat03_04_incomplete_norm_conformance           | 6.8   |
 | cat03_05_execution_equivalence_clustering      | 4.4   |
 | cat03_06_compact_ocel_pipeline                 | 6.7   |
+| cat03_07_duplicate_tie_cleaning                | 6.1   |
+| cat04_01_dual_formalism_synthesis              | 2.2   |
 | cat04_02_unsound_petri_net_repair              | 6.7   |
 | cat04_03_hybrid_procedural_declarative         | 5.6   |
 | cat04_04_sparse_evidence_model_completion      | 2.8   |
@@ -113,6 +120,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat07_02_formal_shadow_roles                   | 6.7   |
 | cat07_03_collusion_or_necessity                | 8.2   |
 | cat07_04_procedural_fairness_complexity        | 7.3   |
+| cat07_05_learning_fatigue_queue_pressure       | 7.2   |
 | cat07_06_dynamic_resource_assignment           | 6.8   |
 | cat07_07_restructuring_impact                  | 6.7   |
 | cat08_01_conflicting_evidence_redesign         | 6.7   |
@@ -122,6 +130,58 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat08_05_disruption_resilience_recovery        | 7.4   |
 | cat08_06_digital_twin_experiments              | 6.8   |
 | cat08_07_contradictory_evidence_memo           | 6.7   |
+
+### deepseekdeepseek-v4-flash-0731   => 29.2 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 1.0   |
+| cat01_02_staggered_automation                  | 7.4   |
+| cat01_03_flag_mediation                        | 1.0   |
+| cat01_04_conformance_root_cause                | 7.3   |
+| cat01_05_mixed_drift_attribution               | 7.8   |
+| cat01_06_intervention_transportability         | 7.3   |
+| cat01_07_case_counterfactuals                  | 7.1   |
+| cat02_01_reconstruct_partial_queue             | 1.0   |
+| cat02_02_infer_queue_disciplines               | 8.2   |
+| cat02_03_fork_join_delay_decomposition         | 8.2   |
+| cat02_04_batching_vs_bulk_logging              | 8.7   |
+| cat02_05_nonstationary_queue_regimes           | 6.8   |
+| cat02_06_sla_survival_censoring                | 7.4   |
+| cat02_07_robust_multiskill_staffing            | 2.2   |
+| cat03_01_case_notion_tradeoffs                 | 8.9   |
+| cat03_03_cross_instance_bottlenecks            | 7.8   |
+| cat03_05_execution_equivalence_clustering      | 5.8   |
+| cat03_06_compact_ocel_pipeline                 | 5.0   |
+| cat04_01_dual_formalism_synthesis              | 8.2   |
+| cat04_02_unsound_petri_net_repair              | 6.8   |
+| cat04_03_hybrid_procedural_declarative         | 5.6   |
+| cat04_04_sparse_evidence_model_completion      | 6.0   |
+| cat04_05_behavioral_equivalence_simplification | 1.7   |
+| cat04_06_conversion_semantic_loss_audit        | 8.0   |
+| cat04_07_adversarial_model_review              | 2.0   |
+| cat05_01_norm_hierarchy_conflicts              | 7.3   |
+| cat05_02_compensating_controls                 | 8.2   |
+| cat05_04_uncertain_temporal_conformance        | 1.0   |
+| cat05_07_normative_model_dialectic             | 1.0   |
+| cat06_01_latent_state_next_event               | 7.5   |
+| cat06_02_competing_clocks_remaining_time       | 7.3   |
+| cat06_03_censored_outcome_study                | 7.4   |
+| cat06_04_capacity_aware_early_warning          | 6.8   |
+| cat06_05_process_aware_explanation_audit       | 6.1   |
+| cat06_06_conformant_next_best_action           | 7.3   |
+| cat06_07_process_evidence_drift_diagnosis      | 6.7   |
+| cat07_01_reconcile_org_networks                | 5.6   |
+| cat07_03_collusion_or_necessity                | 8.0   |
+| cat07_04_procedural_fairness_complexity        | 7.2   |
+| cat07_05_learning_fatigue_queue_pressure       | 8.0   |
+| cat07_06_dynamic_resource_assignment           | 6.8   |
+| cat07_07_restructuring_impact                  | 6.1   |
+| cat08_01_conflicting_evidence_redesign         | 7.8   |
+| cat08_04_sustainability_redesign               | 7.2   |
+| cat08_05_disruption_resilience_recovery        | 8.2   |
+| cat08_06_digital_twin_experiments              | 6.7   |
+| cat08_07_contradictory_evidence_memo           | 6.8   |
 
 ### qwenqwen3.5-9b   => 25.7 points
 
