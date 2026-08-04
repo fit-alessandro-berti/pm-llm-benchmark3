@@ -11,8 +11,8 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | z-aiglm-5.2                   | **37.7** | :white_check_mark: | :white_check_mark: | 4.5                  | **4.5**              | 4.8                  | 4.5                  | 4.4                  | 4.6                  | **5.2**              | **5.2**              |
 | deepseek-v4-pro               | **37.0** | :white_check_mark: | :white_check_mark: | 4.8                  | 4.2                  | 4.4                  | 3.9                  | 4.5                  | 4.8                  | 5.1                  | 5.1                  |
 | qwen3.6-27b                   | **36.7** | :white_check_mark: | :white_check_mark: | 4.5                  | 4.1                  | **5.2**              | 4.0                  | 4.3                  | 4.6                  | 5.1                  | 5.0                  |
+| qwen3.5-397b-a17b             | **36.2** | :white_check_mark: | :white_check_mark: | 4.4                  | 4.1                  | 4.9                  | 4.0                  | 4.4                  | 4.5                  | 4.9                  | 4.9                  |
 | deepseek-v4-flash-0731        | **35.1** | :white_check_mark: | :white_check_mark: | 3.9                  | 4.2                  | 4.1                  | 3.8                  | 4.0                  | 4.9                  | 4.9                  | **5.3**              |
-| qwen3.5-397b-a17b             | **34.9** | :white_check_mark: | :white_check_mark: | 4.4                  | 3.5                  | 4.9                  | 4.0                  | 3.8                  | 4.5                  | 4.9                  | 4.9                  |
 | qwen3.5-122b-a10b             | **33.5** | :white_check_mark: | :white_check_mark: | 4.1                  | 3.5                  | 4.3                  | 3.1                  | 3.9                  | 4.7                  | 4.7                  | 5.1                  |
 | qwen3.6-35b-a3b               | **33.4** | :white_check_mark: | :white_check_mark: | 4.2                  | 3.2                  | 4.3                  | 3.2                  | 4.0                  | 4.7                  | 5.0                  | 4.7                  |
 | minimaxminimax-m3             | **33.1** | :white_check_mark: | :white_check_mark: | 4.1                  | 4.0                  | 4.3                  | 2.4                  | 4.0                  | 4.7                  | 4.9                  | 4.8                  |
@@ -445,6 +445,67 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 6.8   |
 | cat08_07_contradictory_evidence_memo           | 7.2   |
 
+### qwenqwen3.5-397b-a17b   => 36.2 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 6.8   |
+| cat01_02_staggered_automation                  | 5.8   |
+| cat01_03_flag_mediation                        | 6.7   |
+| cat01_04_conformance_root_cause                | 5.8   |
+| cat01_05_mixed_drift_attribution               | 6.7   |
+| cat01_06_intervention_transportability         | 6.8   |
+| cat01_07_case_counterfactuals                  | 5.8   |
+| cat02_01_reconstruct_partial_queue             | 5.0   |
+| cat02_02_infer_queue_disciplines               | 6.8   |
+| cat02_03_fork_join_delay_decomposition         | 6.7   |
+| cat02_04_batching_vs_bulk_logging              | 6.7   |
+| cat02_05_nonstationary_queue_regimes           | 5.6   |
+| cat02_06_sla_survival_censoring                | 5.8   |
+| cat02_07_robust_multiskill_staffing            | 4.8   |
+| cat03_01_case_notion_tradeoffs                 | 6.8   |
+| cat03_02_relation_repair                       | 7.3   |
+| cat03_03_cross_instance_bottlenecks            | 8.2   |
+| cat03_04_incomplete_norm_conformance           | 7.4   |
+| cat03_05_execution_equivalence_clustering      | 6.7   |
+| cat03_06_compact_ocel_pipeline                 | 5.8   |
+| cat03_07_duplicate_tie_cleaning                | 6.8   |
+| cat04_01_dual_formalism_synthesis              | 5.6   |
+| cat04_02_unsound_petri_net_repair              | 6.8   |
+| cat04_03_hybrid_procedural_declarative         | 5.0   |
+| cat04_04_sparse_evidence_model_completion      | 3.3   |
+| cat04_05_behavioral_equivalence_simplification | 6.8   |
+| cat04_06_conversion_semantic_loss_audit        | 5.6   |
+| cat04_07_adversarial_model_review              | 6.8   |
+| cat05_01_norm_hierarchy_conflicts              | 6.7   |
+| cat05_02_compensating_controls                 | 5.6   |
+| cat05_03_data_aware_obligations                | 6.1   |
+| cat05_04_uncertain_temporal_conformance        | 5.6   |
+| cat05_05_delegation_resource_conformance       | 6.8   |
+| cat05_06_alignment_business_severity           | 7.3   |
+| cat05_07_normative_model_dialectic             | 5.6   |
+| cat06_01_latent_state_next_event               | 7.3   |
+| cat06_02_competing_clocks_remaining_time       | 2.8   |
+| cat06_03_censored_outcome_study                | 6.8   |
+| cat06_04_capacity_aware_early_warning          | 6.7   |
+| cat06_05_process_aware_explanation_audit       | 6.8   |
+| cat06_06_conformant_next_best_action           | 7.3   |
+| cat06_07_process_evidence_drift_diagnosis      | 7.3   |
+| cat07_01_reconcile_org_networks                | 7.3   |
+| cat07_02_formal_shadow_roles                   | 7.8   |
+| cat07_03_collusion_or_necessity                | 6.8   |
+| cat07_04_procedural_fairness_complexity        | 7.3   |
+| cat07_05_learning_fatigue_queue_pressure       | 6.8   |
+| cat07_06_dynamic_resource_assignment           | 5.6   |
+| cat07_07_restructuring_impact                  | 7.7   |
+| cat08_01_conflicting_evidence_redesign         | 2.6   |
+| cat08_02_demand_shock_robustness               | 8.2   |
+| cat08_03_automation_portfolio_dependencies     | 7.8   |
+| cat08_04_sustainability_redesign               | 7.5   |
+| cat08_05_disruption_resilience_recovery        | 8.2   |
+| cat08_06_digital_twin_experiments              | 6.7   |
+| cat08_07_contradictory_evidence_memo           | 8.0   |
+
 ### deepseekdeepseek-v4-flash-0731   => 35.1 points
 
 | Question                                       | Score |
@@ -505,65 +566,6 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat08_05_disruption_resilience_recovery        | 8.2   |
 | cat08_06_digital_twin_experiments              | 6.7   |
 | cat08_07_contradictory_evidence_memo           | 6.8   |
-
-### qwenqwen3.5-397b-a17b   => 34.9 points
-
-| Question                                       | Score |
-| ---------------------------------------------- | ----- |
-| cat01_01_bottleneck_causality                  | 6.8   |
-| cat01_02_staggered_automation                  | 5.8   |
-| cat01_03_flag_mediation                        | 6.7   |
-| cat01_04_conformance_root_cause                | 5.8   |
-| cat01_05_mixed_drift_attribution               | 6.7   |
-| cat01_06_intervention_transportability         | 6.8   |
-| cat01_07_case_counterfactuals                  | 5.8   |
-| cat02_01_reconstruct_partial_queue             | 5.0   |
-| cat02_02_infer_queue_disciplines               | 6.8   |
-| cat02_03_fork_join_delay_decomposition         | 6.7   |
-| cat02_05_nonstationary_queue_regimes           | 5.6   |
-| cat02_06_sla_survival_censoring                | 5.8   |
-| cat02_07_robust_multiskill_staffing            | 4.8   |
-| cat03_01_case_notion_tradeoffs                 | 6.8   |
-| cat03_02_relation_repair                       | 7.3   |
-| cat03_03_cross_instance_bottlenecks            | 8.2   |
-| cat03_04_incomplete_norm_conformance           | 7.4   |
-| cat03_05_execution_equivalence_clustering      | 6.7   |
-| cat03_06_compact_ocel_pipeline                 | 5.8   |
-| cat03_07_duplicate_tie_cleaning                | 6.8   |
-| cat04_01_dual_formalism_synthesis              | 5.6   |
-| cat04_02_unsound_petri_net_repair              | 6.8   |
-| cat04_03_hybrid_procedural_declarative         | 5.0   |
-| cat04_04_sparse_evidence_model_completion      | 3.3   |
-| cat04_05_behavioral_equivalence_simplification | 6.8   |
-| cat04_06_conversion_semantic_loss_audit        | 5.6   |
-| cat04_07_adversarial_model_review              | 6.8   |
-| cat05_01_norm_hierarchy_conflicts              | 6.7   |
-| cat05_02_compensating_controls                 | 5.6   |
-| cat05_03_data_aware_obligations                | 6.1   |
-| cat05_04_uncertain_temporal_conformance        | 5.6   |
-| cat05_05_delegation_resource_conformance       | 6.8   |
-| cat05_06_alignment_business_severity           | 7.3   |
-| cat06_01_latent_state_next_event               | 7.3   |
-| cat06_02_competing_clocks_remaining_time       | 2.8   |
-| cat06_03_censored_outcome_study                | 6.8   |
-| cat06_04_capacity_aware_early_warning          | 6.7   |
-| cat06_05_process_aware_explanation_audit       | 6.8   |
-| cat06_06_conformant_next_best_action           | 7.3   |
-| cat06_07_process_evidence_drift_diagnosis      | 7.3   |
-| cat07_01_reconcile_org_networks                | 7.3   |
-| cat07_02_formal_shadow_roles                   | 7.8   |
-| cat07_03_collusion_or_necessity                | 6.8   |
-| cat07_04_procedural_fairness_complexity        | 7.3   |
-| cat07_05_learning_fatigue_queue_pressure       | 6.8   |
-| cat07_06_dynamic_resource_assignment           | 5.6   |
-| cat07_07_restructuring_impact                  | 7.7   |
-| cat08_01_conflicting_evidence_redesign         | 2.6   |
-| cat08_02_demand_shock_robustness               | 8.2   |
-| cat08_03_automation_portfolio_dependencies     | 7.8   |
-| cat08_04_sustainability_redesign               | 7.5   |
-| cat08_05_disruption_resilience_recovery        | 8.2   |
-| cat08_06_digital_twin_experiments              | 6.7   |
-| cat08_07_contradictory_evidence_memo           | 8.0   |
 
 ### qwenqwen3.5-122b-a10b   => 33.5 points
 
