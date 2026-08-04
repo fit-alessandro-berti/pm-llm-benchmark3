@@ -500,6 +500,7 @@ _CLOSED_SOURCE_COMMERCIAL_TIERS = (
     "qwen3-max",
     "qwen3.6-max",
     "qwen3.6-plus",
+    "qwen3.8-max",
 )
 
 _CLOSED_SOURCE_MODEL_ALIASES = (
@@ -514,6 +515,7 @@ _CLOSED_SOURCE_MODEL_ALIASES = (
     "sonoma",
     "mimo",
     "muse",
+    "inkling",
 )
 
 _CLOSED_SOURCE_MODEL_MARKERS = (
