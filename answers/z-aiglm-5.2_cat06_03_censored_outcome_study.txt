@@ -1,0 +1,403 @@
+<think>
+The user wants a detailed design for an uncertainty-aware predictive process monitoring study in the context of credit application default prediction. I need to address the specific business question, process, and data constraints. The output must strictly follow the nine sections outlined.
+
+Key constraints to keep in mind:
+- Don't train only on the 21,600 labeled rows without qualification.
+- Don't label rejected/withdrawn/open as non-default.
+- Prevent leakage (final_limit, collection_status, future events, etc.).
+- Time-based validation instead of random split.
+- PM4Py skeleton of 80-160 lines.
+
+Let's outline the 9 sections:
+
+## 1. Target definition
+Primary target: Time-to-default after activation with right censoring (survival analysis framework). Predict the probability of default within 90 days of activation, conditional on activation, using early application prefixes. Alternatively, multi-state competing risk model (default, rejection, withdrawal, transfer). Survival is better because it handles delayed labels and right censoring (the 3,600 matured but feed-delayed, plus 5,100 still-open). Operationally defensible: it acknowledges that default is only defined post-activation and handles partial observation. Estimand: $P(T \le 90 | \text{prefix}, \text{activated})$.
+Alternative: Multi-state model predicting the probability of reaching Accept->Default vs Accept->No Default vs Reject vs Withdrawn from a given prefix. This answers "what happens to the application" rather than just "will an activated account default".
+
+## 2. Cohort construction
+As-of date: 15 Feb 2026 (extraction date).
+Total: 48,000.
+- 18,900 non-default + 2,700 default = 21,600 activated & matured.
+- 3,600 activated but unmatured/delayed: Censored (right censoring).
+- 5,100 still-open: Censored (competing/incomplete processes).
+- 9,100 rejected: Competing outcome (Rejected).
+- 5,700 withdrawn: Competing outcome (Withdrawn).
+- 2,900 transferred: Competing outcome or missing mechanism (Transferred).
+Cohort flow table mapping all 48,000.
+
+## 3. Censoring and missing-label strategy
+- Ordinary right censoring: 3,600 activated but not matured, 5,100 still-open (if we consider activation as the absorbing state, but they are still in the process, so event-history censoring). Wait, if target is time-to-default *after activation*, then "still-open" means they haven't activated yet or haven't matured? Data says: "5,100 still-open applications" and "3,600 activated accounts whose 90-day outcome... has not matured". So 3,600 are right-censored for the 90d post-activation outcome. 5,100 are right-censored for the application outcome itself (not yet activated/rejected/withdrawn).
+- Delayed labels: External feed 7-35 days late.
+- Selection through activation: Only activated accounts have default labels.
+- Transfer: 60% linkage table. If unlinked, missing follow-up. If linked, they have a different trajectory (competing risk or censoring).
+- Permanently missing: Partner-originated accounts missing feed.
+Primary analysis: Survival analysis (Cox PH or discrete-time survival) on activated cases, treating unmatured/delayed as right-censored. 
+Sensitivity analysis: Inverse probability weighting (IPW) to adjust for activation selection bias.
+
+## 4. Prefix extraction
+Prediction point: First 3 events, OR 48 hours after Application Started.
+Future prevention: Cut events strictly after prediction point.
+Activity renaming: Map pre-15 Oct 2025 names to post-migration names, or flag migration cohort.
+Documents total: Only include if uploaded before prediction time (exclude same-day uploads if prediction time is e.g. noon, or require timestamp of upload if available, otherwise drop feature).
+
+## 5. Process-aware features
+Control-flow: Event sequence, variants, count of loops.
+Timing: Time since start, time between events.
+Resource/queue: Resource experience (calculated *at event time* if possible, else flag), resource load.
+Static: Requested amount, channel, region.
+Historical: Previous approval rates by resource/branch.
+
+## 6. Leakage audit
+Table format. Cover final_limit, decision_reason, collection_status, future events, documents_total, risk_score, resource experience, label availability.
+
+## 7. Validation design
+Time split:
+Train: Jan 2024 - Jun 2025 (pre-policy)
+Validation: Jul 2025 - Sep 2025 (post-policy, pre-migration)
+Test: Oct 2025 - Dec 2025 (post-migration)
+Random split is bad because of policy change, system migration, and temporal leakage.
+Metrics: C-index, Brier score for survival, AUC for fixed horizon.
+
+## 8. Limitations and decision-use boundary
+Association vs counterfactual. We are predicting $P(\text{default} | \text{activated}, \text{prefix})$, not $P(\text{default} | \text{prefix})$ for all applicants.
+Deployment could change behavior (people write better applications, resources change, thresholds change).
+
+## 9. PM4Py-oriented Python implementation skeleton
+Use `pm4py.format_dataframe`, `pm4py.get_prefixes_from_log`, etc.
+
+Let's draft the code carefully to fit 80-160 lines.
+```python
+import pandas as pd
+import pm4py
+from datetime import timedelta
+
+# Configurable cutoff and prediction rules
+EXTRACTION_TIME = pd.to_datetime("2026-02-15")
+PREDICTION_EVENT_COUNT = 3
+HORIZON_DAYS = 90
+
+def main():
+    # 1. Load and format event log
+    df = pd.read_csv("applications_events.csv")
+    df['time:timestamp'] = pd.to_datetime(df['time:timestamp'])
+    log = pm4py.format_dataframe(df, case_id_column='case:concept:name', 
+                                activity_column='concept:name', 
+                                timestamp_column='time:timestamp')
+    
+    # 2. Case-level as-of information
+    case_starts = log.groupby('case:concept:name')['time:timestamp'].min().rename('start_time')
+    case_ends = log.groupby('case:concept:name')['time:timestamp'].max().rename('end_time')
+    
+    # Find activation and terminal states
+    # Assuming 'Account Activated' is an activity name
+    activated_cases = log[log['concept:name'] == 'Account Activated']
+    activation_times = activated_cases.groupby('case:concept:name')['time:timestamp'].min().rename('activation_time')
+    
+    case_info = pd.concat([case_starts, case_ends, activation_times], axis=1)
+    
+    # Define outcomes
+    # Default label available? only for activated and matured
+    # Censoring logic: right-censored if activation_time + 90d > EXTRACTION_TIME
+    case_info['matured'] = (case_info['activation_time'] + timedelta(days=HORIZON_DAYS)) <= EXTRACTION_TIME
+    case_info['eventually_activated'] = case_info['activation_time'].notna()
+    
+    # 3. Temporal Train/Val/Test Split by case start time
+    train_end = pd.to_datetime("2025-06-30")
+    val_end = pd.to_datetime("2025-09-30")
+    
+    train_cases = case_info[case_info['start_time'] <= train_end].index
+    val_cases = case_info[(case_info['start_time'] > train_end) & (case_info['start_time'] <= val_end)].index
+    test_cases = case_info[case_info['start_time'] > val_end].index
+    
+    train_log = log[log['case:concept:name'].isin(train_cases)]
+    
+    # 4. Prefix extraction using PM4Py
+    # Get prefixes of length PREDICTION_EVENT_COUNT
+    # Note: get_prefixes_from_log returns a dataframe of prefixes
+    prefixes_train = pm4py.get_prefixes_from_log(train_log, length=PREDICTION_EVENT_COUNT)
+    
+    # 5. Leakage Prevention: Drop post-prefix columns and future-derived features
+    # We filter out any column that couldn't be known at the prefix length
+    leakage_cols = ['final_limit', 'decision_reason', 'collection_status', 'default_90d']
+    # Also filter events beyond the prediction point if pm4py didn't already slice them
+    # (get_prefixes_from_log usually handles event slicing, but we ensure no future leakage in attrs)
+    
+    feature_cols = [c for c in prefixes_train.columns if c not in leakage_cols]
+    X_train = prefixes_train[feature_cols]
+    
+    # 6. Cohort counts and leakage audit
+    print("Cohort Counts:")
+    print(f"Total applications: {len(case_info)}")
+    print(f"Activated: {case_info['eventually_activated'].sum()}")
+    print(f"Matured Activated (Labeled): {(case_info['eventually_activated'] & case_info['matured']).sum()}")
+    # ... more counts
+    
+    # 7. Process discovery and temporal features (optional, for demonstration)
+    # Only using training data to avoid any test set leakage in process models
+    dfg = pm4py.discover_dfg(train_log)
+    
+    # Extract temporal features for the prefixes
+    # Note: we use the prefix log, so waiting times are bounded by the prefix
+    temp_features = pm4py.extract_temporal_features_dataframe(train_log)
+    
+    # Assume survival model fitting would go here:
+    # model = fit_survival_model(X_train, y_train)
+    
+if __name__ == "__main__":
+    main()
+```
+Wait, I need to refine the code to be closer to 80-160 lines and robust. I will add comments to explain the assumptions. I'll make sure `get_prefixes_from_log` is used correctly. Also, I should manually slice the dataframe before applying `get_prefixes_from_log` if I want an elapsed-time prefix. For event count, `get_prefixes_from_log` is perfect.
+
+Let's refine the text.
+Target definition: I'll choose "Time-to-default after activation with right censoring" as primary.
+Estimand: $S(t | X_{prefix}) = P(T > t | X_{prefix}, \text{Activated})$.
+
+Cohort flow table:
+Total: 48,000
+- Labeled (Matured): 21,600 (18,900 Non-default, 2,700 Default)
+- Censored (Unmatured): 3,600
+- Competing (Still open): 5,100
+- Competing (Rejected): 9,100
+- Competing (Withdrawn): 5,700
+- Missing/Competing (Transferred): 2,900
+
+Wait, 21,600 + 3,600 = 25,200 activated.
+25,200 + 9,100 + 5,700 + 2,900 + 5,100 = 48,000. Math checks out.
+
+Censoring strategy:
+Ordinary right censoring: 3,600 unmatured.
+Delayed labels: handled by survival analysis (event time observed, but entry to dataset is delayed).
+Selection through activation: Primary model only applies to activated cases. Do not predict for rejected/withdrawn unless using a multi-state model.
+Transfer: Treat as competing event for activation. If survival post-activation is modeled, transfer prior to activation is just a competing risk.
+
+Leakage audit table:
+final_limit | Populated only after final decision | Exclude from features | Drop
+decision_reason | Populated at/after Accept/Reject | Exclude | Drop
+collection_status | Post-activation | Exclude | Drop
+future events | Post-prefix | Exclude via prefix extraction | Drop
+documents_total | Same-day uploads might be in future | Require upload timestamp < prediction time | Repair/Drop
+risk_score | Updated at several events | Take value at the last event of the prefix | Repair
+resource experience | Stored at extraction time | Calculate historical experience at event time if possible, else flag as static | Repair
+label_available_at | Reveals label presence | Exclude | Drop
+
+Validation:
+Temporal split.
+Train: Jan 2024 - Jun 2025
+Val: Jul 2025 - Sep 2025
+Test: Oct 2025 - Dec 2025
+Metrics: Brier Score at 90 days, C-index.
+
+Let's write out the response.
+</think>
+## 1. Target definition
+
+**Primary target formulation:** Time-to-default after activation with right censoring (survival analysis).
+- **Prediction time:** Either after the 3rd event of the application process or after 48 hours have elapsed since `Application Started`, whichever occurs first.
+- **Horizon:** 90 days after `Account Activated`.
+- **Unit of analysis:** The credit application case (`case:concept:name`).
+- **Population:** All applications that eventually reach `Account Activated`. Rejected, withdrawn, and transferred cases are excluded from the primary training population because the target (default) is undefined without credit exposure.
+- **Estimand:** The survival function $S(t | X_{prefix}) = P(T > t | X_{prefix}, \text{Activated})$, specifically evaluating $1 - S(90)$ to obtain the probability of default within 90 days. 
+
+This formulation is statistically defensible because it respects the fact that default is only observed post-activation and naturally handles delayed labels and right-censored unmatured accounts. 
+
+**Alternative target formulation:** A multi-state competing-outcome model.
+- **Target:** The probability of transitioning to one of several absorbing states (`Default`, `No Default (Matured)`, `Rejected`, `Withdrawn`, `Transferred`) from the observed prefix. 
+- **Why it answers a different question:** This answers “what is the likely trajectory and final disposition of this application?” rather than “given the account is activated, what is its default risk?”. It avoids the selection bias of conditioning on activation but requires modeling pathways (e.g., rejection) that are outside the business question’s immediate focus on activated defaults.
+
+## 2. Cohort construction
+
+**As-of rules:** 
+- The data extraction date is 15 February 2026. 
+- An account is considered “matured” if `Account Activated` occurred at least 90 days before the extraction date (i.e., on or before 17 November 2025) and the outcome feed is present. 
+- Applications still in process (not accepted/rejected/withdrawn/activated) at the extraction date are right-censored at their last observed event time.
+
+**Cohort-flow table:**
+
+| Category | Status | Count | Treatment in Primary Model |
+| :--- | :--- | :--- | :--- |
+| **Total Applications** | | **48,000** | |
+| Activated & Matured | Default | 2,700 | Labeled event (T = time to default) |
+| Activated & Matured | Non-Default | 18,900 | Labeled event (T > 90 days) |
+| Activated & Unmatured/Delayed | Right Censored | 3,600 | Included; right-censored at extraction time |
+| Still-Open Applications | Competing/Censored | 5,100 | Excluded from primary target (no activation) |
+| Rejected | Competing | 9,100 | Excluded from primary target |
+| Withdrawn | Competing | 5,700 | Excluded from primary target |
+| Transferred | Missing/Competing | 2,900 | Excluded from primary target |
+
+## 3. Censoring and missing-label strategy
+
+- **Ordinary right censoring:** The 3,600 activated accounts whose 90-day window has not matured by 15 Feb 2026. These are included in the survival dataset with their last known event time as the censoring time.
+- **Delayed labels:** The 7–35 day feed delay means an account might be matured in reality but missing the label in the warehouse. Survival analysis accommodates this naturally; if the feed arrives later, the record can be updated.
+- **Selection through activation:** By conditioning the primary model only on activated accounts, we explicitly avoid the undefined counterfactual of default for rejected/withdrawn cases. We acknowledge this estimates risk *among the selected*.
+- **Transfer as a competing event:** Applications transferred before activation never face our credit exposure. They are excluded from the primary survival model. 
+- **Permanently missing outcome feeds:** Partner-originated accounts with missing feeds must be treated as right-censored. If missingness is informative (e.g., missing feeds correlate with risk), this introduces bias.
+
+**Primary analysis strategy:** A discrete-time survival model (e.g., logistic regression or gradient boosted trees on person-period formatted data) predicting the hazard of default at each time step post-activation. Prefixes are used to predict this baseline risk.
+
+**Sensitivity analysis:** Inverse Probability of Treatment Weighting (IPTW) to estimate what the default rate would be if all applications were activated. This requires modeling the probability of activation given the prefix (a selection model). This is *partially testable* (we can validate the activation propensity model) but the counterfactual outcome for non-activated cases is *fundamentally untestable*.
+
+## 4. Prefix extraction
+
+- **Fixed event-count prefixes:** We will use a prefix length of 3 events. For cases with fewer than 3 events, we pad with a special `<PAD>` activity or exclude them if too short to be informative.
+- **Elapsed-time prefixes:** As an alternative, we will define a cutoff at 48 hours after `Application Started` and extract all events occurring within that window.
+- **Repeated document loops:** The prefix extraction must include these loops (e.g., `Credit Review -> Request Documents -> Credit Review`) as they carry strong predictive signal. The event count naturally captures the number of loops.
+- **Activity renaming:** Pre-15 October 2025 activity names are mapped to post-migration names using a dictionary. Duplicate events created by the migration are removed by retaining only the first event per `(case:concept:name, concept:name, time:timestamp)`.
+- **Future prevention:** Events occurring after the 3rd event or after the 48-hour mark are completely discarded for feature generation.
+
+## 5. Process-aware features
+
+- **Control-flow:** Activity sequence (one-hot encoded or embeddings), count of rework loops, presence of specific activities (e.g., `Identity/KYC Check`).
+- **Timing:** Time elapsed between `Application Started` and the 3rd event, average time between events.
+- **Resource/queue:** Resource ID at the prefix events, historical throughput of that resource (calculated using a rolling window of *past* cases only), current queue length at the resource level at the time of the event.
+- **Rework:** Number of document requests, time spent in rework.
+- **Cohort/calendar features:** Month of application start, day of week, pre/post 1 July 2025 policy flag, pre/post 15 October 2025 migration flag.
+- **Static case attributes:** `case:channel`, `case:region`, `case:requested_amount`.
+- **Features requiring historical reference:** Moving average of approval rates for a given `case:region` or `org:resource` in the preceding 30 days.
+
+## 6. Leakage audit
+
+| Feature or data element | Leakage or bias risk | Valid availability rule | Keep/repair/drop | Rationale |
+| :--- | :--- | :--- | :--- | :--- |
+| `final_limit` | Determined at final decision, post-prefix | Only available at the end of the case | Drop | Direct future leakage of the credit decision |
+| `decision_reason` | Populated at/after Accept/Reject | Only available at the end of the case | Drop | Direct future leakage of the process outcome |
+| `collection_status` | Updated post-activation, reveals default | Only available after activation | Drop | Direct target leakage |
+| Future events | Contract Signed, Default Recorded | Must be strictly excluded by prefix slicing | Drop | The prefix extractor must slice the event log |
+| `documents_total` | Nightly snapshot may include same-day future uploads | Require document upload timestamp  prediction time | Repair | If exact upload time is unavailable, drop the feature |
+| `risk_score` | Updated at several events | Use the `risk_score` value present at the last event of the prefix | Repair | Ensures only historical values are used |
+| Resource experience | Stored at extraction time | Recompute experience as of the event timestamp using historical data | Repair | Avoids using future information about employee tenure |
+| `label_available_at` | Reveals the presence or absence of the label | Must never be used as a feature | Drop | Meta-leakage of outcome observation |
+| `default_90d` | The target variable | Excluded from features; used only for label generation | Drop | Target leakage |
+
+## 7. Validation design
+
+A random case split is highly misleading here because it would mix cases from the pre-policy, post-policy, and post-migration eras, allowing the model to learn era-specific artifacts and falsely generalize. 
+
+**Temporal Validation Scheme:**
+- **Training set:** Applications started between 1 January 2024 and 30 June 2025 (pre-policy change).
+- **Validation set:** Applications started between 1 July 2025 and 14 October 2025 (post-policy, pre-migration).
+- **Test set:** Applications started between 15 October 2025 and 31 December 2025 (post-migration).
+
+**Evaluation:**
+- **Backtesting:** Simulate predictions at the prediction point for the test set and evaluate against eventually observed outcomes (accounting for right censoring).
+- **Calibration:** Assess calibration of predicted default probabilities using the Brier Score and calibration plots, specifically for the 90-day horizon.
+- **Discrimination:** Use the time-dependent Area Under the ROC Curve (AUC) or Concordance Index (C-index) suitable for censored survival data.
+- **Subgroup performance:** Evaluate calibration and AUC across `case:channel` and `case:region` to ensure the model does not exacerbate disparities, especially for partner-originated accounts.
+
+## 8. Limitations and decision-use boundary
+
+- **What the study can claim:** The model predicts the association between early application prefixes and 90-day default risk *among accounts that are eventually activated*. 
+- **What it cannot claim:** It cannot estimate the counterfactual default risk for an applicant if they had been accepted, because rejected/withdrawn cases are excluded. It is a model of selection-conditioned risk, not a model of inherent applicant creditworthiness.
+- **Deployment risks (data-generating process changes):**
+  1. If the model is used to automatically reject high-risk applications, the population of activated accounts will shift, reducing the observed default rate but invalidating the model’s baseline calibration.
+  2. Applicants may adapt their behavior if they know the process is automated, altering the frequency of early events like document uploads.
+  3. Resources may change their workflow (e.g., spending less time on `Credit Review` for flagged cases), altering the timing and rework features the model relies on.
+
+## 9. PM4Py-oriented Python implementation skeleton
+
+```python
+import pandas as pd
+import pm4py
+from datetime import timedelta
+
+# Configuration
+EXTRACTION_TIME = pd.to_datetime("2026-02-15")
+PREDICTION_EVENT_COUNT = 3
+HORIZON_DAYS = 90
+
+def load_and_format_log():
+    """Loads CSV and formats for PM4Py."""
+    df = pd.read_csv("applications_events.csv")
+    df['time:timestamp'] = pd.to_datetime(df['time:timestamp'])
+    
+    # Format dataframe for PM4Py
+    log = pm4py.format_dataframe(df, 
+                                 case_id_column='case:concept:name', 
+                                 activity_column='concept:name', 
+                                 timestamp_column='time:timestamp')
+    # Remove exact duplicate events potentially caused by the Oct 15 migration
+    log = log.drop_duplicates(subset=['case:concept:name', 'concept:name', 'time:timestamp'])
+    return log
+
+def build_case_info(log):
+    """Constructs case-level as-of and outcome information."""
+    case_starts = log.groupby('case:concept:name')['time:timestamp'].min().rename('start_time')
+    case_ends = log.groupby('case:concept:name')['time:timestamp'].max().rename('end_time')
+    
+    # Identify activation time
+    activated_events = log[log['concept:name'] == 'Account Activated']
+    activation_times = activated_events.groupby('case:concept:name')['time:timestamp'].min().rename('activation_time')
+    
+    case_info = pd.concat([case_starts, case_ends, activation_times], axis=1)
+    
+    # Right-censoring flag: matured if activation + 90d <= extraction time
+    case_info['eventually_activated'] = case_info['activation_time'].notna()
+    case_info['matured'] = (case_info['activation_time'] + timedelta(days=HORIZON_DAYS)) <= EXTRACTION_TIME
+    
+    # Determine outcome (Assuming 'default_90d' is 1 for default, 0 for non-default, NaN otherwise)
+    # We take the max over the case to get the label if it exists
+    label_series = log.groupby('case:concept:name')['default_90d'].max()
+    case_info = case_info.join(label_series.rename('label'))
+    
+    return case_info
+
+def temporal_split(case_info):
+    """Splits cases by start time to respect temporal order."""
+    train_end = pd.to_datetime("2025-06-30")
+    val_end = pd.to_datetime("2025-10-14")
+    
+    train_cases = case_info[case_info['start_time'] <= train_end].index
+    val_cases = case_info[(case_info['start_time'] > train_end) & (case_info['start_time'] <= val_end)].index
+    test_cases = case_info[case_info['start_time'] > val_end].index
+    
+    return train_cases, val_cases, test_cases
+
+def generate_prefix_features(log, cases):
+    """Extracts fixed-length prefixes and prevents future leakage."""
+    # Filter log to only the relevant cases
+    sub_log = log[log['case:concept:name'].isin(cases)]
+    
+    # PM4Py function to extract prefixes of a fixed length
+    # This naturally excludes future events beyond the prefix length
+    prefixes_df = pm4py.get_prefixes_from_log(sub_log, length=PREDICTION_EVENT_COUNT)
+    
+    # Leakage Prevention: Drop columns that are post-prefix or leak the target
+    leakage_cols = ['final_limit', 'decision_reason', 'collection_status', 
+                    'default_90d', 'label_available_at', 'data_extract_time']
+    valid_cols = [c for c in prefixes_df.columns if c not in leakage_cols]
+    
+    return prefixes_df[valid_cols]
+
+def main():
+    log = load_and_format_log()
+    case_info = build_case_info(log)
+    
+    # Cohort counts for audit
+    print("Total Applications:", len(case_info))
+    print("Eventually Activated:", case_info['eventually_activated'].sum())
+    print("Matured (Labeled):", (case_info['eventually_activated'] & case_info['matured']).sum())
+    print("Censored (Unmatured):", (case_info['eventually_activated'] & ~case_info['matured']).sum())
+    
+    train_cases, val_cases, test_cases = temporal_split(case_info)
+    
+    # Generate features
+    X_train = generate_prefix_features(log, train_cases)
+    
+    # Example of using process discovery and temporal features on the training set only
+    train_log = log[log['case:concept:name'].isin(train_cases)]
+    
+    # Discover Directly-Follows Graph (for analysis, not direct feature input)
+    dfg, sa, ea = pm4py.discover_dfg(train_log)
+    
+    # Extract temporal features (assumes we only feed it the prefix log to avoid future timing leakage)
+    # Note: We would use X_train (prefixes) here, but ensure it's formatted as an event log
+    # temporal_features = pm4py.extract_temporal_features_dataframe(prefix_train_log)
+    
+    # Assume survival model fitting goes here:
+    # We would format X_train as a person-period dataset and fit a discrete-time hazard model.
+    # y_train would be derived from case_info: event = label, time = min(90, extraction_time - activation_time)
+    
+    print("Pipeline executed successfully.")
+
+if __name__ == "__main__":
+    main()
+```
