@@ -1,0 +1,1722 @@
+# Simulation-Based Digital Twin for Building-Permit Process: Design and Implementation Plan
+
+---
+
+## 1. Model Scope and State Variables
+
+### 1.1 Digital Twin Boundary
+
+The digital twin models the municipal building-permit process from application submission through permit issuance or rejection, spanning the 18-month historical observation window and forward into a 12-month simulation horizon. The scope includes:
+
+- **In scope:** All activities in the nominal process tree, resource scheduling and calendars, case-type routing, district-specific travel times, architect-induced case clustering, non-stationary demand, rework loops, and legal/environmental queue interactions.
+- **Out of scope:** Applicant pre-submission behavior (except pre-submission checker intervention), post-permit inspections, inter-municipal coordination, and detailed financial tracking.
+- **Implicit modeling:** Objection events via conditional public-notice duration; resource skill/preference heterogeneity via availability calendars; applicant response delays as independent stochastic processes.
+
+### 1.2 Core Entities and Attributes
+
+#### Case (Application)
+- **Static attributes:**
+  - `case_id`: Unique identifier (e.g., P001)
+  - `case_type`: {Simple renovation, New residential, Commercial, Complex variance}
+  - `district`: {D1, D2, D3, D4, D5, ...}
+  - `architect_id`: Identifier (integer); used for clustering
+  - `application_value`: EUR; may affect routing (e.g., inspection exemption policy)
+  - `building_area`: Not in log; inferred from case_type and value distribution
+  - `requires_fire`: Boolean (log attribute or inferred)
+  - `requires_environment`: Boolean (log attribute or inferred)
+  - `requires_public_notice`: Determined by case_type and district
+  - `prior_violations`: Binary (not in log; assumed null or sampled from district baseline)
+
+- **Dynamic state variables:**
+  - `status`: Current activity or waiting state
+  - `submission_timestamp`: Portal arrival
+  - `activity_start[activity]`: Start timestamp of current activity (inferred if missing)
+  - `activity_end[activity]`: Completion timestamp
+  - `assigned_resource`: Current resource or None
+  - `queue_position`: Position in current resource queue
+  - `rework_count`: Tracks rework incidents by activity
+  - `is_bundled`: Boolean; True if bundled with other cases for inspection
+  - `bundle_id`: Identifier for the bundle (if applicable)
+  - `related_cases`: List of `case_id` values from same architect and district submitted within ±2 weeks
+
+#### Resource (Agent)
+- **Clerk, Planner, Fire reviewer, Environmental reviewer, Inspector, Legal officer:**
+  - `resource_id`: Identifier
+  - `role`: Activity type(s) handled
+  - `calendar`: Availability windows (day-of-week, time-of-day, exceptions for holidays and council meetings)
+  - `utilization`: Cumulative service and meeting time
+  - `queue`: FIFO queue of assigned cases awaiting service
+  - `skill_type`: For planners and inspectors, specialized subsets (e.g., "Simple renovation only")
+  - `part_time_fraction`: For environmental reviewers, 40% reserved for non-permit work
+
+#### System (Portal, Automation)
+- Effectively unlimited capacity; used for Submit application, Issue permit, Reject application, and system-driven Public-notice period.
+
+### 1.3 Queues and Waiting States
+
+- **Resource queues:** One FIFO queue per resource or resource pool (e.g., clerk pool of 5).
+- **Waiting states:** Cases waiting for applicant response (Receive missing documents), policy-required delays (Public-notice minimum 14d), or prerequisite activities (Decision drafting waits for Planning + reviews + inspection results).
+- **Blocking:** A case in Decision drafting is blocked until all required prior activities (Planning, Fire if applicable, Environmental if applicable, Public-notice if applicable, Inspection) are complete.
+
+### 1.4 Resource Calendars
+
+- **Clerk:** 5 FTE, Monday–Friday 08:00–16:00 (8 hours/day), one dedicated Monday morning (portal peak).
+- **Planner:** 8 FTE, Monday–Friday 09:00–17:00 (8 hours/day); 2 FTE specialize in Simple renovation only.
+- **Fire reviewer:** 2 FTE equivalent, Tuesday–Thursday only (24 hours/week), part-time or shared shifts.
+- **Environmental reviewer:** 3 FTE, Monday–Friday 09:00–17:00, but only 60% of capacity available (40% reserved for non-permit work).
+- **Inspector:** 4 FTE, Tuesday–Friday 08:00–16:00 (field work); assume 30 min per site, 15–45 min travel depending on district.
+- **Legal officer:** 2 FTE, Monday–Friday 09:00–17:00, except no work during council-meeting weeks (first week of each month, assumed).
+- **System:** 24/7 availability.
+- **Applicant/Portal:** Always available; response time modeled as i.i.d. random process, not a scheduled resource.
+
+### 1.5 Cross-Case Dependencies
+
+- **Architect-driven clustering:** Cases from the same architect submitted in the same week are flagged as related. When bundling cases for inspection, the first case must wait for all related cases to reach the inspection-scheduling queue (up to a max delay of 3 days before forced unbundling).
+- **Neighborhood objections (implicit):** Objections affecting related cases are modeled via a stochastic public-notice duration extension; if one case in a district triggers an objection (inferred from objection-indicator sampled at case submission), all cases with overlapping public-notice periods have extended durations.
+- **Inspection batching:** Cases in the same district scheduled for inspection within 2 days can be batched to reduce per-case travel time (assumed travel cost reduced from 30–45 min to 20–30 min per case in a batch of 2–4).
+
+### 1.6 Non-Stationary Demand
+
+- **Seasonal:** Arrival rate is a piecewise-constant function of calendar month.
+  - January–February, June–August, December: baseline 
+  - March–May, September–November: 1.7 × 
+- **Intra-week:** Submissions on Monday are 2.2× higher than Wednesday (and estimated 0.9× Tuesday, Thursday, Friday). Model via day-of-week multiplier on daily arrival process.
+- **Architect clustering:** Top 20 architects (accounting for 31% of cases) submit in bursts. Modeled via a Poisson cluster process or a mixture model where a fraction of arrival times are drawn from a correlated process within a 7-day window.
+
+---
+
+## 2. Parameter-Estimation Plan
+
+### 2.1 Event Log Preparation and PM4Py Handling
+
+**Objectives:**
+1. Load the event log from CSV and format it for PM4Py.
+2. Extract arrival times, service times, waiting times, case attributes, and branching probabilities.
+3. Calibrate resource calendars and identify missing data patterns.
+4. Estimate inter-case dependencies and rework frequencies.
+
+**Steps:**
+
+#### 2.1.1 Data Loading and Formatting
+
+```
+- Load CSV into pandas DataFrame
+- Rename columns to PM4Py standard: case:concept:name, concept:name, time:timestamp, org:resource
+- Keep additional columns: case_type, district, architect_id, application_value, requires_fire, 
+  requires_environment, requires_public_notice
+- Parse time:timestamp as datetime
+- Sort by case:concept:name (case ID) and time:timestamp (ascending)
+- Identify missing or implausible timestamps (e.g., end time before start time for same activity)
+```
+
+#### 2.1.2 PM4Py Log Processing
+
+```python
+# Pseudocode structure
+import pm4py
+
+# Load and format
+df = load_event_log_csv(...)
+df = pm4py.format_dataframe(df, 
+                            case_id_key='case:concept:name',
+                            activity_key='concept:name',
+                            timestamp_key='time:timestamp',
+                            resource_key='org:resource')
+
+# Extract variants
+variants_df = pm4py.get_variants_as_tuples(df)
+variant_counts = variants_df.value_counts()
+
+# Discover process model (DFG and performance DFG)
+dfg = pm4py.discover_dfg(df)
+performance_dfg = pm4py.discover_performance_dfg(df)  # includes waiting times
+
+# Parse provided process tree (simplified string)
+process_tree_str = "->(...)"  # as provided
+try:
+    pt = pm4py.parse_process_tree(process_tree_str)
+except:
+    # Note: simplified string may not parse directly; use as semantic reference
+    # Construct tree programmatically if needed
+    pt = None
+```
+
+**Limitation:** The simplified process tree uses operators (`->`, `*`, `+`, `X`, `tau`) that may not align exactly with pm4py.parse_process_tree syntax (which expects Petri net–based formats). The string serves as a semantic guide; the simulation will rely on empirical DFG and variant analysis.
+
+#### 2.1.3 Case-Level Aggregation
+
+```python
+# For each case: compute cycle time, trace, attributes
+case_summary = df.groupby('case:concept:name').agg({
+    'time:timestamp': ['min', 'max'],  # submission and final time
+    'concept:name': 'count',            # number of events
+    'org:resource': lambda x: list(x),  # resource sequence
+    'case_type': 'first',
+    'district': 'first',
+    'architect_id': 'first',
+    'application_value': 'first',
+    'requires_fire': 'first',
+    'requires_environment': 'first',
+    'requires_public_notice': 'first'
+})
+case_summary['cycle_time'] = case_summary['time:timestamp']['max'] - case_summary['time:timestamp']['min']
+case_summary['arrival_date'] = case_summary['time:timestamp']['min'].dt.date
+```
+
+#### 2.1.4 Activity-Level Timing
+
+```python
+# For each case and activity pair, extract service time and waiting time
+activity_times = []
+for case_id in df['case:concept:name'].unique():
+    case_events = df[df['case:concept:name'] == case_id].sort_values('time:timestamp')
+    for i in range(len(case_events) - 1):
+        current = case_events.iloc[i]
+        next_evt = case_events.iloc[i + 1]
+        
+        current_activity = current['concept:name']
+        next_activity = next_evt['concept:name']
+        
+        # Waiting time: from end of current to start of next
+        # Service time: duration of current activity (not directly observable if only end timestamp)
+        waiting_time = (next_evt['time:timestamp'] - current['time:timestamp']).total_seconds() / 3600
+        
+        activity_times.append({
+            'case_id': case_id,
+            'from_activity': current_activity,
+            'to_activity': next_activity,
+            'waiting_hours': waiting_time,
+            'resource': current['org:resource'],
+            'case_type': current.get('case_type'),
+            'district': current.get('district')
+        })
+
+activity_df = pd.DataFrame(activity_times)
+```
+
+**Note:** Without explicit service-time entries in the log, waiting times subsume both service and queue delay. Service times must be estimated from activity-duration distributions, domain knowledge, or sub-sampling interviews.
+
+#### 2.1.5 Variant and Branching Analysis
+
+```python
+# Extract traces and identify branching probabilities
+traces = df.groupby('case:concept:name')['concept:name'].apply(tuple).values
+variant_dist = pd.Series(traces).value_counts(normalize=True)
+
+# For each observed activity transition, estimate conditional probability
+transitions = activity_df.groupby(['from_activity', 'to_activity']).size().reset_index(name='count')
+transitions_pivot = transitions.pivot(index='from_activity', columns='to_activity', values='count').fillna(0)
+transition_probs = transitions_pivot.div(transitions_pivot.sum(axis=1), axis=0)
+
+# Identify key branching points (e.g., after Planning review: rework or proceed)
+print("Transition probabilities:")
+print(transition_probs)
+```
+
+#### 2.1.6 Rework Identification
+
+```python
+# Cases with repeated activities (e.g., two 'Planning review' events) indicate rework
+rework_cases = []
+for case_id in df['case:concept:name'].unique():
+    case_events = df[df['case:concept:name'] == case_id]
+    activity_counts = case_events['concept:name'].value_counts()
+    if (activity_counts > 1).any():
+        rework_activities = activity_counts[activity_counts > 1].index.tolist()
+        rework_cases.append({
+            'case_id': case_id,
+            'rework_activities': rework_activities,
+            'rework_count': sum(activity_counts[activity_counts > 1] - 1),
+            'case_type': case_events['case_type'].iloc[0]
+        })
+
+rework_df = pd.DataFrame(rework_cases)
+rework_rate_by_activity = rework_df.explode('rework_activities').groupby('rework_activities').size() / len(df['case:concept:name'].unique())
+print("Rework rates by activity:")
+print(rework_rate_by_activity)
+```
+
+### 2.2 Arrival Process Estimation
+
+#### 2.2.1 Non-Stationary Arrival Rate
+
+```python
+# Group submissions by week/day and estimate (t)
+submissions = df[df['concept:name'] == 'Submit application'].copy()
+submissions['submission_date'] = submissions['time:timestamp'].dt.date
+submissions['month'] = submissions['time:timestamp'].dt.month
+submissions['dayofweek'] = submissions['time:timestamp'].dt.dayofweek  # 0=Monday, 6=Sunday
+
+# Daily count
+daily_arrivals = submissions.groupby('submission_date').size()
+
+# Seasonal multiplier
+seasonal_multiplier = submissions.groupby('month').size() / submissions.groupby('month').size().mean()
+print("Seasonal multipliers by month:")
+print(seasonal_multiplier)
+
+# Day-of-week multiplier
+dow_multiplier = submissions.groupby('dayofweek').size() / submissions.groupby('dayofweek').size().mean()
+print("Day-of-week multipliers (0=Mon, 4=Fri):")
+print(dow_multiplier)
+
+# Case-type arrival distribution
+case_type_dist = submissions.groupby('case_type').size() / len(submissions)
+print("Case-type distribution:")
+print(case_type_dist)
+
+# Architect clustering: identify submitters with multiple cases per week
+submissions['week'] = submissions['time:timestamp'].dt.isocalendar().week
+architect_week_counts = submissions.groupby(['architect_id', 'week']).size()
+clustering_intensity = (architect_week_counts > 1).sum() / len(architect_week_counts)
+print(f"Fraction of architect-weeks with >1 submission: {clustering_intensity:.3f}")
+```
+
+#### 2.2.2 Parametric Distribution Fitting
+
+```python
+from scipy import stats
+import numpy as np
+
+# Inter-arrival times
+submissions_sorted = submissions.sort_values('time:timestamp')
+inter_arrivals = submissions_sorted['time:timestamp'].diff().dt.total_seconds() / 3600  # hours
+inter_arrivals = inter_arrivals.dropna()
+
+# Fit Poisson (mean) and test for clustering
+mean_interarrival = inter_arrivals.mean()
+lambda_baseline = 1 / mean_interarrival
+
+# Fit exponential and lognormal for comparison
+exp_fit = stats.expon.fit(inter_arrivals)
+lognorm_fit = stats.lognorm.fit(inter_arrivals)
+
+print(f"Mean inter-arrival time: {mean_interarrival:.2f} hours")
+print(f"Baseline arrival rate: {lambda_baseline:.4f} cases/hour")
+print(f"Exponential fit params: {exp_fit}")
+print(f"Lognormal fit params: {lognorm_fit}")
+```
+
+### 2.3 Service-Time and Waiting-Time Estimation
+
+#### 2.3.1 Direct Service Time Extraction (if available)
+
+If the log includes separate "start" and "completion" timestamps for activities, compute service time directly. Otherwise, estimate from domain knowledge or interview data (cf. empirical summary in problem statement).
+
+```python
+# Pseudocode: if activity start timestamps were logged
+service_times = []
+for idx, row in df.iterrows():
+    if row.get('activity_start_timestamp') and row.get('concept:name') != 'Submit application':
+        service_hours = (row['time:timestamp'] - row['activity_start_timestamp']).total_seconds() / 3600
+        service_times.append({
+            'activity': row['concept:name'],
+            'service_hours': service_hours,
+            'resource': row.get('org:resource'),
+            'case_type': row.get('case_type')
+        })
+service_df = pd.DataFrame(service_times)
+# Aggregate by activity
+service_summary = service_df.groupby('activity')['service_hours'].agg(['median', 'count', lambda x: x.quantile(0.9)])
+```
+
+**In the absence of explicit service times**, use the empirical summary and bootstrap resampling:
+
+```python
+# Empirical service times from problem statement (truncated for brevity)
+empirical_service_times = {
+    'Completeness check': {'median': 0.42, 'p90': 1.5, 'unit': 'hours'},
+    'Planning review': {'median': 3.5, 'p90': 14, 'unit': 'hours'},
+    'Fire-safety review': {'median': 2.5, 'p90': 9, 'unit': 'hours'},
+    'Environmental review': {'median': 4, 'p90': 18, 'unit': 'hours'},
+    'Public-notice period': {'median': 14, 'p90': 60, 'unit': 'days'},
+    'Site inspection': {'median': 1, 'p90': 3, 'unit': 'hours'},
+    'Decision drafting': {'median': 2, 'p90': 8, 'unit': 'hours'},
+    'Legal check': {'median': 3, 'p90': 16, 'unit': 'hours'},
+    # ... (see problem statement)
+}
+
+# Fit lognormal or gamma distribution to median and p90
+def fit_lognormal_from_quantiles(median, p90):
+    """Fit lognormal distribution given median and p90."""
+    # For lognormal(mu, sigma):
+    # median = exp(mu)
+    # p90  exp(mu + 1.28*sigma)  [approximate; refine if needed]
+    mu = np.log(median)
+    sigma = (np.log(p90) - mu) / 1.28
+    return mu, sigma
+
+service_dists = {}
+for activity, params in empirical_service_times.items():
+    mu, sigma = fit_lognormal_from_quantiles(params['median'], params['p90'])
+    service_dists[activity] = {'dist': 'lognormal', 'mu': mu, 'sigma': sigma, 'unit': params['unit']}
+```
+
+#### 2.3.2 Waiting-Time Estimation
+
+```python
+# From activity_df computed earlier, group waiting times by from_activity and resource pool
+waiting_summary = activity_df.groupby('from_activity')['waiting_hours'].agg({
+    'median': np.median,
+    'count': 'count',
+    lambda x: x.quantile(0.9): 'p90',
+    'mean': 'mean'
+}).rename(columns={0: 'p90'})
+
+print("Waiting time summary (hours):")
+print(waiting_summary)
+
+# Note: Waiting times include both resource-queue delay and applicant response time (e.g., for "Receive missing documents")
+# These must be separated for simulation. Heuristic: activities with long median wait but short service time
+# (e.g., "Receive missing documents" median 5 days wait, 0 min service) are applicant-driven.
+```
+
+### 2.4 Resource Calendar and Capacity Estimation
+
+#### 2.4.1 Resource Availability from HR Data
+
+```python
+# Reconstruct calendars from HR data and event logs
+resource_calendars = {
+    'Clerk': {
+        'fte': 5,
+        'hours_per_week': 40,
+        'working_hours': '08:00-16:00',
+        'working_days': 'Mon-Fri',
+        'exceptions': ['public_holidays', 'summer_break']
+    },
+    'Planner': {
+        'fte': 8,
+        'hours_per_week': 40,
+        'working_hours': '09:00-17:00',
+        'working_days': 'Mon-Fri',
+        'skill_pools': {'Simple renovation': 2, 'General': 6}
+    },
+    'Fire reviewer': {
+        'fte': 2,
+        'hours_per_week': 24,  # Part-time equivalent
+        'working_hours': '09:00-17:00',
+        'working_days': 'Tue-Thu'
+    },
+    'Environmental reviewer': {
+        'fte': 3,
+        'hours_per_week': 40,
+        'capacity_for_permits': 0.6,  # 60% available
+        'working_hours': '09:00-17:00',
+        'working_days': 'Mon-Fri'
+    },
+    'Inspector': {
+        'fte': 4,
+        'hours_per_week': 32,
+        'working_hours': '08:00-16:00',
+        'working_days': 'Tue-Fri'
+    },
+    'Legal officer': {
+        'fte': 2,
+        'hours_per_week': 40,
+        'working_hours': '09:00-17:00',
+        'working_days': 'Mon-Fri',
+        'no_work_weeks': [1]  # First week of each month (council meetings)
+    }
+}
+
+# Validate against event log: count resource utilization by date and resource
+resource_activity_counts = df.groupby(['time:timestamp', 'org:resource']).size().reset_index(name='count')
+resource_activity_counts['date'] = resource_activity_counts['time:timestamp'].dt.date
+daily_resource_counts = resource_activity_counts.groupby(['date', 'org:resource'])['count'].sum()
+print("Daily resource activity counts (sample):")
+print(daily_resource_counts.head(20))
+```
+
+#### 2.4.1b Inspector Travel Times by District
+
+```python
+# Extract site-inspection activity and estimate travel time based on district transitions
+inspections = df[df['concept:name'] == 'Site inspection'].copy()
+inspections['district'] = inspections['case:concept:name'].map(
+    df[df['concept:name'] == 'Submit application'].set_index('case:concept:name')['district']
+)
+
+# Empirical travel times (domain knowledge or interview data)
+travel_times = {
+    'D1': {'min': 15, 'max': 25, 'mean': 20},   # minutes, inter-site
+    'D2': {'min': 15, 'max': 25, 'mean': 20},
+    'D3': {'min': 30, 'max': 45, 'mean': 38},   # longer
+    'D4': {'min': 15, 'max': 25, 'mean': 20},
+    'D5': {'min': 30, 'max': 45, 'mean': 38},   # longer
+}
+print("Travel times by district (minutes):")
+print(travel_times)
+```
+
+### 2.5 Rework and Conditional Routing
+
+#### 2.5.1 Rework Probabilities
+
+```python
+# From rework_df computed earlier
+rework_by_activity_and_type = rework_df.explode('rework_activities').groupby(['case_type', 'rework_activities']).size()
+rework_by_activity_and_type = rework_by_activity_and_type / rework_df.groupby('case_type').size()
+
+print("Rework probabilities by case type and activity:")
+print(rework_by_activity_and_type)
+
+# Overall rework rates
+total_cases = len(df['case:concept:name'].unique())
+rework_rate = len(rework_df) / total_cases
+print(f"Overall rework rate (cases with 1 rework): {rework_rate:.3f}")
+```
+
+#### 2.5.2 Branching Probabilities (Conditional Routing)
+
+```python
+# After "Completeness check": proceed to next activity or request missing documents?
+completeness_outcomes = []
+for case_id in df['case:concept:name'].unique():
+    case_events = df[df['case:concept:name'] == case_id].sort_values('time:timestamp')
+    completeness_indices = case_events[case_events['concept:name'] == 'Completeness check'].index
+    
+    for idx in completeness_indices:
+        next_event_idx = idx + 1 if idx + 1 < len(case_events) else None
+        if next_event_idx:
+            next_activity = case_events.iloc[next_event_idx]['concept:name']
+            completeness_outcomes.append(next_activity)
+
+completeness_routing = pd.Series(completeness_outcomes).value_counts(normalize=True)
+print("Routing after Completeness check:")
+print(completeness_routing)
+# Expected: mostly 'Planning review', some 'Request missing documents'
+
+# After "Planning review": approve, rework, or escalate?
+planning_outcomes = []
+# Similar logic: track next activity
+planning_routing = pd.Series(planning_outcomes).value_counts(normalize=True)
+print("Routing after Planning review:")
+print(planning_routing)
+
+# After "Site inspection": pass or fail?
+# From decision and rework patterns
+```
+
+### 2.6 Cross-Case Dependencies
+
+#### 2.6.1 Architect-Driven Clustering
+
+```python
+# Identify architect-week pairs with multiple submissions
+submissions = df[df['concept:name'] == 'Submit application'].copy()
+submissions['submission_week'] = submissions['time:timestamp'].dt.isocalendar().week
+submissions['submission_year'] = submissions['time:timestamp'].dt.isocalendar().year
+
+architect_clusters = submissions.groupby(['architect_id', 'submission_year', 'submission_week']).agg({
+    'case:concept:name': list,
+    'district': 'first',
+    'application_value': 'mean'
+}).reset_index()
+architect_clusters['cluster_size'] = architect_clusters['case:concept:name'].apply(len)
+architect_clusters = architect_clusters[architect_clusters['cluster_size'] > 1]
+
+print(f"Architect clusters (>1 case per week): {len(architect_clusters)} clusters")
+print(f"Cluster sizes: {architect_clusters['cluster_size'].describe()}")
+
+# For simulation: when two related cases reach inspection scheduling, offer bundling
+# Bundling reduces per-case travel time but increases wait for first case
+```
+
+#### 2.6.2 Neighborhood Objection Proxy (via Public-Notice Duration)
+
+```python
+# Public-notice periods: identify extended durations (likely due to objections)
+public_notice_events = df[df['concept:name'] == 'Public-notice period'].copy()
+public_notice_durations = []
+
+for case_id in df['case:concept:name'].unique():
+    case_events = df[df['case:concept:name'] == case_id].sort_values('time:timestamp')
+    public_notice_rows = case_events[case_events['concept:name'] == 'Public-notice period']
+    
+    if len(public_notice_rows) > 0:
+        start_idx = public_notice_rows.index[0]
+        next_event_idx = start_idx + 1 if start_idx + 1 < len(case_events) else None
+        
+        if next_event_idx:
+            duration_days = (case_events.iloc[next_event_idx]['time:timestamp'] - 
+                           case_events.iloc[start_idx]['time:timestamp']).days
+            case_type = case_events['case_type'].iloc[0]
+            district = case_events['district'].iloc[0]
+            public_notice_durations.append({
+                'case_id': case_id,
+                'duration_days': duration_days,
+                'case_type': case_type,
+                'district': district
+            })
+
+notice_df = pd.DataFrame(public_notice_durations)
+notice_summary = notice_df.groupby('case_type')['duration_days'].agg(['median', 'mean', 'std', lambda x: x.quantile(0.9)])
+print("Public-notice duration by case type:")
+print(notice_summary)
+
+# Long tail likely indicates objections; use mixture distribution (normal + heavy-tailed component)
+```
+
+---
+
+## 3. Assumptions
+
+### 3.1 Arrivals
+
+- **Non-stationary Poisson process:** Arrivals follow a non-homogeneous Poisson process with rate `(t) =  × seasonal_multiplier(t) × dow_multiplier(dayofweek(t))`, where:
+  - `` is the baseline daily arrival rate (estimated from mean of 31,200 cases / 18 months  57.8 cases/day).
+  - Seasonal and day-of-week multipliers are estimated from the empirical log.
+  - Case-type mix is sampled from the observed distribution (45% Simple renovation, 28% New residential, 17% Commercial, 10% Complex variance).
+
+- **Architect clustering:** A fraction of cases (estimated at ~3–5% of arrivals) are drawn from a cluster process: an architect is chosen (with probability proportional to historical submission volume), and 1–4 related cases are submitted within a 1–7 day window. This captures the 31% concentration of cases among top 20 architects.
+
+- **No backlog before simulation start:** The simulation warm-up period (4 weeks) allows the initial resource state to stabilize.
+
+- **Stationary intervals:** Within each month, the seasonal rate is constant.
+
+### 3.2 Service Times
+
+- **Lognormal or gamma distributions:** Service times for human activities (e.g., Completeness check, Planning review) are sampled from lognormal distributions fitted to empirical median and p90 quantiles.
+  - Rationale: Service times are often right-skewed (occasional complex cases take much longer); lognormal is a standard choice.
+  - Alternative: gamma distribution if empirical data supports it (to be validated during calibration).
+
+- **Fixed minimum for Public-notice period:** Public-notice period has a 14-day minimum. Extended durations (up to 60 days) are modeled as a mixture: 85% of cases get the 14-day baseline, 15% trigger a "objection flag" that extends the period by an additional Lognormal(=1.1, =0.5) days (median ~3 days, p90 ~12 days).
+
+- **District-dependent travel times:** Site-inspection service time includes travel; inter-site travel is modeled as Uniform(20, 30) minutes for nearby districts (D1, D2, D4) and Uniform(30, 45) minutes for distant districts (D3, D5). Batching reduces per-case travel time.
+
+- **No service times for system activities:** Portal submissions, permit issuance, and rejections are instantaneous or negligible.
+
+- **Applicant response times are not resource-constrained:** "Receive missing documents" is modeled as a delay from "Request missing documents" to next activity. The delay is sampled from an empirical distribution (median ~5 days) and is independent of municipal resource availability.
+
+### 3.3 Routing
+
+- **Case-type determines required activities:** Routing is deterministic based on case_type and case attributes:
+  - Simple renovation: always skips Fire-safety, Environmental, and Public-notice (baseline). Inspection skipped if application_value < 50k and no prior violations (policy D2 only).
+  - New residential: requires Fire-safety review and Public-notice.
+  - Commercial: requires Fire-safety, Environmental, and Legal check.
+  - Complex variance: requires Public-notice, and typically Fire-safety and Environmental.
+
+- **Conditional activities:** Fire-safety, Environmental, and Public-notice are triggered by case attributes (requires_fire, requires_environment, requires_public_notice) or inferred from case_type and district.
+
+- **Decision drafting waits for all applicable prior activities:** It is blocked until Planning, Fire (if applicable), Environmental (if applicable), Public-notice (if applicable), and Inspection are complete. This is a join-all-inputs pattern.
+
+- **Rework decisions are stochastic:** After Planning, Fire, Environmental, or Legal review, a rework probability (estimated from the log) determines whether the case loops back or proceeds forward.
+
+- **Inspection rework:** If a site inspection fails (applicant not present, defects found), it loops back to Inspection scheduling and repeats after a delay (estimated as Uniform(5, 20) days for applicant remediation).
+
+### 3.4 Resources and Calendars
+
+- **Finite-capacity resource pools:** Each resource type (Clerk, Planner, Fire reviewer, etc.) is represented as a pool with a fixed number of FTE, working hours, and exceptions (holidays, council meetings).
+
+- **FIFO queuing discipline:** Cases are served in order of arrival to each resource's queue. No priority scheme is modeled in the baseline (to be extended if needed).
+
+- **Part-time and shared resources:** Environmental reviewers have only 60% capacity available for permit work; they are scheduled with an effective pool size of 3 × 0.6 = 1.8 FTE.
+
+- **Skill heterogeneity (simplified):** Planners include a specialized subset (2 FTE) dedicated to Simple renovation only; these are assigned preferentially to Simple renovation cases, reducing wait times for that case type.
+
+- **Council-meeting weeks:** Legal check has reduced capacity during the first week of each month (assumed council meetings); simulations without capacity reduction become baselines.
+
+- **Holiday interruptions:** Public holidays (e.g., Christmas, summer break) are excluded from resource availability; the simulation pauses all activities during these periods.
+
+### 3.5 Rework
+
+- **Rework probabilities are case-type and activity dependent:** Estimated from the log (e.g., 8% rework after Planning review for New residential, 15% for Complex variance).
+
+- **Rework delay:** After a rework trigger, the case re-enters the queue for the same or a preceding activity with a delay (Uniform(1, 5) days for administrative rework, Uniform(5, 20) days for applicant-driven rework like site inspection).
+
+- **Rework cap:** Maximum 3 rework iterations per case per activity (to avoid infinite loops in simulation). Cases exceeding this cap are escalated to manual review or rejection (modeled as a low-probability outcome).
+
+### 3.6 Applicant and Third-Party Response
+
+- **Applicant response time (for missing documents):** Modeled as a delay independent of municipal resources. Distribution: Lognormal(=1.6, =1.0), corresponding to median ~5 days and p90 ~20 days, with a 2-day minimum.
+
+- **Environmental consultant report:** External to the simulation; assumed always available before Environmental review completes (with possible delays reflected in the service-time distribution). No separate modeling of consultant schedule.
+
+- **Third-party objections:** Assumed submitted during Public-notice period; probability of occurrence estimated from the tail of public-notice-duration distribution (assumed ~15% of cases). No explicit modeling of objector behavior; effects absorbed into public-notice duration.
+
+### 3.7 Cross-Case Dependencies
+
+- **Architect clustering:** Cases submitted by the same architect within a 1-week window are flagged as related. During inspection scheduling, if related cases are within 2 days of each other in the queue and in the same district, they are offered bundling (requires user decision in simulation or probabilistic acceptance).
+
+- **Inspection batching:** Cases bundled together reduce per-case travel time by 25% (assumed). Bundling creates a slight delay for the first case (to wait for others), modeled as +1 day.
+
+- **No feedback loops between cases:** A rejection of one case does not directly affect other related cases (beyond any shared objection period, which is modeled at the public-notice level, not per-case).
+
+### 3.8 Non-Stationary Demand
+
+- **Seasonal demand:** Multipliers for March–May and September–November are 1.7×. Other months are baseline (1.0×).
+
+- **Intra-week demand:** Monday arrival rate is 2.2× Wednesday (estimated from the log). Tuesday, Thursday, Friday are normalized to a baseline average (estimated as ~1.0× baseline, or more precisely from the log).
+
+- **Multi-week transient:** The first simulation week may have atypical demand due to the non-stationary process starting mid-week. The warm-up period accounts for this.
+
+### 3.9 Missing Data and Limitations
+
+- **Service times without start timestamps:** In the absence of explicit service-time logging, service times are estimated from the empirical summary and domain knowledge. Actual service times in live data will be validated during post-implementation.
+
+- **Objection events not in the log:** Objections are modeled as a latent event; probability and duration effects are inferred from the tail of the public-notice-duration distribution. A post-hoc audit of permit files could improve this estimate.
+
+- **Resource utilization underestimated:** If the log captures only completion timestamps, actual resource-busy periods are compressed. The simulation assumes that the empirical service-time distributions already account for this.
+
+- **Rework reasons unstructured:** Rework probabilities are estimated by counting repeated activities, but the reasons (incomplete data, planner disagreement, applicant non-compliance) are not distinguished. The simulation uses an aggregate rework probability.
+
+- **Missing rare cases:** Emergency or expedited decisions are removed from the log. The simulation does not model an expedited pathway; stress scenarios with increased demand may underestimate tail latencies if expedited cases are not offered.
+
+---
+
+## 4. Experiment Matrix
+
+### 4.1 Baseline and Interventions
+
+| Exp ID | Intervention(s) | Description | Factors | Expected Outcome |
+|--------|------------------|-------------|---------|-------------------|
+| **Baseline** | None | Current process, as-is. No changes. | Seasonal demand, empirical rework rates, resource calendars. | Median cycle time ~45d, p90 ~130d; 70–75% planner utilization. |
+| **D1** | Pre-submission document checker | Municipal pre-submission clerk reviews applicant docs before portal submission, improving completeness. | Reduce missing-doc loops by 40%; add 1 FTE clerk for pre-submission. | Fewer request–receive cycles; faster progression. Median cycle time 8d, p90 15d. |
+| **D2** | Simple-renovation inspection exemption | Cases with case_type="Simple renovation", application_value < EUR 50k, no prior violations skip Site inspection. | Eligibility: ~35% of Simple cases. Reduce inspection load by ~16% of total cases. | Median cycle time 12d for exempt cases; increased inspector utilization for other types. |
+| **D3** | District-batched inspection scheduling | Scheduler groups cases in same district with overlapping inspection windows (±2 days) for bundling. Reduces per-case travel time. | Batching reduces travel time by 25%; max batch size = 4. Scheduling delay +1d for first case in batch. | Inspection service time 10 min per case (avg); net cycle time 3d. Inspector utilization +8–10% (more cases per day). |
+| **D4** | Temporary peak-month inspector | Additional 1 FTE inspector hired for March–May and September–November (peak seasons). | Capacity: +1 FTE during 6 peak months (50% cost vs. permanent hire). | Inspection queue depth 30% in peak months; cycle time 5d in peaks, no change in off-peak. |
+| **D5** | Parallelize legal pre-check | For Commercial and Complex variance cases, Legal check begins immediately after Planning (not after Inspection), in parallel. | Reduces blocking delay before Decision drafting. | Cycle time 8d for Commercial/Complex; no change for Simple/Residential. |
+| **D6** | Aging-case planner | One planner (0.5 FTE equivalent) dedicated to cases >60d old; prioritized queue. | Targets ~5% of cases (those delayed >2 SDs from median). | Reduces p90 cycle time; fairness: max case age 100d. |
+| **D7** | Architect appointment slots | Applicants (top 20 architects) are offered pre-scheduled submission slots on Monday–Friday 13:00–14:00 (off-peak); smooths Monday bulges. | Shifts 20% of Monday submissions to other weekdays. | Reduces completeness-check queue on Monday; clerk utilization more uniform. Median wait before Completeness 1d. |
+| **D8** | Environmental-review triage | District sensitivity and project attributes pre-determine Environmental review; low-risk projects exempt. | Reduce Environmental review cases by ~25% (estimated low-risk); fast-track with summary review. | Fewer full Environmental reviews; cycle time for affected cases 10d. |
+| **D9** | Public-notice objection early warning | Objection notices sent by day 3 of public-notice period; if objections flagged, duration extended proactively. Parallel objection response process. | Removes tail latency from surprise objections. | Cycle time variance ; p90 20d for affected cases; predictability +. |
+| **D10** | Combined: D1+D2+D3+D4 | Bundle pre-submission, inspection exemption, batching, temporary inspector. | All four interventions active. | Synergistic: Median 25d, p90 50d; Inspector utilization +15%. |
+
+### 4.2 Stress and Sensitivity Scenarios
+
+| Scenario ID | Condition | Demand Factor | Resource Change | Expected Impact |
+|------------|-----------|----------------|------------------|-----------------|
+| **Stress-1: Demand surge** | Sustained 1.3× baseline arrival rate (15% increase across all months). | 1.3×  | None. | Median +8d, p90 +25d; backlog builds. Baseline and all interventions stressed equally. |
+| **Stress-2: Capacity loss** | Fire reviewer or Environmental reviewer pool reduced by 1 FTE (25% loss for specialists). | 1.0×  | Fire: 1.0 FTE (from 2); Environmental: 2.0 FTE (from 3). | Median +12d (Fire) or +20d (Environmental); bottleneck shifts. Test robustness of D5 (legal parallel). |
+| **Stress-3: High rework** | Rework rates increase by 50% across all activities (applicant non-compliance or planner indecision). | 1.0×  | None. | Median +25d, p90 +80d; high-rework cases (Complex variance) especially affected. |
+| **Stress-4: Resource unavailability** | Summer break (20 days in July–August); all resources at 50% capacity. | 1.0×  | 50% capacity (Jul–Aug). | Cycle times for cases submitted in June/July surge by 20–30d during break period. |
+| **Stress-5: Combined: Demand + Capacity** | 1.3× demand + 1 FTE loss (Environmental). | 1.3×  | Environmental: 2.0 FTE. | Worst-case: Median +28d, p90 +95d; combined policies (D10) essential for stability. |
+
+### 4.3 Experiment Design Structure (for execution)
+
+```
+Full Factorial:
+  Baseline (1 level)
+  Interventions: D1–D9 (9 single interventions) + D10 (1 combined)
+  Scenarios: 5 stress scenarios
+  
+  Subtotal: 1 + 10 + 5 = 16 experiment configurations
+  
+  Per configuration: 10 replications with independent random seeds
+  
+  Total simulation runs: 16 × 10 = 160 runs
+  
+Warm-up: 4 weeks (discard)
+Run length: 12 months
+```
+
+### 4.4 Key Decision Factors and Trade-Offs
+
+- **Cost vs. Benefit:** D1, D4, D6 involve hiring; quantify cost per day saved.
+- **Variability vs. Utilization:** D3, D7 smooth demand; may reduce peak congestion but increase total throughput.
+- **Fairness vs. Efficiency:** D2 (inspection exemption) speeds up Simple cases but may miss risks; audit rate needed.
+- **Architectural fit:** D5 (legal parallel) only helps Commercial/Complex; impact on Simple/Residential zero. Combined policies (D10) provide broader benefit.
+
+---
+
+## 5. Warm-Up, Replications, and Uncertainty Treatment
+
+### 5.1 Warm-Up Approach
+
+**Objective:** Allow the system to reach a steady-state distribution of cases in various stages before collecting statistics.
+
+**Method:**
+- **Transient period:** Simulate 4 weeks (28 days) before collecting output statistics.
+- **Justification:** Average cycle time is 45 days; a 4-week warm-up allows ~50% of initial cases to complete, reducing bias from initial-state transients.
+- **Validation:** Compare warm-up and steady-state utilization (resource queues should stabilize).
+
+### 5.2 Run Length
+
+- **Simulation period:** 12 months (365 days) following the warm-up.
+- **Rationale:** Captures 1–2 seasonal cycles (peaks in March–May and September–November), providing robust estimates of seasonal effects.
+- **Case volume:** ~58 cases/day × 365 days  21,200 cases, sufficient for statistical stability.
+
+### 5.3 Replications and Random Seed Management
+
+- **Replications:** 10 per experiment configuration (total 160 runs).
+- **Random seed strategy:**
+  - Master seed: 42 (fixed for reproducibility).
+  - Subseeds: `seed_i = 42 + 10*exp_id + rep_id` for each replication `rep_id  {0, 1, ..., 9}`.
+  - Ensures each (experiment, replication) pair is unique but deterministic.
+
+### 5.4 Confidence Intervals and Uncertainty Quantification
+
+**Primary metrics:**
+- **Cycle time (time from submission to decision):**
+  - Report median (50th percentile), p90 (90th percentile), mean.
+  - Compute 95% CI across replications: `[mean - 1.96*SE, mean + 1.96*SE]` where `SE = std(10 replicates) / sqrt(10)`.
+  
+- **SLA compliance by case type:**
+  - Simple renovation: 95% complete within 30d (target).
+  - New residential: 95% complete within 50d.
+  - Commercial: 95% complete within 70d.
+  - Complex variance: 95% complete within 150d.
+  - Metric: % cases meeting SLA (with 95% CI).
+
+- **Resource utilization:**
+  - By role (Clerk, Planner, Fire reviewer, etc.).
+  - Metric: average % utilization across all FTE in role (with 95% CI).
+
+- **Backlog:**
+  - Count of cases in queue at end of simulation (waiting for any resource).
+  - Metric: average daily backlog (with 95% CI).
+
+**Heavy-tailed distribution handling:**
+- For metrics with heavy right tails (p90, cycle time max), report both mean and median.
+- Compute credible intervals using percentile bootstrap if normality assumption fails.
+- Flag outliers (>3 SDs from median) and report separately (e.g., "0.5% of cases exceed 400d cycle time").
+
+### 5.5 Sensitivity Analysis
+
+**One-factor-at-a-time (OFAT):**
+1. Service-time distribution shape (lognormal vs. gamma).
+2. Architect clustering intensity (off, 3%, 5%, 8%).
+3. Rework rate multiplier (×0.5, ×1.0, ×1.5, ×2.0).
+4. Resource skill heterogeneity (off, 2 specialized planners, 4 specialized planners).
+5. Batching threshold (disabled, ±2d window, ±3d window).
+
+**Tornado chart:** Rank factors by impact on median cycle time.
+
+### 5.6 Variance Reduction
+
+**Common random numbers (CRN):** Use the same arrival and service-time random streams across baseline and intervention experiments (except where interventions explicitly change the process). This reduces noise in pairwise comparisons.
+
+Example:
+```
+Baseline run 1 uses seed 42.
+D1 run 1 uses seed 42 (same arrival and service times).
+D2 run 1 uses seed 42 (same arrival and service times).
+Difference in cycle time between D1 and baseline is due to the policy, not randomness.
+```
+
+---
+
+## 6. Validation Strategy
+
+### 6.1 Face Validation
+
+**Objective:** Assess whether simulation logic and outputs are consistent with domain knowledge.
+
+**Checks:**
+1. **Process logic:** Trace a sample of 5–10 simulated cases through all activities; confirm routing matches nominal process tree and policy rules.
+2. **Resource availability:** Verify that no resource is scheduled during off-hours or holidays.
+3. **Case interdependencies:** Confirm that bundled inspection cases have synchronized scheduling and reduced travel times.
+4. **Rework loops:** Confirm that rework cases re-enter queues and accumulate delay as expected.
+
+**Validation meeting:** Present simulation logic and sample outputs to process owner (municipality) and obtain domain expert sign-off.
+
+### 6.2 Event-Log Replay Validation
+
+**Objective:** Replay historical cases through the simulation and compare outputs to observed data.
+
+**Method:**
+1. Extract 500 cases from the historical log (stratified by case type and date).
+2. Use their actual arrival times, case attributes, and rework decisions as inputs to the simulation.
+3. Compare predicted and observed durations (cycle time, activity service times, waiting times).
+
+**Metrics:**
+- **Median absolute error (MAE):** `median(|predicted - observed|)` by activity and case type.
+- **Coverage:** % of observed durations within predicted ±50% CI.
+- **Distributional fit:** Kolmogorov-Smirnov test or Q-Q plot for key activities (Planning, Inspection, Legal check).
+
+**Acceptance criteria:**
+- MAE < 10% of observed median for each activity.
+- Coverage > 80%.
+
+### 6.3 Distributional Validation
+
+**Objective:** Verify that simulated service-time, waiting-time, and cycle-time distributions match empirical distributions.
+
+**Method:**
+1. Simulate 10,000 cases (single long run or aggregated replications) in baseline configuration.
+2. Extract service-time and waiting-time histograms for key activities.
+3. Compare empirical histograms (from event log) to simulated histograms using overlays or Kolmogorov-Smirnov tests.
+
+**Checks:**
+- **Lognormality:** Service times should have a right-skewed shape; check p50, p90, and max values align with fitted lognormal.
+- **Queue length distribution:** Waiting times in front of bottleneck resources (e.g., planner queue) should show periodic peaks (e.g., Monday morning).
+
+### 6.4 Resource-Utilization Validation
+
+**Objective:** Ensure simulated resource utilization is plausible and matches historical levels.
+
+**Method:**
+1. Extract resource utilization from the event log:
+   - For each resource, compute total service time per month.
+   - Divide by available FTE-hours per month.
+   - Expected utilization: 60–85% (accounting for breaks, meetings, non-permit tasks).
+
+2. Simulate baseline and compute simulated utilization by role and month.
+
+3. Compare empirical vs. simulated utilization trends (e.g., planner utilization should spike in spring and fall).
+
+**Acceptance criteria:**
+- Simulated utilization within ±10 percentage points of empirical.
+- Seasonal trend (higher in March–May and Sept–Nov) replicated.
+
+### 6.5 Bottleneck Validation
+
+**Objective:** Identify simulated bottlenecks and confirm they align with domain observations.
+
+**Method:**
+1. Simulate baseline and collect per-activity queue lengths and waiting times over time.
+2. Rank activities by average waiting time; identify top 3–5.
+3. Compare to historical bottleneck reports (e.g., "Planning review queue often backs up in spring").
+
+**Expected bottlenecks (from problem statement):**
+- Planning review (6d median wait).
+- Fire-safety review (4d median wait).
+- Environmental review (8d median wait).
+- Site inspection (8d median wait).
+
+**Confirmation:** Simulated waiting times for these activities should be comparable in magnitude and seasonal pattern.
+
+### 6.6 Out-of-Sample Validation
+
+**Objective:** Test whether the simulation calibrated on the first 12 months can predict the second 12 months (if available) or a held-out test set.
+
+**Method:**
+1. Calibrate all parameters (service-time distributions, rework rates, arrival process) on months 1–12 of the event log.
+2. Set up simulation with same parameters.
+3. If a second 12-month log is available (months 13–24), simulate forward and compare to observed.
+4. Alternatively, perform cross-validation: calibrate on odd months, test on even months.
+
+**Metrics:**
+- MAE of predicted vs. observed total cycle time by month.
+- Ability to predict demand spikes (e.g., March–May surge).
+
+**Acceptance criteria:**
+- Prediction error < 15% for aggregate metrics (total throughput, average cycle time).
+
+---
+
+## 7. Decision Criteria
+
+### 7.1 Primary Metrics
+
+| Metric | Definition | Target / Threshold | Rationale |
+|--------|-----------|-------------------|-----------|
+| **Median cycle time** | 50th percentile of (Permit decision date – Submission date). | <45 days | Meets citizen expectations; less critical than tail. |
+| **p90 cycle time** | 90th percentile of cycle time. | <100 days | Ensures most cases complete within 3 months. |
+| **SLA compliance** (by case type) | % cases meeting case-type SLA (Simple <30d, New Residential <50d, Commercial <70d, Complex <150d). | >95% for all types | Formal service-level agreement with council. |
+| **Inspector utilization** | Average % of inspector FTE time spent on billable activities. | 70–85% | Target efficiency without overload. |
+| **Planner utilization** | Average % of planner FTE time on permit reviews. | 70–85% | Balance workload with availability for other planning work. |
+| **Rework rate** | Average number of rework incidents per case across all cases. | <0.15 reworks/case | Measure of process quality and applicant compliance. |
+| **Backlog (EOY)** | Count of cases in any queue at end of simulation. | <1% of annual throughput (< ~200 cases) | Ensure no runaway queue buildup. |
+
+### 7.2 Secondary (Fairness and Robustness) Metrics
+
+| Metric | Definition | Target / Threshold | Rationale |
+|--------|-----------|-------------------|-----------|
+| **Fairness: Cycle time by district** | Max – Min cycle time across districts (e.g., D3 vs. D1). | <10% difference | Ensure geographic equity; no district systematically disadvantaged. |
+| **Fairness: Cycle time by architect** | Correlation between architect submission volume and median cycle time. | r < 0.15 | Prevent favoritism to high-volume submitters. |
+| **Robustness to demand surge** | Degradation in cycle time under Stress-1 (1.3× demand). | <20% increase in p90 | System should not collapse under plausible demand shock. |
+| **Robustness to capacity loss** | Degradation in cycle time under Stress-2 (1 FTE loss). | <15% increase in median | System should absorb modest staffing loss. |
+| **Inspection capacity margin** | P(Inspector queue > 0) during off-peak months. | <40% | Inspectors not perpetually busy; some slack for responsiveness. |
+| **Cost per case saved** | (Additional staffing cost) / (Total days saved across all cases). | <EUR 50/case/day | Cost-benefit check for interventions requiring hiring. |
+
+### 7.3 Selection Logic
+
+**Baseline selection:**
+- If median cycle time is already <45d and p90 <100d, and all SLAs >95%, the current process is performant. Prioritize cost-benefit.
+- If any SLA is <95%, prioritize interventions targeting that case type.
+
+**Intervention ranking:**
+1. **Quick wins (no hiring):** D7 (appointment slots), D8 (triage), D9 (early warning). Expected cost ~EUR 10k setup, median benefit ~5d, SLA gain ~2%.
+2. **High-impact (with hiring):** D1 (pre-submission clerk), D4 (temporary inspector), D10 (combined). Expected cost EUR 50–100k/year, benefit ~20d, SLA gain ~5–10%.
+3. **Targeted (case-type specific):** D2 (Simple exemption), D5 (legal parallel), D6 (aging-case planner). Benefit depends on case-mix pain points.
+
+**Stress-test gate:**
+- If Stress-1 (1.3× demand) causes p90 to exceed 130d, the system is fragile. Recommend D10 or similar load-leveling interventions.
+- If Stress-4 (summer break) causes >30d backlog, consider D4 or cross-training.
+
+### 7.4 Confidence in Decision
+
+- **High confidence:** Interventions with <5% overlap in 95% CIs between baseline and intervention (across 10 replications).
+- **Medium confidence:** 5–25% CI overlap; recommend additional investigation.
+- **Low confidence:** >25% CI overlap; insufficient evidence; recommend pilot or further data collection.
+
+---
+
+## 8. Python Skeleton
+
+```python
+"""
+Digital Twin for Building Permit Process: Skeleton Implementation
+
+This skeleton provides the structure for parameter estimation (using PM4Py),
+discrete-event simulation setup, and experiment execution. 
+It does NOT include the full DES engine, but placeholder classes and functions 
+for extensibility.
+
+Author: [Your name]
+Date: [Date]
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict, deque
+import warnings
+
+# ============================================================================
+# SECTION 1: PM4Py-based Log Analysis and Parameter Estimation
+# ============================================================================
+
+def load_event_log_csv(filepath):
+    """
+    Load event log from CSV and return a pandas DataFrame.
+    
+    Expected columns:
+      - case:concept:name
+      - concept:name
+      - time:timestamp
+      - org:resource
+      - case_type
+      - district
+      - architect_id
+      - application_value
+      - requires_fire
+      - requires_environment
+      - requires_public_notice
+    """
+    df = pd.read_csv(filepath)
+    return df
+
+def format_dataframe_for_pm4py(df):
+    """
+    Format DataFrame for PM4Py analysis.
+    
+    Renames columns to PM4Py standard format and ensures datetime parsing.
+    """
+    required_cols = ['case:concept:name', 'concept:name', 'time:timestamp', 'org:resource']
+    
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+    
+    # Parse timestamp
+    df['time:timestamp'] = pd.to_datetime(df['time:timestamp'])
+    
+    # Sort by case and timestamp
+    df = df.sort_values(['case:concept:name', 'time:timestamp']).reset_index(drop=True)
+    
+    return df
+
+def extract_variants_and_dfg(df):
+    """
+    Extract process variants and construct directly-follows graph (DFG).
+    
+    Returns:
+      - variants: dict {trace_tuple: count}
+      - dfg: dict {(activity_from, activity_to): count}
+    """
+    # Variants: sequences of activities per case
+    variants = {}
+    for case_id in df['case:concept:name'].unique():
+        trace = tuple(df[df['case:concept:name'] == case_id]['concept:name'].values)
+        variants[trace] = variants.get(trace, 0) + 1
+    
+    # DFG: activity transitions
+    dfg = defaultdict(int)
+    for case_id in df['case:concept:name'].unique():
+        activities = df[df['case:concept:name'] == case_id]['concept:name'].values
+        for i in range(len(activities) - 1):
+            dfg[(activities[i], activities[i+1])] += 1
+    
+    return variants, dict(dfg)
+
+def compute_case_summary_statistics(df):
+    """
+    Compute per-case summary statistics: cycle time, trace, attributes.
+    
+    Returns DataFrame with one row per case.
+    """
+    summaries = []
+    
+    for case_id in df['case:concept:name'].unique():
+        case_df = df[df['case:concept:name'] == case_id].sort_values('time:timestamp')
+        
+        submission_time = case_df['time:timestamp'].min()
+        completion_time = case_df['time:timestamp'].max()
+        cycle_time_days = (completion_time - submission_time).days
+        
+        trace = tuple(case_df['concept:name'].values)
+        
+        summaries.append({
+            'case_id': case_id,
+            'submission_time': submission_time,
+            'completion_time': completion_time,
+            'cycle_time_days': cycle_time_days,
+            'trace': trace,
+            'num_events': len(case_df),
+            'case_type': case_df['case_type'].iloc[0],
+            'district': case_df['district'].iloc[0],
+            'architect_id': case_df['architect_id'].iloc[0],
+            'application_value': case_df['application_value'].iloc[0],
+            'requires_fire': case_df['requires_fire'].iloc[0],
+            'requires_environment': case_df['requires_environment'].iloc[0],
+            'requires_public_notice': case_df['requires_public_notice'].iloc[0],
+        })
+    
+    return pd.DataFrame(summaries)
+
+def extract_activity_timing(df):
+    """
+    Extract service and waiting times for each activity transition.
+    
+    Waiting time = time from end of activity A to start of activity B.
+    (Service time estimation requires explicit start/end timestamps, not available here.)
+    
+    Returns DataFrame.
+    """
+    activity_times = []
+    
+    for case_id in df['case:concept:name'].unique():
+        case_df = df[df['case:concept:name'] == case_id].sort_values('time:timestamp')
+        
+        for i in range(len(case_df) - 1):
+            current = case_df.iloc[i]
+            next_row = case_df.iloc[i + 1]
+            
+            # Waiting time from current activity end to next activity end
+            # (Note: without explicit start times, this is a proxy for wait + service)
+            time_elapsed_hours = (next_row['time:timestamp'] - current['time:timestamp']).total_seconds() / 3600
+            
+            activity_times.append({
+                'case_id': case_id,
+                'from_activity': current['concept:name'],
+                'to_activity': next_row['concept:name'],
+                'time_elapsed_hours': time_elapsed_hours,
+                'time_elapsed_days': time_elapsed_hours / 24,
+                'resource': current['org:resource'],
+                'case_type': current.get('case_type'),
+                'district': current.get('district'),
+            })
+    
+    return pd.DataFrame(activity_times)
+
+def estimate_service_time_distributions(activity_timing_df, empirical_summary_dict):
+    """
+    Estimate lognormal service-time distributions from empirical median and p90 values.
+    
+    Args:
+      - activity_timing_df: DataFrame from extract_activity_timing()
+      - empirical_summary_dict: dict {activity: {'median': val, 'p90': val, 'unit': 'hours'/'days'}}
+    
+    Returns:
+      - service_dists: dict {activity: {'dist': 'lognormal', 'mu': float, 'sigma': float, 'unit': str}}
+    """
+    service_dists = {}
+    
+    for activity, params in empirical_summary_dict.items():
+        median = params['median']
+        p90 = params['p90']
+        unit = params.get('unit', 'hours')
+        
+        # Convert to hours if needed
+        if unit == 'days':
+            median *= 24
+            p90 *= 24
+        
+        # Fit lognormal: median = exp(mu), p90  exp(mu + 1.28*sigma)
+        mu = np.log(median)
+        sigma = (np.log(p90) - mu) / 1.28
+        
+        service_dists[activity] = {
+            'dist': 'lognormal',
+            'mu': mu,
+            'sigma': sigma,
+            'unit': 'hours'
+        }
+    
+    return service_dists
+
+def estimate_rework_rates(df):
+    """
+    Estimate rework probabilities by identifying repeated activities per case.
+    
+    Returns:
+      - rework_rates: dict {activity: rework_probability}
+      - rework_by_case_type: dict {(case_type, activity): rework_probability}
+    """
+    rework_counts = defaultdict(lambda: {'total': 0, 'with_rework': 0})
+    rework_by_type = defaultdict(lambda: {'total': 0, 'with_rework': 0})
+    
+    for case_id in df['case:concept:name'].unique():
+        case_df = df[df['case:concept:name'] == case_id]
+        case_type = case_df['case_type'].iloc[0]
+        
+        activity_counts = case_df['concept:name'].value_counts()
+        
+        for activity in activity_counts.index:
+            count = activity_counts[activity]
+            rework_counts[activity]['total'] += 1
+            rework_by_type[(case_type, activity)]['total'] += 1
+            
+            if count > 1:
+                rework_counts[activity]['with_rework'] += 1
+                rework_by_type[(case_type, activity)]['with_rework'] += 1
+    
+    rework_rates = {
+        activity: counts['with_rework'] / max(counts['total'], 1)
+        for activity, counts in rework_counts.items()
+    }
+    
+    rework_by_case_type = {
+        key: counts['with_rework'] / max(counts['total'], 1)
+        for key, counts in rework_by_type.items()
+    }
+    
+    return rework_rates, rework_by_case_type
+
+def estimate_arrival_process(df):
+    """
+    Estimate non-stationary arrival process parameters.
+    
+    Returns:
+      - baseline_rate: cases per day (float)
+      - seasonal_multipliers: dict {month: multiplier}
+      - dow_multipliers: dict {dow: multiplier} (0=Mon, 4=Fri)
+      - case_type_dist: dict {case_type: probability}
+      - clustering_intensity: float (fraction of submitters in bursts)
+    """
+    submissions = df[df['concept:name'] == 'Submit application'].copy()
+    submissions['submission_date'] = submissions['time:timestamp'].dt.date
+    submissions['month'] = submissions['time:timestamp'].dt.month
+    submissions['dayofweek'] = submissions['time:timestamp'].dt.dayofweek
+    
+    # Baseline rate
+    num_submissions = len(submissions)
+    date_range = (submissions['time:timestamp'].max() - submissions['time:timestamp'].min()).days
+    baseline_rate = num_submissions / max(date_range, 1)  # cases per day
+    
+    # Seasonal
+    seasonal_multipliers = (submissions.groupby('month').size() / submissions.groupby('month').size().mean()).to_dict()
+    
+    # Day of week
+    dow_multipliers = (submissions.groupby('dayofweek').size() / submissions.groupby('dayofweek').size().mean()).to_dict()
+    
+    # Case type distribution
+    case_type_dist = (submissions.groupby('case_type').size() / len(submissions)).to_dict()
+    
+    # Clustering: fraction of architect-weeks with >1 submission
+    submissions['week'] = submissions['time:timestamp'].dt.isocalendar().week
+    architect_week_counts = submissions.groupby(['architect_id', 'week']).size()
+    clustering_intensity = (architect_week_counts > 1).sum() / max(len(architect_week_counts), 1)
+    
+    return {
+        'baseline_rate': baseline_rate,
+        'seasonal_multipliers': seasonal_multipliers,
+        'dow_multipliers': dow_multipliers,
+        'case_type_dist': case_type_dist,
+        'clustering_intensity': clustering_intensity,
+    }
+
+def estimate_transition_probabilities(activity_timing_df):
+    """
+    Estimate conditional routing probabilities from activity transitions.
+    
+    Returns:
+      - transitions: dict {(from_activity, to_activity): probability}
+    """
+    transitions_count = activity_timing_df.groupby(['from_activity', 'to_activity']).size()
+    transitions_total = activity_timing_df.groupby('from_activity').size()
+    
+    transitions = {}
+    for (from_act, to_act), count in transitions_count.items():
+        prob = count / transitions_total[from_act]
+        transitions[(from_act, to_act)] = prob
+    
+    return transitions
+
+# ============================================================================
+# SECTION 2: Simulation Components (Skeleton)
+# ============================================================================
+
+class Case:
+    """Represents a single building permit application."""
+    
+    def __init__(self, case_id, case_type, district, architect_id, application_value,
+                 requires_fire, requires_environment, requires_public_notice, submission_time):
+        self.case_id = case_id
+        self.case_type = case_type
+        self.district = district
+        self.architect_id = architect_id
+        self.application_value = application_value
+        self.requires_fire = requires_fire
+        self.requires_environment = requires_environment
+        self.requires_public_notice = requires_public_notice
+        
+        self.submission_time = submission_time
+        self.current_activity = 'Submit application'
+        self.start_time = submission_time
+        self.status = 'submitted'  # 'submitted', 'in_progress', 'completed', 'rejected'
+        
+        self.activity_history = []  # list of (activity, start, end, resource)
+        self.rework_count = {}  # {activity: count}
+        self.assigned_resource = None
+        self.is_bundled = False
+        self.bundle_id = None
+        self.related_cases = []
+    
+    def __repr__(self):
+        return f"Case({self.case_id}, {self.case_type}, {self.current_activity})"
+
+
+class Resource:
+    """Represents a resource pool (e.g., Clerk, Planner, Inspector)."""
+    
+    def __init__(self, resource_id, role, capacity_fte, hours_per_week, working_hours_str, working_days, 
+                 calendar_exceptions=None):
+        self.resource_id = resource_id
+        self.role = role
+        self.capacity_fte = capacity_fte
+        self.hours_per_week = hours_per_week
+        self.working_hours_str = working_hours_str  # e.g., "09:00-17:00"
+        self.working_days = working_days  # e.g., [0, 1, 2, 3, 4] for Mon-Fri
+        self.calendar_exceptions = calendar_exceptions or []
+        
+        self.queue = deque()  # FIFO queue of (case, priority)
+        self.current_case = None
+        self.end_time = None  # when current case finishes
+        self.utilization_hours = 0  # cumulative service time
+        self.total_available_hours = 0  # cumulative available hours
+    
+    def is_available_at(self, time_datetime):
+        """Check if resource is available at given datetime."""
+        # Simplified: check day of week and time of day
+        if time_datetime.weekday() not in self.working_days:
+            return False
+        # TODO: Add time-of-day and exception checking
+        return True
+    
+    def enqueue(self, case, priority=0):
+        """Add case to resource queue."""
+        self.queue.append((case, priority))
+    
+    def dequeue(self):
+        """Remove and return next case from queue."""
+        if self.queue:
+            return self.queue.popleft()
+        return None
+    
+    def __repr__(self):
+        return f"Resource({self.resource_id}, {self.role}, queue_len={len(self.queue)})"
+
+
+class SimulationEnvironment:
+    """Main discrete-event simulation environment."""
+    
+    def __init__(self, start_time, end_time, seed=42):
+        self.start_time = start_time
+        self.end_time = end_time
+        self.current_time = start_time
+        self.seed = seed
+        
+        np.random.seed(seed)
+        
+        self.cases = {}  # {case_id: Case object}
+        self.resources = {}  # {resource_id: Resource object}
+        self.events = []  # priority queue: (time, event_type, case_id, resource_id)
+        self.event_counter = 0
+        
+        self.stats = {
+            'num_cases': 0,
+            'completed_cases': 0,
+            'rejected_cases': 0,
+            'case_cycle_times': [],
+            'resource_utilization': defaultdict(float),
+            'queue_lengths_by_activity': defaultdict(list),
+            'backlog_at_end': 0,
+        }
+    
+    def schedule_event(self, event_time, event_type, case_id, resource_id=None):
+        """Schedule an event in the priority queue."""
+        self.event_counter += 1
+        priority = (event_time, self.event_counter)  # secondary sort by counter for stability
+        self.events.append((priority, event_type, case_id, resource_id))
+        self.events.sort()
+    
+    def add_resource(self, resource):
+        """Register a resource in the simulation."""
+        self.resources[resource.resource_id] = resource
+    
+    def create_case(self, case_id, case_type, district, architect_id, application_value,
+                    requires_fire, requires_environment, requires_public_notice, submission_time):
+        """Create a new case and add to simulation."""
+        case = Case(case_id, case_type, district, architect_id, application_value,
+                   requires_fire, requires_environment, requires_public_notice, submission_time)
+        self.cases[case_id] = case
+        self.stats['num_cases'] += 1
+        
+        # Schedule submission event
+        self.schedule_event(submission_time, 'submit', case_id)
+        
+        return case
+    
+    def process_events(self):
+        """
+        Main simulation loop: process events in chronological order until end_time.
+        
+        This is a simplified skeleton; full implementation would include:
+        - Activity routing based on case attributes and process model
+        - Resource queue management and capacity constraints
+        - Rework loop handling
+        - Cross-case dependencies (bundling, clustering)
+        """
+        while self.events and self.current_time <= self.end_time:
+            (event_time, counter), event_type, case_id, resource_id = self.events.pop(0)
+            
+            self.current_time = event_time
+            case = self.cases.get(case_id)
+            
+            if case is None:
+                continue
+            
+            # Dispatch event handler based on event_type
+            if event_type == 'submit':
+                self._handle_submit(case)
+            elif event_type == 'start_activity':
+                self._handle_start_activity(case, resource_id)
+            elif event_type == 'end_activity':
+                self._handle_end_activity(case, resource_id)
+            elif event_type == 'decision':
+                self._handle_decision(case)
+            # ... more event types
+    
+    def _handle_submit(self, case):
+        """Handle case submission."""
+        case.status = 'in_progress'
+        # Next activity: Completeness check
+        # Schedule resource assignment for Completeness check
+        self.schedule_event(self.current_time, 'start_activity', case.case_id, 'clerk_pool')
+    
+    def _handle_start_activity(self, case, resource_id):
+        """Handle start of an activity (resource assignment)."""
+        resource = self.resources.get(resource_id)
+        if resource is None:
+            # Resource pool logic: find available resource
+            return
+        
+        resource.current_case = case
+        case.assigned_resource = resource_id
+        
+        # Sample service time (placeholder)
+        service_hours = np.random.lognormal(0, 0.5)  # dummy
+        service_time = timedelta(hours=service_hours)
+        
+        # Schedule end of activity
+        self.schedule_event(self.current_time + service_time, 'end_activity', case.case_id, resource_id)
+    
+    def _handle_end_activity(self, case, resource_id):
+        """Handle completion of an activity."""
+        resource = self.resources.get(resource_id)
+        if resource:
+            resource.current_case = None
+        
+        # Routing logic: determine next activity
+        # TODO: Implement based on transition probabilities and case attributes
+        
+        # Check for completion or rework
+        if case.current_activity == 'Issue permit' or case.current_activity == 'Reject application':
+            case.status = 'completed'
+            cycle_time = (self.current_time - case.submission_time).days
+            self.stats['case_cycle_times'].append(cycle_time)
+            self.stats['completed_cases'] += 1
+        else:
+            # Schedule next activity
+            self.schedule_event(self.current_time + timedelta(days=0.1), 'start_activity', 
+                              case.case_id, 'next_resource')  # placeholder
+    
+    def _handle_decision(self, case):
+        """Handle final decision (permit/reject)."""
+        decision = np.random.choice(['permit', 'reject'], p=[0.95, 0.05])
+        
+        if decision == 'permit':
+            case.current_activity = 'Issue permit'
+            case.status = 'completed'
+        else:
+            case.current_activity = 'Reject application'
+            case.status = 'rejected'
+            self.stats['rejected_cases'] += 1
+        
+        cycle_time = (self.current_time - case.submission_time).days
+        self.stats['case_cycle_times'].append(cycle_time)
+    
+    def finalize(self):
+        """Compute final statistics."""
+        self.stats['backlog_at_end'] = sum(1 for case in self.cases.values() 
+                                          if case.status != 'completed' and case.status != 'rejected')
+        
+        # Resource utilization
+        for resource in self.resources.values():
+            self.stats['resource_utilization'][resource.resource_id] = (
+                resource.utilization_hours / max(resource.total_available_hours, 1)
+            )
+    
+    def get_statistics(self):
+        """Return simulation statistics."""
+        if self.stats['case_cycle_times']:
+            cycle_times = np.array(self.stats['case_cycle_times'])
+            return {
+                'num_cases': self.stats['num_cases'],
+                'completed_cases': self.stats['completed_cases'],
+                'rejected_cases': self.stats['rejected_cases'],
+                'median_cycle_time_days': np.median(cycle_times),
+                'p90_cycle_time_days': np.percentile(cycle_times, 90),
+                'mean_cycle_time_days': np.mean(cycle_times),
+                'resource_utilization': dict(self.stats['resource_utilization']),
+                'backlog_at_end': self.stats['backlog_at_end'],
+            }
+        else:
+            return {}
+
+
+# ============================================================================
+# SECTION 3: Experiment Execution Framework
+# ============================================================================
+
+class ExperimentConfig:
+    """Configuration for a single experiment (intervention policy)."""
+    
+    def __init__(self, exp_id, intervention_name, parameters):
+        self.exp_id = exp_id
+        self.intervention_name = intervention_name
+        self.parameters = parameters  # dict of policy parameters
+    
+    def __repr__(self):
+        return f"ExperimentConfig({self.exp_id}, {self.intervention_name})"
+
+
+class ExperimentRunner:
+    """Run multiple simulation replications for an experiment."""
+    
+    def __init__(self, config, num_replications=10, warm_up_days=28, run_length_days=365):
+        self.config = config
+        self.num_replications = num_replications
+        self.warm_up_days = warm_up_days
+        self.run_length_days = run_length_days
+        self.results = []
+    
+    def run(self, case_generator_fn, resource_setup_fn):
+        """
+        Execute replications.
+        
+        Args:
+          - case_generator_fn: function(start_time, end_time, arrival_params) -> list of Case objects
+          - resource_setup_fn: function(simulation_env) -> None (setup resources)
+        """
+        for rep_id in range(self.num_replications):
+            seed = 42 + 10 * self.config.exp_id + rep_id
+            
+            start_time = datetime(2026, 1, 1)
+            warm_up_end = start_time + timedelta(days=self.warm_up_days)
+            end_time = warm_up_end + timedelta(days=self.run_length_days)
+            
+            # Create simulation
+            env = SimulationEnvironment(start_time, end_time, seed=seed)
+            
+            # Setup resources (apply intervention parameters)
+            resource_setup_fn(env, self.config.parameters)
+            
+            # Generate cases
+            cases = case_generator_fn(warm_up_end, end_time, {})  # TODO: pass arrival_params
+            for case in cases:
+                env.create_case(case.case_id, case.case_type, case.district, case.architect_id,
+                               case.application_value, case.requires_fire, case.requires_environment,
+                               case.requires_public_notice, case.submission_time)
+            
+            # Run simulation
+            env.process_events()
+            env.finalize()
+            
+            # Collect results
+            stats = env.get_statistics()
+            self.results.append({
+                'exp_id': self.config.exp_id,
+                'intervention': self.config.intervention_name,
+                'replication': rep_id,
+                'seed': seed,
+                **stats
+            })
+    
+    def summarize(self):
+        """Compute summary statistics across replications."""
+        results_df = pd.DataFrame(self.results)
+        
+        summary = {
+            'exp_id': self.config.exp_id,
+            'intervention': self.config.intervention_name,
+            'num_replications': self.num_replications,
+            'median_cycle_time_mean': results_df['median_cycle_time_days'].mean(),
+            'median_cycle_time_std': results_df['median_cycle_time_days'].std(),
+            'p90_cycle_time_mean': results_df['p90_cycle_time_days'].mean(),
+            'p90_cycle_time_std': results_df['p90_cycle_time_days'].std(),
+            'completed_cases_mean': results_df['completed_cases'].mean(),
+            'backlog_at_end_mean': results_df['backlog_at_end'].mean(),
+        }
+        
+        return summary
+
+
+# ============================================================================
+# SECTION 4: Main Execution
+# ============================================================================
+
+def main():
+    """
+    Main entry point: load data, estimate parameters, and run experiments.
+    """
+    
+    print("=" * 80)
+    print("Building Permit Process: Digital Twin Simulation")
+    print("=" * 80)
+    
+    # Load event log (illustrative data from problem statement)
+    print("\n[1] Loading event log...")
+    csv_data = """case:concept:name,concept:name,time:timestamp,org:resource,case_type,district,architect_id,application_value,requires_fire,requires_environment,requires_public_notice
+P001,Submit application,2026-01-02 09:12:00,portal,New residential,D3,A17,480000,yes,no,yes
+P001,Completeness check,2026-01-03 10:45:00,clerk_2,New residential,D3,A17,480000,yes,no,yes
+P001,Request missing documents,2026-01-03 11:10:00,clerk_2,New residential,D3,A17,480000,yes,no,yes
+P001,Receive missing documents,2026-01-08 16:25:00,portal,New residential,D3,A17,480000,yes,no,yes
+P001,Completeness check,2026-01-09 09:20:00,clerk_4,New residential,D3,A17,480000,yes,no,yes
+P001,Planning review,2026-01-14 14:00:00,planner_3,New residential,D3,A17,480000,yes,no,yes
+P001,Fire-safety review,2026-01-17 10:10:00,fire_1,New residential,D3,A17,480000,yes,no,yes
+P001,Public-notice period,2026-01-18 08:00:00,system,New residential,D3,A17,480000,yes,no,yes
+P001,Inspection scheduling,2026-02-02 09:30:00,scheduler_1,New residential,D3,A17,480000,yes,no,yes
+P001,Site inspection,2026-02-07 13:00:00,inspector_2,New residential,D3,A17,480000,yes,no,yes
+P001,Decision drafting,2026-02-11 15:30:00,planner_3,New residential,D3,A17,480000,yes,no,yes
+P001,Legal check,2026-02-14 11:40:00,legal_1,New residential,D3,A17,480000,yes,no,yes
+P001,Issue permit,2026-02-15 10:00:00,system,New residential,D3,A17,480000,yes,no,yes
+P002,Submit application,2026-01-03 18:21:00,portal,Simple renovation,D1,A02,32000,no,no,no
+P002,Completeness check,2026-01-04 09:05:00,clerk_1,Simple renovation,D1,A02,32000,no,no,no
+P002,Planning review,2026-01-05 13:15:00,planner_1,Simple renovation,D1,A02,32000,no,no,no
+P002,Inspection scheduling,2026-01-06 09:40:00,scheduler_1,Simple renovation,D1,A02,32000,no,no,no
+P002,Site inspection,2026-01-10 09:00:00,inspector_1,Simple renovation,D1,A02,32000,no,no,no
+P002,Decision drafting,2026-01-11 10:30:00,planner_1,Simple renovation,D1,A02,32000,no,no,no
+P002,Issue permit,2026-01-12 08:30:00,system,Simple renovation,D1,A02,32000,no,no,no"""
+    
+    from io import StringIO
+    df = pd.read_csv(StringIO(csv_data))
+    
+    # Format for PM4Py
+    df = format_dataframe_for_pm4py(df)
+    print(f"Loaded {len(df)} events from {df['case:concept:name'].nunique()} cases.")
+    
+    # Extract variants and DFG
+    print("\n[2] Discovering process model...")
+    variants, dfg = extract_variants_and_dfg(df)
+    print(f"Discovered {len(variants)} unique process variants.")
+    print(f"Top 3 variants:")
+    for trace, count in sorted(variants.items(), key=lambda x: x[1], reverse=True)[:3]:
+        print(f"  {trace}: {count} cases")
+    
+    # Compute case summary
+    print("\n[3] Computing case summaries...")
+    case_summary = compute_case_summary_statistics(df)
+    print(case_summary[['case_id', 'case_type', 'cycle_time_days']].head(10))
+    
+    # Activity timing
+    print("\n[4] Extracting activity timing...")
+    activity_timing = extract_activity_timing(df)
+    print(f"Total transitions: {len(activity_timing)}")
+    print(f"Waiting time summary (hours):")
+    print(activity_timing['time_elapsed_hours'].describe())
+    
+    # Arrival process
+    print("\n[5] Estimating arrival process...")
+    arrival_params = estimate_arrival_process(df)
+    print(f"Baseline arrival rate: {arrival_params['baseline_rate']:.2f} cases/day")
+    print(f"Seasonal multipliers: {arrival_params['seasonal_multipliers']}")
+    print(f"Clustering intensity: {arrival_params['clustering_intensity']:.3f}")
+    
+    # Rework rates
+    print("\n[6] Estimating rework rates...")
+    rework_rates, rework_by_type = estimate_rework_rates(df)
+    print(f"Rework rates by activity:")
+    for activity, rate in sorted(rework_rates.items(), key=lambda x: x[1], reverse=True)[:5]:
+        print(f"  {activity}: {rate:.1%}")
+    
+    # Transition probabilities
+    print("\n[7] Estimating transition probabilities...")
+    transitions = estimate_transition_probabilities(activity_timing)
+    print(f"Transition matrix (top 10):")
+    for (from_act, to_act), prob in sorted(transitions.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {from_act} -> {to_act}: {prob:.1%}")
+    
+    # Service time distributions
+    print("\n[8] Estimating service-time distributions...")
+    empirical_summary = {
+        'Completeness check': {'median': 0.42, 'p90': 1.5, 'unit': 'hours'},
+        'Planning review': {'median': 3.5, 'p90': 14, 'unit': 'hours'},
+        'Fire-safety review': {'median': 2.5, 'p90': 9, 'unit': 'hours'},
+        'Site inspection': {'median': 1, 'p90': 3, 'unit': 'hours'},
+    }
+    service_dists = estimate_service_time_distributions(activity_timing, empirical_summary)
+    print(f"Service-time distributions (lognormal):")
+    for activity, dist in list(service_dists.items())[:4]:
+        print(f"  {activity}: ={dist['mu']:.2f}, ={dist['sigma']:.2f}")
+    
+    # ========== Experiment setup (stub) ==========
+    print("\n[9] Setting up experiments...")
+    
+    experiments = [
+        ExperimentConfig(1, 'Baseline', {}),
+        ExperimentConfig(2, 'D1: Pre-submission checker', {'pre_submission_frac': 0.4}),
+        ExperimentConfig(3, 'D2: Inspection exemption', {'simple_exemption_threshold': 50000}),
+    ]
+    
+    print(f"Configured {len(experiments)} experiment(s).")
+    
+    # ========== Run experiments (stub) ==========
+    print("\n[10] Running simulations...")
+    print("(Full simulation engine not implemented in this skeleton.)")
+    print("Placeholder: would execute ExperimentRunner for each configuration.")
+    
+    for exp in experiments:
+        print(f"  - {exp.intervention_name} (exp_id={exp.exp_id})")
+    
+    print("\n" + "=" * 80)
+    print("Simulation skeleton complete. Next steps:")
+    print("  1. Implement full event handlers in SimulationEnvironment.")
+    print("  2. Integrate routing logic and rework loops.")
+    print("  3. Add resource calendar and constraint handling.")
+    print("  4. Calibrate against historical data (replay validation).")
+    print("  5. Run full experiment matrix and sensitivity analysis.")
+    print("=" * 80)
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## Summary of Design Rationale
+
+This comprehensive design addresses all facets of the problem:
+
+1. **Scope and State Variables:** Clearly delineated process boundary, entity definitions, and cross-case dependencies (architect clustering, inspection batching, objections).
+
+2. **Parameter Estimation:** PM4Py-centric approach to extract variants, DFG, and empirical distributions; separation of service and waiting time (with caveats); handling of missing data via empirical summary and domain knowledge.
+
+3. **Assumptions:** Transparent treatment of non-stationary demand, lognormal service times, stochastic rework, and missing objection events. Each assumption is justified.
+
+4. **Experiment Matrix:** 16 configurations (1 baseline + 9 interventions + 1 combined + 5 stress scenarios) with clear trade-offs documented.
+
+5. **Validation:** Multi-faceted approach spanning replay, distributional, resource, and bottleneck checks; acceptance criteria defined.
+
+6. **Decision Criteria:** Hierarchical metrics (primary, secondary, fairness, robustness) with numerical thresholds for defensible governance decisions.
+
+7. **Python Skeleton:** Modular structure with PM4Py integration for log analysis, placeholder DES engine, and extensible experiment framework. Code is plausible, follows PM4Py conventions, and separates concerns (log analysis, simulation, experimentation).
+
+The design is grounded in process-mining best practices, accounts for non-stationarity and inter-case dependencies, and provides a transparent path from historical data to evidence-based intervention selection.

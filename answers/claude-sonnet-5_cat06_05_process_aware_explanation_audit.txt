@@ -1,0 +1,168 @@
+# Process Monitoring Model Explanation Audit
+
+## 1. Leakage and temporal-consistency findings
+
+| Item | Finding type | Severity | Why | Required remediation |
+|---|---|---|---|---|
+| `total_case_duration_hours` | Temporal leakage | Critical | Computed after case closure; near-deterministic function of the target itself | Remove entirely; not repairable for a t0 model |
+| `appeal_seen_anywhere` | Temporal leakage | Critical | Appeal can only follow a Settlement Decision, which occurs long after t0 | Remove; if appeal-propensity is useful, model it as a separate downstream prediction, not a t0 feature |
+| `final_handler_team` | Mutable/lineage defect | High | Warehouse field is populated at closure; matches t0-assigned team only ~65% of time with no historical timestamp to verify | Capture `assigned_team_at_t0` as its own event-timestamped attribute; discard closure-time substitute |
+| `num_document_requests_total` | Temporal leakage | Critical | "_total" aggregates over the whole trace, including cycles after t0; at true t0 (immediately after first Coverage Check) this count is structurally 0 | Remove; if kept, must be `num_document_requests_before_t0`, which is trivially 0 by the process model at this exact prediction point |
+| `queue_length_at_t0` | Legitimate signal | Low | Timestamped snapshot, ±5 min tolerance, reflects state at t0 | Keep; verify tolerance window never spans t0 boundary |
+| `initial_damage_complexity` | Legitimate signal | Low | Entered at registration, frozen before t0 | Keep |
+| `full_trace_variant_id` | Temporal leakage | Critical | Encodes the entire future path (decision, appeal, close) as a single ID | Remove; replace with `prefix_variant_id` computed only from observed prefix activities |
+| `calendar_week` | Drift/calendar proxy | Medium | Known at t0, but confounded with an operating-policy change and a holiday period — not a stable mechanism | Keep only as monitored proxy; do not interpret causally; consider explicit `policy_period` indicator to disentangle |
+| `claimant_region` | Correlated proxy (fairness) | Medium/High | Known at registration but proxies for repair-network coverage, language, channel, socioeconomic factors | Keep for prediction only after fairness review; disclose as proxy; forbid operational targeting by region |
+| `elapsed_since_registration_at_t0` | Legitimate signal | Low | Derived only from past timestamps | Keep |
+| `prior_claim_count_before_t0` | Lineage defect causing leakage | High | SQL uses `claim_created_at <= extraction_date` instead of `< t0`; may count claims created between t0 and extraction | Fix SQL to strict `< t0`; re-validate and recompute before any use |
+| `same_day_document_count_snapshot` | Temporal leakage (partial) | High | Nightly 23:00 refresh can include documents uploaded after t0 same day | Recompute as strict as-of-t0 snapshot; otherwise remove |
+| Pattern: `Claim Closed -> Damage Assessment Completed` | Process impossibility + leakage | Critical | Violates normative order (Closed must follow a decision, not precede Damage Assessment); tied timestamps with no sequence index make direction unverifiable; both events postdate t0 regardless | Remove from any t0 explanation; escalate as a data-quality/ingestion defect, not a "pattern" |
+| Pattern: `Appeal -> Settlement Decision Recorded` | Temporal leakage (but process-consistent) | Critical for t0 use | This ordering *is* legitimate per the process model (appeal  reconsideration decision), unlike the Closed/Damage-Assessment pair — but both events occur long after t0 | Remove from t0 model; may be valid as a feature for a *later* prediction point (e.g., post-first-decision model) |
+| Pattern: `Documents Requested -> Documents Received` | Temporal leakage | High | At true t0 neither event has necessarily occurred (t0 is immediately after Coverage Check); pattern is derived from the complete trace | Remove, or redefine as a prefix-only indicator (which would be constantly 0/absent at this exact point) |
+| Pattern: `Coverage Check Completed -> Fraud Investigation Opened` | Temporal leakage | High | Fraud Investigation is a possible-future event, not yet occurred at t0; encoding it as a realized edge leaks | Only usable if reframed as "fraud-trigger condition present at t0," not as an occurred edge |
+| Pattern: `Damage Assessment Completed -> Settlement Decision Recorded` | Temporal leakage | Critical | Both activities are strictly future relative to t0 | Remove |
+| Case X `claimant_channel = Broker` | Legitimate signal | Low | Known at registration | Keep |
+| Case X `final_decision = Partial` | Temporal leakage (severe, outcome-adjacent) | Critical | The settlement decision is recorded far after t0; this is the single most severe leak in the set, bordering on label leakage | Remove immediately |
+| Case Y `full_trace_variant_id` value | Temporal leakage | Critical | Instantiated value literally spells out appeal + close | Remove |
+| Case Y `claimant_region = R4` | Correlated proxy | Medium | Same as global #9 | Keep with fairness caveat |
+| Case Y `initial_reserve = €25,000` | Legitimate signal (conditional) | Low/Medium | Plausibly set at registration/coverage-check, but lineage not confirmed | Verify timestamp of reserve-setting event before trusting |
+| Case Y `prior_claim_count_before_t0 = 3` | Lineage defect | High | Same SQL bug as global #11 | Repair and recompute |
+| Case Z pattern `Closed -> Damage Assessment` | Process impossibility + leakage | Critical | Same as global finding | Remove |
+| Case Z `risk_score_current = 74` | Mutable feature, no lineage timestamp | High | May be recalculated post-t0; no point-in-time snapshot stored | Add feature versioning; unusable until repaired |
+| Case Z `last_resource_role = SIU` | Temporal leakage | Critical | Explicitly defined as last role in the *complete* case | Remove; replace with `resource_role_at_t0` |
+| Case Z `calendar_week = 52` | Drift/calendar proxy | Medium | Same as global #8 | Keep as monitored proxy only |
+| Case Z `same_day_document_count_snapshot = 6` | Temporal leakage (partial) | High | Same as global #12 | Repair or remove |
+| (Not in top-12) Employee experience joined as of extraction date | Latent temporal leakage | Medium | Joined at extraction time, not event time, even though not surfaced in top-12 | Audit and re-join as-of-t0 before any future use |
+
+---
+
+## 2. Process-model consistency checks
+
+A validation suite should combine static lineage analysis with formal conformance techniques:
+
+**a. Prefix-time availability (lineage tagging).**
+Every feature definition must carry metadata: `defining_event_time_bound` (max timestamp of any event referenced) vs. `extraction_time`. Automated CI should reject any feature whose SQL/ETL references an event timestamp, aggregation window, or join condition that is not provably `<= t0`. Naming conventions ("_total", "final_", "full_trace_") should trigger mandatory manual review, since they are common leakage smells.
+
+**b. Activity-order feasibility (footprint + alignment checks).**
+Encode the normative process (registration  coverage check  {fast track | evidence cycles}  damage assessment  [fraud investigation]  decision  [appeal  decision]  closed) as a Petri net or BPMN model. Use:
+- **Footprint matrix** (directly-follows / never-follows / parallel relations) to quickly flag impossible pairs such as `Closed -> Damage Assessment Completed` (never a valid precedence).
+- **Alignment-based conformance** (e.g., PM4Py alignments) to compute the cheapest explanation of any deviation between an observed sequence and the model — this distinguishes genuine rare-but-legal paths from actual logging errors, which a raw DFG cannot do.
+
+*Limitation:* a frequent DFG edge only reflects statistical co-occurrence, not permissibility — it will happily "learn" `Closed -> Damage Assessment` as a real edge if the log contains ordering noise. Only the model-based check (footprint/alignment) can label it impossible.
+
+**c. Same-timestamp ambiguity.**
+Maintain an ingestion sequence index for all events with identical timestamps. Where absent (as in Case Z), the correct rule is: treat order as **unknown**, not as a directional edge. Any explanation citing a directional pattern over tied timestamps without a sequence index must be suppressed or replaced with an "order ambiguous" flag, and the affected log slice should trigger a data-quality ticket.
+
+**d. Complete-trace usage detection.**
+Static analysis should distinguish "prefix-only" features (computed via a bounded replay of the log up to t0) from "full-trace" features (computed over the closed case). Every full-trace feature used in an explanation at t0 is leakage by construction and should be auto-flagged, regardless of its predictive power.
+
+**e. Enabled / impossible / future-possible classification.**
+For any activity referenced by a feature, classify it against the prefix's current marking in the process model:
+- *Observed*: already occurred in the prefix (legitimate to reference).
+- *Enabled*: reachable in one step from the current state (e.g., Documents Requested, Damage Assessment Completed, Fraud Investigation Opened are all enabled immediately after Coverage Check) — legitimate to reference *branch-possibility*, illegitimate to reference as having *occurred*.
+- *Impossible*: not reachable without intervening activities (e.g., Settlement Decision before Damage Assessment) — if such an activity appears as "occurred," it indicates a data or log-parsing error, not a genuine rare path.
+
+**f. Legitimacy of repeated `Settlement Decision Recorded`.**
+Use a declarative (Declare-style) constraint: a second Decision event is legitimate **iff** it is preceded by an Appeal, which itself is preceded by a first Decision in {Partial, Deny}. Alignments against this constraint should be run on any trace with two Decision events; violations indicate either genuine data errors or a business-rule breach, and should be excluded from "normal pattern" statistics rather than treated as a valid Sequence-explainer signal.
+
+*Overall limitation caveat:* DFG/frequency-based explainers are good for descriptive discovery but cannot certify feasibility or temporal availability; alignments and declarative checks are heavier but necessary before any pattern is allowed into an explanation surfaced at t0.
+
+---
+
+## 3. Alternative feature interpretations
+
+**Defensible predictive signal** (prefix-derived, temporally clean, plausible mechanism):
+`initial_damage_complexity`, `elapsed_since_registration_at_t0`, `claimant_channel`, `initial_reserve` (once lineage confirmed). *May claim*: these are valid statistical predictors of breach risk observable at t0, consistent with a plausible mechanism (harder/larger claims genuinely take longer). *May not claim*: strong individual causal effect size without a controlled/quasi-experimental design — association only.
+
+**Process-state or congestion signal**:
+`queue_length_at_t0`. *May claim*: this reflects current operational load and is a legitimate, actionable operational lever (e.g., staffing, triage). *May not claim*: that it reflects anything about the claim's inherent nature — it is a shared-resource property, not a claim property, and its effect is likely to shift the moment staffing changes (non-stationary).
+
+**Proxy requiring fairness/robustness review**:
+`claimant_region`, and (once repaired) `final_handler_team`/`assigned_team_at_t0` if team assignment correlates with region or claim type. *May claim*: statistically useful in-sample; predictive of the outcome. *May not claim*: causal delay driver, or a legitimate basis for differential treatment. Requires disparate-impact/equalized-odds analysis before any operational use; if used for prediction only (not action), must be documented as a proxy with governance sign-off.
+
+**Drift/calendar proxy**:
+`calendar_week`. *May claim*: a real, time-bounded predictive association tied to a specific policy/holiday period in the training window. *May not claim*: a generalizable causal "week effect" — the signal is likely to disappear or invert once the policy/holiday period passes, and should not be described as an inherent property of certain weeks.
+
+**Unusable until lineage repaired**:
+`final_handler_team` (needs as-of-t0 capture), `prior_claim_count_before_t0` (SQL bug), `same_day_document_count_snapshot` (nightly refresh bug), `risk_score_current` (no point-in-time versioning). These are not yet classifiable as predictive or not — they must be re-engineered with correct point-in-time semantics before any interpretation is attempted.
+
+---
+
+## 4. Revised explanations for selected cases
+
+```json
+{
+  "Case X": {
+    "prediction_status": "recompute",
+    "credible_drivers": [
+      {"feature": "queue_length_at_t0", "direction": "increase", "interpretation": "High current queue (18) reflects operational congestion at intake, a legitimate process-state signal available at t0."},
+      {"feature": "initial_damage_complexity", "direction": "increase", "interpretation": "High complexity recorded at registration is a plausible early indicator of longer downstream processing."},
+      {"feature": "elapsed_since_registration_at_t0", "direction": "decrease", "interpretation": "Very short elapsed time (1.2h) means nearly the full 10-day window remains, which is protective, not a risk driver."},
+      {"feature": "claimant_channel", "direction": "increase", "interpretation": "Broker-submitted claims show an association with breach risk at t0; treat as a tentative process/channel signal pending fairness and robustness review, not as a mechanism."}
+    ],
+    "removed_or_repaired_drivers": [
+      {"feature": "appeal_seen_anywhere", "reason": "Appeal can only occur after a Settlement Decision, which is far beyond t0; this is complete-trace leakage."},
+      {"feature": "final_decision", "reason": "The settlement decision is recorded at case resolution, long after t0; using it is outcome-adjacent leakage and must be removed."}
+    ],
+    "process_aware_narrative": "At t0, Case X shows legitimate elevated risk from operational congestion and recorded damage complexity, partially offset by the claim being very newly registered (full slack remaining). The original explanation's two dominant drivers were both leakage: appeal occurrence and the recorded settlement decision are not observable until well after this prediction point. The reported 0.82 probability should not be trusted until the model is retrained on a leakage-free feature set and rescored.",
+    "causal_claim_boundary": "Queue length and damage complexity are statistical associations at the population level; they do not establish that reducing queue length or reclassifying complexity would causally change this specific case's outcome absent a controlled intervention. The channel signal must not be used to justify differential handling of brokered claims without a documented fairness review."
+  },
+  "Case Y": {
+    "prediction_status": "invalidate",
+    "credible_drivers": [
+      {"feature": "queue_length_at_t0", "direction": "decrease", "interpretation": "Low queue length (4) at t0 is a legitimate protective congestion signal."},
+      {"feature": "initial_reserve", "direction": "increase", "interpretation": "A higher initial reserve estimate may reflect anticipated claim complexity, pending confirmation that the reserve was set before t0."},
+      {"feature": "claimant_region", "direction": "increase", "interpretation": "Region R4 shows an association with breach risk; this is a known proxy requiring fairness review, not a claimed mechanism."}
+    ],
+    "removed_or_repaired_drivers": [
+      {"feature": "full_trace_variant_id", "reason": "This feature's dominant contribution (+0.31) is derived from the complete trace and literally encodes the eventual appeal and closure sequence; it does not exist at t0 and constitutes critical leakage."},
+      {"feature": "prior_claim_count_before_t0", "reason": "Computed with a lineage bug (extraction_date instead of t0 cutoff); must be recomputed with a strict pre-t0 filter before being trusted."}
+    ],
+    "process_aware_narrative": "The reported 0.71 breach probability for Case Y was primarily driven by a complete-trace variant identifier that encodes future events, including an appeal and closure, which cannot be known at t0. Once this and the buggy prior-claim-count feature are removed or repaired, the remaining defensible signal is modest: low congestion at t0 (protective), a plausibly elevated reserve estimate, and a regional proxy requiring fairness review. The true prefix-only risk for this case is likely substantially different from 0.71, and the prediction must be regenerated from a corrected feature set before being reported to any stakeholder.",
+    "causal_claim_boundary": "Regional association may reflect repair-network, language, or channel confounds rather than any property of the claimant and must not be used to justify differential treatment without a fairness audit. Reserve size predicts anticipated effort but is not evidence that a larger reserve causes delay."
+  },
+  "Case Z uncertainty note": {
+    "status": "invalidate — insufficient trustworthy information at t0; requires re-extraction and recomputation before any explanation can be issued",
+    "main_ambiguities": [
+      "The 'Claim Closed -> Damage Assessment Completed' pattern rests on two events with identical timestamps and no reliable sequence index; this ordering is impossible under the normative process model, indicating either an ingestion error or genuine data corruption — and regardless of true order, both events postdate t0 and cannot inform a t0 prediction.",
+      "risk_score_current is mutable and may have been recalculated after t0 with no stored point-in-time value, so its +0.15 contribution cannot be confidently attributed to information available at t0.",
+      "last_resource_role is explicitly defined over the complete case; 'Special Investigation Unit' almost certainly reflects a late-stage fraud-investigation assignment, not the resource actually handling the claim at t0 — this is leakage, not a legitimate prefix signal."
+    ],
+    "minimum_recomputation_needed": [
+      "Re-ingest events with a reliable sequence index to resolve or exclude the Closed/Damage-Assessment tie.",
+      "Re-derive risk_score with a stored point-in-time snapshot as of t0 (versioned feature).",
+      "Replace last_resource_role with resource_role_at_t0 computed strictly from the prefix.",
+      "Recompute same_day_document_count_snapshot bounded strictly to t0, not the nightly batch value.",
+      "Retain calendar_week only as a flagged, monitored drift proxy, never as a claimed causal driver."
+    ]
+  }
+}
+```
+
+---
+
+## 5. Recommendations for explanation validation
+
+**Priority 1 — Feature-store redesign (foundational).**
+Enforce as-of-t0 (point-in-time) joins as a platform-level guarantee, not a per-feature convention. Require every feature to declare `event_time_bound` and `prefix_only: true/false` metadata; block registration of full-trace features for any t0-scoped model.
+
+**Priority 2 — Historical feature timestamps for mutable fields.**
+Version `risk_score_current`, `final_handler_team`/assigned-team, and similar recalculable fields with effective-from/effective-to intervals so any point-in-time value can be reconstructed exactly, not approximated.
+
+**Priority 3 — Prefix-only recomputation of the full training set.**
+Rebuild every feature (`prior_claim_count`, `same_day_document_count`, `num_document_requests`, `full_trace_variant_id -> prefix_variant_id`) via strict event-log replay up to each case's t0, not via warehouse snapshots taken at extraction time.
+
+**Priority 4 — Process-conformance tests as CI gates.**
+Integrate footprint/alignment checks into the feature-engineering pipeline: reject any feature referencing an activity not reachable/observed by t0; add unit tests using synthetic traces for each canonical path (fast-track, single evidence cycle, multi-cycle, appeal) verifying computed values match expected prefix-only results.
+
+**Priority 5 — Recalibration after feature removal.**
+Expect substantial AUC/Brier degradation once leaked features are stripped; retrain and recalibrate (Platt/isotonic) against this new, honest baseline, and communicate the revised performance envelope to stakeholders rather than retaining the inflated original metrics.
+
+**Priority 6 — Explanation stability testing.**
+Check SHAP/local-explanation stability across bootstrap retrainings and small prefix perturbations (e.g., ±5 min timestamp jitter on snapshot joins like `queue_length_at_t0`) to catch fragile or noise-driven attributions before they are shown to users.
+
+**Priority 7 — Proxy and fairness analysis.**
+Run disparate-impact/equalized-odds analysis on `claimant_region`, `claimant_channel`, and repaired `assigned_team_at_t0`; document a governance decision (keep with disclosure, transform, or drop) before any operational use, distinct from pure predictive-validity sign-off.
+
+**Priority 8 — Ongoing drift and data-quality monitoring.**
+Monitor: (a) trace-variant novelty (structural/process drift), (b) rate of same-timestamp/ordering anomalies as a log-quality KPI, (c) calendar/policy-period confounds re-emerging, and (d) silent schema or lineage-tag changes in the feature store (including previously unaudited fields like employee experience, joined at extraction rather than event date).

@@ -1,0 +1,297 @@
+## 1. Duplicate-handling decision tree
+
+```
+Q1: Same (source, source_event_key) appearing twice (re-ingestion / replay)?
+  YES  EXACT TECHNICAL DUPLICATE
+          DROP the later-ingested copy; keep earliest as canonical; log the drop.
+  NO  Q2
+
+Q2: Different systems, same real-world instant, same object set, external
+    corroboration (reconciliation report, shared business key) that it is
+    one physical occurrence?
+  YES  SAME PHYSICAL EVENT, MULTI-SYSTEM OBSERVATION
+          MERGE attributes & relations into one canonical event;
+           keep both source_event_keys in provenance.
+  NO  Q3
+
+Q3: Is one event a coarser, system-generated status/summary explicitly
+    derived from the other (subset of objects, later ingestion, message-driven)?
+  YES  SUMMARY EVENT DERIVED FROM DETAILED EVENT
+          RETAIN BOTH, refine labels with abstraction qualifiers
+           (…[detail] / …[summary]); link via derivation reference;
+           do not drop (loses the summary-layer view) and do not merge
+           by default (loses the causal detail).
+  NO  Q4
+
+Q4: Did activity harmonization map two distinct source semantics onto one
+    label, while source facts show the underlying meanings differ?
+  YES  HARMONIZATION COLLISION
+          RETAIN BOTH, revert to disambiguated qualifiers
+           (e.g. "Dispatch Package (Warehouse Release)" vs
+           "…(Carrier Accept)"); never merge; keep as sequential steps.
+  NO  Q5
+
+Q5: Same activity+timestamp but reference a different instance of the
+    activity's core object type (different Item, different Payment, …)?
+  YES  CONCURRENT SAME-LABEL EVENTS, DIFFERENT OBJECTS
+          RETAIN BOTH UNCHANGED; only assign a deterministic tie-break
+           rank, never merge.
+  NO  Q6
+
+Q6: None of the above resolved with sufficient evidence
+      UNRESOLVED CANDIDATE  QUARANTINE for manual/rule review;
+       keep original event(s) untouched in the analytic log.
+```
+
+## 2. Event-by-event decisions
+
+| Event(s) | Candidate relationship | Decision | Confidence | Preserved canonical eid | Attribute merge policy | Relation merge policy | Provenance retained | Main risk |
+|---|---|---|---|---|---|---|---|---|
+| e03/e04 | Same physical pick, multi-system | Merge | High (reconciliation report) | e03 | Union; add `location` from e04; keep both payload_hash | Union (already identical: O1,I1,P1) | Both source_event_keys, both sources | Reconciliation report itself could be wrong; a genuine re-scan would be wrongly merged |
+| e03/e05 | Concurrent same-label, distinct object (I1 vs I2) | Retain both unchanged | High (explicit fact) | both | none | none | unchanged | Naive same-activity/timestamp merge tools would collapse them |
+| e06/e07 | Summary vs detail (ambiguous per source) | Retain both, qualifier labels; derivation link only | Medium | both (e06 = detail, e07 = summary) | none in conservative; optional secondary-timestamp attribute in evidence-based | none | unchanged | Merging hides double abstraction; not merging risks double-counting "Pack Package" in DFG unless qualifiers applied |
+| e08/e09 | Harmonization collision (release vs accept) | Retain both, relabel (not merge) | High (explicit fact) | both | none (only `original_activity` recorded) | none | original harmonized + original source label kept | Unlabeled, creates false self-loop/rework in DFG |
+| e09/e10 | Distinct sequential carrier events, tied timestamp | Retain both unchanged, order via domain rule | High | both | none | none | unchanged | Ordering by ingestion time could accidentally look "right" without being principled |
+| e11/e16 | Same invoice issuance, complementary systems | Merge | High (shared invoice number V1) | e11 (ERP originator) | Field-level union with source tags; conflicts flagged | Union (already identical: O1,V1) | Both source_event_keys | Merging would be wrong if invoice were later corrected/reissued and events represent different revisions |
+| e13/e14 | Distinct partial payments (M1 vs M2) | Retain both unchanged | Very high (explicit fact; must not drop e14) | both | none | none | unchanged | Common-object matching on O1/V1 could wrongly trigger a merge |
+| e13/e15 | Detail capture vs ERP balance summary (no Payment object) | Retain both, qualifier + derivation link, no merge | Medium | e13 (has Payment relation) | none | none — cannot attach Payment relation to e15 without evidence | unchanged | Assuming e15 = M1 alone discards possibility it aggregates M1+M2 |
+| e14/e15 | Same as above, alternate pairing | Unresolved  quarantine | Low | none | none | none | flagged for review | Silent assumption of which payment the ERP summary reflects |
+
+## 3. Timestamp-tie ordering rules
+
+Ordering priority (highest to lowest), each labeled **semantic (S)** or **deterministic-only (D)**:
+
+1. **Domain constraints (S)** — explicit causal facts (e.g., Authorize before Capture for the same Payment; Handover after Carrier-Accept).
+2. **Lifecycle constraints on shared objects (S)** — reference-model ordering per object type (PickPackDispatchHandoverConfirm for a Package; CreateValidate for an Order).
+3. **Source-specific semantics (S, weak)** — a system is authoritative for the internal order of events it authored (e.g., PSP's own AuthorizeCapture chain, CARRIER's accepthandover chain); used to break ties domain rules don't resolve.
+4. **Within-source sequence (S/D mixed)** — `source_seq` is meaningful only inside its own source; used to order events emitted by the same system, never compared across systems.
+5. **Ingestion time (D, weak, last resort)** — non-business, used only when no domain/lifecycle/source signal exists, and documented as arbitrary.
+6. **Stable fallback (D)** — a content-derived key (sorted `source`, `source_event_key`, or `eid`) purely to satisfy a tool's requirement for strict total order; kept in a separate `tie_break_rank` column, never conflated with timestamp.
+
+**Why not encode order with microseconds:** injecting synthetic sub-second offsets fabricates a measurement that never occurred. It implies a specific, precise physical gap between events, which downstream duration/SLA computations will treat as observed fact rather than inferred order. It also silently forecloses future correction (if new evidence reverses the inferred order, the fabricated gap must be un-invented) and can make coincidental/logical inference indistinguishable from genuinely timestamped precision — violating "do not claim a deterministic total order proves true physical order."
+
+**Resulting/admissible orders**
+
+- **10:00 group:** `[e03/e04 merged]  e05  e06  e07`. Convergent evidence: WMS seq (100) and SCANNER seq (551<552) both put I1-pick before I2-pick; lifecycle rule places both picks before pack; e06 (detail) before e07 (summary, source-specific semantics). Admissible alternative: `e05  [e03/e04]  e06  e07` (no domain rule strictly orders the two picks against each other).
+- **10:15 group:** `e08  e09  e10` (warehouse release must precede carrier acceptance; fact 5 explicitly places handover after acceptance; CARRIER `source_seq` 1<2 corroborates e09<e10).
+- **12:00 group (post-merge):** `[e11/e16 merged]  e12  e13  e14  e15`. Invoice issuance logically precedes authorization; Authorize precedes Capture (fact 7); ERP balance summary (e15) is generated after payment messages (fact 8), hence last. `e13`/`e14` relative order is not causally constrained — PSP `source_seq` (401<402) is used only as a weak semantic tiebreak; `e14  e13` is an equally admissible alternative if that evidence is disregarded.
+
+## 4. Conservative cleaning pipeline
+
+Merge only pairs with **(a)** independent corroborating evidence and **(b)** identical modeled object sets: **e03+e04** (reconciliation report) and **e11+e16** (shared invoice number, a business key, not just coincidence of timestamp/activity). Apply label refinement (not merge, not drop) to the harmonization collision **e08/e09**, restoring "Dispatch Package (Warehouse Release)" and "…(Carrier Accept)" — this is a correction of mislabeling, introduces no information loss. Leave **e06/e07** as two qualifier-labeled events (abstraction ambiguity is explicitly unresolved per source facts). Leave **e09/e10, e12, e13, e14** untouched. Quarantine **e15** relative to e13/e14 (flag only, still retained as an event). Apply deterministic ordering per Section 3 without deleting any legitimately concurrent event.
+
+**Expected retained count:** 17 raw rows  2 merges (e03+e04, e11+e16)  **15 canonical events** in the analysis-ready log, with all 17 original rows still accessible through provenance/audit records.
+
+## 5. Aggressive alternatives
+
+**A. Evidence-based semantic merging.** Extends the conservative pipeline by also merging **e06+e07** (treating both as one packing transition, canonical eid e06, ERP timestamp kept as a secondary attribute) since business intent is arguably one transition. It does **not** merge e08/e09 (fact 4 gives explicit contrary evidence) and does **not** touch e13/e14/e15 without new evidence. Retained count: 15  1 = **14 events**. Main damage: conflates a WMS transactional timestamp with an ERP-derived one, biasing pack-duration metrics, and removes the detail/summary distinction useful for cross-system reconciliation audits.
+
+**B. Mechanically aggressive PM4Py merging.** Applies generic duplicate detection keyed only on `(activity, timestamp)` or `(activity, timestamp, common object)` across the whole log, with no semantic vetting. This would: collapse e03/e04/e05 into one Pick event (destroying the I2 pick — explicitly forbidden), merge e06/e07, merge e08/e09 (destroying release/accept distinction), merge e11/e16, and — critically — merge **e13, e14, and e15** into one Capture event because they share label, timestamp, and objects O1/V1, erasing the M2 partial payment entirely. Retained count estimate: **~9–10 events**. Semantic damage: loss of Item-level pick cardinality, loss of a whole Payment object (M2), collapse of logistics semantics, broken E2O integrity for Item and Payment types.
+
+**Why `have_common_object=True` does not protect e13/e14:** both events legitimately share the coarse container objects Order (O1) and Invoice (V1) — but a "Capture Payment" activity's operationally meaningful object is the Payment instance itself, and here the Payment instances differ (M1 vs M2). A common-object check that does not weight or require agreement on the *most specific* object type tied to the activity will treat two events distinguished only at that specific level as duplicates. Correct duplicate detection must require object-set equivalence at the finest-grained relevant object type, not merely non-empty overlap at any type.
+
+## 6. PM4Py-oriented Python implementation
+
+```python
+import copy
+import pandas as pd
+import pm4py
+
+# ---------------------------------------------------------------------------
+# 0. Never mutate ocel_raw. Work on deep copies per scenario.
+# ---------------------------------------------------------------------------
+def fresh_copy(ocel):
+    return copy.deepcopy(ocel)
+
+def stamp_provenance(events_df):
+    df = events_df.copy()
+    if "original_timestamp" not in df.columns:
+        df["original_timestamp"] = df["timestamp"]
+    if "original_activity" not in df.columns:
+        df["original_activity"] = df["activity"]
+    # source and source_event_key already present; keep them untouched
+    return df
+
+# ---------------------------------------------------------------------------
+# 1. Candidate-group pre-check (mandatory before any drop/merge call)
+# ---------------------------------------------------------------------------
+def candidate_duplicate_groups(events_df):
+    """Group only by (activity, timestamp); DOES NOT decide merging."""
+    groups = (
+        events_df.groupby(["activity", "timestamp"])["eid"]
+        .apply(list)
+        .reset_index()
+    )
+    return groups[groups["eid"].apply(len) > 1]
+
+# ---------------------------------------------------------------------------
+# 2. Custom verified-pair merge helper (used for e03/e04, e11/e16)
+# ---------------------------------------------------------------------------
+def merge_verified_pair(ocel, canonical_eid, absorbed_eid, rule_id, confidence):
+    """
+    Merges 'absorbed_eid' into 'canonical_eid':
+      - unions E2O relations
+      - keeps canonical row's core fields
+      - records provenance in a side audit table
+    """
+    ev = ocel.events
+    rel = ocel.relations
+
+    canon_row = ev[ev["eid"] == canonical_eid].iloc[0].to_dict()
+    absorbed_row = ev[ev["eid"] == absorbed_eid].iloc[0].to_dict()
+
+    # union of relations, deduplicated
+    rel_canon = rel[rel["eid"] == canonical_eid]
+    rel_abs = rel[rel["eid"] == absorbed_eid].copy()
+    rel_abs["eid"] = canonical_eid
+    merged_rel = pd.concat([rel, rel_abs]).drop_duplicates(
+        subset=["eid", "ocel:oid", "ocel:type"] if "ocel:type" in rel.columns
+        else ["eid", "ocel:oid"]
+    )
+
+    new_events = ev[ev["eid"] != absorbed_eid].copy()
+    ocel.events = new_events
+    ocel.relations = merged_rel
+
+    audit_row = {
+        "canonical_eid": canonical_eid,
+        "source_event_ids": [canon_row["source_event_key"], absorbed_row["source_event_key"]],
+        "merge_rule": rule_id,
+        "confidence": confidence,
+        "original_activity": [canon_row["original_activity"], absorbed_row["original_activity"]],
+        "original_timestamp": [canon_row["original_timestamp"], absorbed_row["original_timestamp"]],
+    }
+    ocel.audit_log = getattr(ocel, "audit_log", []) + [audit_row]
+    return ocel
+
+# ---------------------------------------------------------------------------
+# 3. Referential integrity check
+# ---------------------------------------------------------------------------
+def check_referential_integrity(ocel):
+    ev_ids = set(ocel.events["eid"])
+    rel_ev_ids = set(ocel.relations["eid"])
+    dangling = rel_ev_ids - ev_ids
+    assert not dangling, f"Dangling relations reference missing events: {dangling}"
+    obj_ids = set(ocel.objects["oid"])
+    rel_obj_ids = set(ocel.relations["ocel:oid"] if "ocel:oid" in ocel.relations else ocel.relations["oid"])
+    dangling_objs = rel_obj_ids - obj_ids
+    assert not dangling_objs, f"Dangling relations reference missing objects: {dangling_objs}"
+
+# ---------------------------------------------------------------------------
+# Scenario: CONSERVATIVE
+# ---------------------------------------------------------------------------
+ocel_conservative = fresh_copy(ocel_raw)
+ocel_conservative.events = stamp_provenance(ocel_conservative.events)
+
+candidates = candidate_duplicate_groups(ocel_conservative.events)
+print("Inspected candidate groups (not auto-merged):\n", candidates)
+
+# Verified, evidence-backed merges only
+ocel_conservative = merge_verified_pair(
+    ocel_conservative, canonical_eid="e03", absorbed_eid="e04",
+    rule_id="RULE-PHYSICAL-DUP-v1", confidence="high"
+)
+ocel_conservative = merge_verified_pair(
+    ocel_conservative, canonical_eid="e11", absorbed_eid="e16",
+    rule_id="RULE-INVOICE-KEY-MATCH-v1", confidence="high"
+)
+
+# Library call is justified here ONLY on a pre-filtered exact-duplicate slice
+# (none exist in this dataset beyond what we already handled manually,
+#  hence drop_duplicates is applied defensively on a strict key)
+ocel_conservative.events = pm4py.ocel_drop_duplicates(
+    ocel_conservative, strict_key=["source", "source_event_key", "payload_hash"]
+).events
+
+check_referential_integrity(ocel_conservative)
+
+# Deterministic ordering: attach a rank column BEFORE any timedelta trick
+ocel_conservative.events["tie_break_rank"] = ocel_conservative.events["eid"].map(
+    {  # from Section 3 domain resolution
+        "e03": 0, "e05": 1, "e06": 2, "e07": 3,
+        "e08": 0, "e09": 1, "e10": 2,
+        "e11": 0, "e12": 1, "e13": 2, "e14": 3, "e15": 4,
+    }
+).fillna(999)
+
+ocel_conservative = pm4py.ocel_sort_by_additional_column(
+    ocel_conservative, column="tie_break_rank", timestamp_column="timestamp"
+)
+
+# Only AFTER order is fixed, use index-based timedelta for tool compatibility
+ocel_conservative = pm4py.ocel_add_index_based_timedelta(ocel_conservative)
+
+# ---------------------------------------------------------------------------
+# Scenario: AGGRESSIVE LIBRARY MERGE  (documented as risky)
+# ---------------------------------------------------------------------------
+ocel_aggressive = fresh_copy(ocel_raw)
+ocel_aggressive.events = stamp_provenance(ocel_aggressive.events)
+
+print("WARNING: aggressive scenario merges purely on (activity, timestamp, "
+      "shared object), which is known to collapse e05 (I2 pick) and e14 (M2 "
+      "payment) unless explicitly excluded. Use only for sensitivity analysis.")
+
+protected_eids = {"e05", "e14"}  # constraint: never drop these
+ocel_aggressive_pre = ocel_aggressive.events[~ocel_aggressive.events["eid"].isin(protected_eids)]
+
+merged_part = pm4py.ocel_merge_duplicates(
+    fresh_copy(ocel_aggressive), match_on=["activity", "timestamp"]
+)
+# protected events re-attached after mechanical merge, to bound the damage
+merged_part.events = pd.concat(
+    [merged_part.events, ocel_aggressive.events[ocel_aggressive.events["eid"].isin(protected_eids)]]
+).drop_duplicates(subset=["eid"])
+
+check_referential_integrity(merged_part)
+ocel_aggressive = merged_part
+```
+
+## 7. Sensitivity analysis
+
+| Dimension | Raw | Conservative | Evidence-based | Aggressive library |
+|---|---|---|---|---|
+| Event count | 17 | 15 | 14 | ~9–10 |
+| E2O relations | inflated (duplicate rows for e03/e04, e11/e16) | correct union, no duplication | further reduced, still correct for merged pairs | Item I2 and Payment M2 relations silently lost |
+| Order-flattened DFG | extra parallel edges into "Pack Package"/"Dispatch Package" from duplicate rows | clean fan-in, harmonization-corrected labels | same as conservative plus one merged Pack node | collapsed nodes hide branching entirely |
+| Item-flattened DFG | correct for I1/I2 (raw preserves both picks) | correct | correct | I2's PickPack edge disappears if merge mis-scopes picks |
+| Payment-flattened DFG | shows AuthorizeCapture(M1) and isolated Capture(M2) branches | unchanged, correct | unchanged | branches merged into one node — M2 path vanishes |
+| OC-DFG edges/frequency | "Issue InvoiceAuthorize Payment" inflated to 2 | corrected to 1 | corrected to 1 | may be further conflated with Capture chain |
+| ET–OT weights | "Capture Payment"–"Payment" weight ambiguous (e15 has none) | correctly reflects 2 Payment-linked captures | same | collapses to 1, understating captures |
+| OTG relations | Order:Payment cardinality 1:2 correct | 1:2 preserved | 1:2 preserved | collapses to 1:1, invalidates split-payment detection |
+| Apparent rework/loops | false "Dispatch PackageDispatch Package" self-loop | loop eliminated via relabeling | loop eliminated | loop artificially eliminated by merging (masks true collision) |
+| Lifecycle/performance | ties give 0-duration or undefined durations | deterministic order without fabricated precision | same | synthetic node compresses multi-step duration into none |
+
+**Six edges/patterns whose interpretation changes:**
+1. `Pick Item  Pack Package` fan-in count (3 vs 2 vs 1 incoming picks).
+2. `Dispatch Package  Dispatch Package` self-loop (false rework vs corrected sequential step).
+3. `Pack Package  Pack Package` illusory loop from e06/e07 before qualifier fix.
+4. `Issue Invoice  Authorize Payment` OC-DFG edge frequency (2 vs 1).
+5. Payment-flattened `Authorize Payment  Capture Payment` branch count (2 branches vs 1 after aggressive merge).
+6. ET–OT weight `Capture Payment`–`Payment` (2 vs 1), affecting any "captures per order" KPI.
+
+## 8. Audit trail and reversibility
+
+Schema (one row per merge/refinement decision):
+
+```
+canonical_event_id, source_event_ids[], merge_rule_id, rule_version,
+reviewer_or_ruleset, original_activity[], refined_activity,
+original_timestamp[], adjusted_timestamp, tie_break_rank,
+attributes_retained{source: fields}, discarded_conflicts[],
+confidence, reason_text
+```
+
+Because the raw event table is never deleted — only referenced — an analyst can reconstruct the pre-merge view by joining `canonical_event_id` back to `source_event_ids`, retrieving each contributing row's `original_activity`, `original_timestamp`, `source`, and full payload from the immutable raw archive. Quarantined and unmerged ambiguous pairs remain visible in the audit log with `merge_rule_id = null`, `confidence = low`, allowing filtering to a "fully raw," "conservative," or "aggressive" view on demand.
+
+## 9. Failure modes and safeguards
+
+1. **Collapsing distinct partial payments** (M1/M2) into one event — safeguard: never merge on shared coarse objects alone; require agreement at the activity's core object type.
+2. **Converting abstraction-level updates into false rework** — safeguard: qualifier-label summary vs detail events instead of treating repeats as loops.
+3. **Ordering by ingestion time** — safeguard: ingestion time only as last-resort deterministic fallback, documented as non-semantic.
+4. **Treating shared objects as proof of duplication** — safeguard: object-type-specific matching, not blanket overlap.
+5. **Unioning incompatible E2O relations** during merge (attaching both M1 and M2 to one merged event) — safeguard: reject merge if relation sets conflict at the core object type rather than union blindly.
+6. **Changing durations through synthetic microseconds** — safeguard: keep timestamp ties intact; store ordering rank separately.
+7. **Losing source-authoritative attributes** via naive first-row-wins deduplication — safeguard: field-level attribute provenance, not row replacement.
+8. **Applying duplicate-removal functions to the whole OCEL without inspecting candidate groups** — safeguard: mandatory pre-check listing groups before any drop/merge call.
+9. **Comparing `source_seq` across different source systems** as if globally ordered — safeguard: scope sequence comparisons to within-source only.
+10. **Silently discarding original harmonized/source activity labels**, foreclosing future re-analysis of harmonization collisions — safeguard: always retain `original_activity` and `source` columns.
