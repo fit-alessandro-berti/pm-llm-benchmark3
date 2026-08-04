@@ -4,11 +4,135 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 
 | Model                          | Score    | OS                 | LRM | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
 | ------------------------------ | -------- | ------------------ | --- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
-| ministral-14b-2512             | **22.7** | :white_check_mark: | :x: | **2.7**              | :mage_woman: **2.1** | 2.4                  | :mage_woman: **2.1** | :mage_woman: **2.5** | :mage_woman: **3.1** | :mage_woman: **4.0** | :mage_woman: **3.8** |
-| ministral-8b-2512              | **22.3** | :white_check_mark: | :x: | :mage_woman: **2.9** | :mage_woman: **2.1** | :mage_woman: **2.8** | **1.9**              | **2.3**              | **3.0**              | **3.7**              | **3.5**              |
-| ibm-granitegranite-4.1-8b      | **21.1** | :white_check_mark: | :x: | **2.6**              | **1.9**              | 2.2                  | :mage_woman: **2.1** | :mage_woman: **2.5** | :mage_woman: **3.1** | 2.9                  | :mage_woman: **3.8** |
+| mistral-large-2512             | **28.5** | :white_check_mark: | :x: | :mage_woman: **4.2** | :mage_woman: **2.7** | :mage_woman: **3.5** | :mage_woman: **2.8** | :mage_woman: **3.3** | :mage_woman: **3.3** | :mage_woman: **4.4** | :mage_woman: **4.3** |
+| mistral-small-2603             | **23.8** | :white_check_mark: | :x: | 3.1                  | 2.0                  | 3.1                  | 2.3                  | 2.8                  | 2.9                  | 3.6                  | **4.0**              |
+| ministral-14b-2512             | **22.7** | :white_check_mark: | :x: | 2.7                  | 2.1                  | 2.4                  | 2.1                  | 2.5                  | **3.1**              | 4.0                  | 3.8                  |
+| ministral-8b-2512              | **22.3** | :white_check_mark: | :x: | 2.9                  | 2.1                  | 2.8                  | 1.9                  | 2.3                  | **3.0**              | 3.7                  | 3.5                  |
+| ibm-granitegranite-4.1-8b      | **21.1** | :white_check_mark: | :x: | 2.6                  | 1.9                  | 2.2                  | 2.1                  | 2.5                  | **3.1**              | 2.9                  | 3.8                  |
 | ministral-3b-2512              | **18.5** | :white_check_mark: | :x: | 2.3                  | 1.6                  | 2.1                  | 1.6                  | 2.0                  | 2.2                  | 3.3                  | 3.4                  |
 | ibm-granitegranite-4.0-h-micro | **13.6** | :white_check_mark: | :x: | 1.5                  | 1.4                  | 1.4                  | 1.4                  | 1.7                  | 1.7                  | 2.4                  | 2.1                  |
+
+### mistral-large-2512   => 28.5 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 8.4   |
+| cat01_02_staggered_automation                  | 5.2   |
+| cat01_03_flag_mediation                        | 5.0   |
+| cat01_04_conformance_root_cause                | 7.0   |
+| cat01_05_mixed_drift_attribution               | 5.0   |
+| cat01_06_intervention_transportability         | 5.5   |
+| cat01_07_case_counterfactuals                  | 6.0   |
+| cat02_01_reconstruct_partial_queue             | 3.0   |
+| cat02_02_infer_queue_disciplines               | 3.0   |
+| cat02_03_fork_join_delay_decomposition         | 4.2   |
+| cat02_04_batching_vs_bulk_logging              | 3.8   |
+| cat02_05_nonstationary_queue_regimes           | 6.0   |
+| cat02_06_sla_survival_censoring                | 4.0   |
+| cat02_07_robust_multiskill_staffing            | 3.0   |
+| cat03_01_case_notion_tradeoffs                 | 5.0   |
+| cat03_02_relation_repair                       | 5.2   |
+| cat03_03_cross_instance_bottlenecks            | 6.0   |
+| cat03_04_incomplete_norm_conformance           | 5.2   |
+| cat03_05_execution_equivalence_clustering      | 4.0   |
+| cat03_06_compact_ocel_pipeline                 | 4.0   |
+| cat03_07_duplicate_tie_cleaning                | 5.5   |
+| cat04_01_dual_formalism_synthesis              | 3.0   |
+| cat04_02_unsound_petri_net_repair              | 6.0   |
+| cat04_03_hybrid_procedural_declarative         | 3.5   |
+| cat04_04_sparse_evidence_model_completion      | 3.0   |
+| cat04_05_behavioral_equivalence_simplification | 3.0   |
+| cat04_06_conversion_semantic_loss_audit        | 5.0   |
+| cat04_07_adversarial_model_review              | 4.0   |
+| cat05_01_norm_hierarchy_conflicts              | 5.0   |
+| cat05_02_compensating_controls                 | 7.0   |
+| cat05_03_data_aware_obligations                | 3.0   |
+| cat05_04_uncertain_temporal_conformance        | 3.0   |
+| cat05_05_delegation_resource_conformance       | 4.2   |
+| cat05_06_alignment_business_severity           | 6.0   |
+| cat05_07_normative_model_dialectic             | 5.2   |
+| cat06_01_latent_state_next_event               | 4.0   |
+| cat06_02_competing_clocks_remaining_time       | 4.0   |
+| cat06_03_censored_outcome_study                | 4.0   |
+| cat06_04_capacity_aware_early_warning          | 4.0   |
+| cat06_05_process_aware_explanation_audit       | 6.0   |
+| cat06_06_conformant_next_best_action           | 4.0   |
+| cat06_07_process_evidence_drift_diagnosis      | 7.0   |
+| cat07_01_reconcile_org_networks                | 7.1   |
+| cat07_02_formal_shadow_roles                   | 6.2   |
+| cat07_03_collusion_or_necessity                | 6.2   |
+| cat07_04_procedural_fairness_complexity        | 6.2   |
+| cat07_05_learning_fatigue_queue_pressure       | 6.0   |
+| cat07_06_dynamic_resource_assignment           | 5.0   |
+| cat07_07_restructuring_impact                  | 7.1   |
+| cat08_01_conflicting_evidence_redesign         | 6.2   |
+| cat08_02_demand_shock_robustness               | 7.0   |
+| cat08_03_automation_portfolio_dependencies     | 4.0   |
+| cat08_04_sustainability_redesign               | 7.0   |
+| cat08_05_disruption_resilience_recovery        | 7.1   |
+| cat08_06_digital_twin_experiments              | 5.2   |
+| cat08_07_contradictory_evidence_memo           | 7.0   |
+
+### mistral-small-2603   => 23.8 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 4.0   |
+| cat01_02_staggered_automation                  | 5.0   |
+| cat01_03_flag_mediation                        | 3.5   |
+| cat01_04_conformance_root_cause                | 4.0   |
+| cat01_05_mixed_drift_attribution               | 6.2   |
+| cat01_06_intervention_transportability         | 4.5   |
+| cat01_07_case_counterfactuals                  | 3.5   |
+| cat02_01_reconstruct_partial_queue             | 2.0   |
+| cat02_02_infer_queue_disciplines               | 3.0   |
+| cat02_03_fork_join_delay_decomposition         | 2.0   |
+| cat02_04_batching_vs_bulk_logging              | 3.2   |
+| cat02_05_nonstationary_queue_regimes           | 3.0   |
+| cat02_06_sla_survival_censoring                | 3.0   |
+| cat02_07_robust_multiskill_staffing            | 4.0   |
+| cat03_01_case_notion_tradeoffs                 | 4.0   |
+| cat03_02_relation_repair                       | 4.0   |
+| cat03_03_cross_instance_bottlenecks            | 6.0   |
+| cat03_04_incomplete_norm_conformance           | 4.0   |
+| cat03_05_execution_equivalence_clustering      | 4.0   |
+| cat03_06_compact_ocel_pipeline                 | 5.0   |
+| cat03_07_duplicate_tie_cleaning                | 4.0   |
+| cat04_01_dual_formalism_synthesis              | 3.0   |
+| cat04_02_unsound_petri_net_repair              | 3.0   |
+| cat04_03_hybrid_procedural_declarative         | 4.0   |
+| cat04_04_sparse_evidence_model_completion      | 3.0   |
+| cat04_05_behavioral_equivalence_simplification | 3.0   |
+| cat04_06_conversion_semantic_loss_audit        | 3.0   |
+| cat04_07_adversarial_model_review              | 4.0   |
+| cat05_01_norm_hierarchy_conflicts              | 4.0   |
+| cat05_02_compensating_controls                 | 6.0   |
+| cat05_03_data_aware_obligations                | 3.0   |
+| cat05_04_uncertain_temporal_conformance        | 2.5   |
+| cat05_05_delegation_resource_conformance       | 3.0   |
+| cat05_06_alignment_business_severity           | 3.0   |
+| cat05_07_normative_model_dialectic             | 6.2   |
+| cat06_01_latent_state_next_event               | 4.0   |
+| cat06_02_competing_clocks_remaining_time       | 3.0   |
+| cat06_03_censored_outcome_study                | 4.0   |
+| cat06_04_capacity_aware_early_warning          | 3.5   |
+| cat06_05_process_aware_explanation_audit       | 5.2   |
+| cat06_06_conformant_next_best_action           | 3.0   |
+| cat06_07_process_evidence_drift_diagnosis      | 6.2   |
+| cat07_01_reconcile_org_networks                | 7.1   |
+| cat07_02_formal_shadow_roles                   | 4.0   |
+| cat07_03_collusion_or_necessity                | 3.5   |
+| cat07_04_procedural_fairness_complexity        | 6.0   |
+| cat07_05_learning_fatigue_queue_pressure       | 6.2   |
+| cat07_06_dynamic_resource_assignment           | 3.0   |
+| cat07_07_restructuring_impact                  | 6.0   |
+| cat08_01_conflicting_evidence_redesign         | 6.2   |
+| cat08_02_demand_shock_robustness               | 6.0   |
+| cat08_03_automation_portfolio_dependencies     | 4.0   |
+| cat08_04_sustainability_redesign               | 6.0   |
+| cat08_05_disruption_resilience_recovery        | 7.0   |
+| cat08_06_digital_twin_experiments              | 5.2   |
+| cat08_07_contradictory_evidence_memo           | 6.0   |
 
 ### ministral-14b-2512   => 22.7 points
 
