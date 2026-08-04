@@ -1,0 +1,297 @@
+# **1. Duplicate-handling Decision Tree**
+
+```
+
+                     DUPLICATE HANDLING DECISION TREE                          
+
+                                                                               
+    
+                       START: Event Candidates                                
+    
+                                                                               
+    
+    Do events share identical `eid`, `timestamp`, `activity`, and `payload_hash`?   
+    
+      
+      YES  Exact technical duplicate (e.g., ingestion artifact)              
+       DROP (all but one, preserving provenance)                            
+      
+                                                                             
+      
+      NO  Do events share `timestamp`, `activity`, and `related_objects`?   
+      
+                                                                             
+      
+       Same physical event (e.g., e03/e04)  MERGE ATTRIBUTES (WMS enriches)   
+       Harmonization collision (e.g., e08/e09)  RETAIN BOTH WITH QUALIFIERS   
+       Concurrent distinct events (e.g., e03/e05)  RETAIN BOTH UNCHANGED     
+      
+                                                                             
+      
+       Summary vs. detailed event (e.g., e06/e07)  RETAIN BOTH WITH LINK   
+       Invoice duplicates (e.g., e11/e16)  MERGE RELATIONS (V1 canonical)   
+      
+                                                                             
+      
+       No clear relationship  QUARANTINE FOR REVIEW                        
+      
+    
+```
+
+---
+
+## **2. Event-by-Event Decisions**
+
+| Event(s)       | Candidate Relationship                                                                 | Decision                                                                                     | Confidence | Canonical eid | Attribute Merge Policy                          | Relation Merge Policy                          | Provenance Retained | Main Risk                                                                 |
+|----------------|---------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------|------------|---------------|--------------------------------------------------|--------------------------------------------------|----------------------|----------------------------------------------------------------------------|
+| e03/e04        | Same physical scan (WMS enriches with location)                                       | Merge attributes (WMS payloads take precedence)                                             | High       | e03           | WMS attributes + SCANNER `source_seq`            | Retain both `related_objects` (I1, P1)         | Yes                  | Losing SCANNER provenance if not documented                                        |
+| e03/e05        | Concurrent picks (I1 vs. I2)                                                          | Retain both unchanged                                                                         | High       | None          | None                                             | None                                             | Yes                  | None                                                                         |
+| e06/e07        | WMS detail vs. ERP summary (same business transition)                                  | Retain both with `is_detailed` flag (e06) and `is_summary` (e07)                           | Medium     | e06           | ERP `source_seq` + WMS `payload_hash`            | Retain both `related_objects` (O1, I1, I2, P1) | Yes                  | Misinterpreting as rework if not linked                                            |
+| e08/e09        | Carrier acceptance vs. dispatch (harmonized labels)                                   | Retain both with `carrier_activity_type` qualifier (e08: "released", e09: "accepted")       | High       | e08           | WMS `source_seq` + CARRIER `payload_hash`        | Retain both `related_objects` (O1, P1, D1)     | Yes                  | Incorrectly treating as duplicate if labels are identical                     |
+| e09/e10        | Carrier acceptance  handover (lifecycle constraint)                                 | Retain both (e09 must precede e10)                                                         | High       | e09           | None                                             | None                                             | Yes                  | Ordering violation if ingestion time is used                                      |
+| e11/e16        | Same invoice (ERP vs. BILLING authoritative)                                          | Merge relations (V1 canonical), retain ERP attributes                                       | High       | e11           | ERP `payload_hash` + BILLING `source_seq`        | BILLING relations dropped (ERP authoritative)   | Yes                  | Losing BILLING-specific attributes if not preserved                            |
+| e13/e14        | Distinct payments (M1 vs. M2)                                                         | Retain both (share O1, V1 but different `related_objects`)                                  | High       | None          | None                                             | None                                             | Yes                  | Collapsing into a single payment if `have_common_object=True` is used alone   |
+| e13/e15        | Payment capture vs. ERP summary (ERP aggregates)                                      | Retain both (e15 is summary, e13 is detailed)                                              | Medium     | e13           | ERP `source_seq` + PSP `payload_hash`            | Retain both (e15 lacks Payment object)         | Yes                  | Misinterpreting as rework if not linked                                            |
+
+---
+
+## **3. Timestamp-Tie Ordering Rules**
+
+### **Deterministic Partial-Order-to-Total-Order Policy**
+1. **Domain Constraints** (semantic):
+   - `e12` must precede `e13` for `M1`.
+   - `e09` must precede `e10` (carrier handover).
+   - `e03` must precede `e06` (pick  pack).
+
+2. **Within-Source Sequence** (deterministic):
+   - Use `source_seq` for events from the same source (e.g., ERP `source_seq` for e01, e02).
+
+3. **Lifecycle Constraints** (semantic):
+   - For shared objects (e.g., `P1`), enforce logical precedence (e.g., `e06`  `e08`).
+
+4. **Source-Specific Semantics** (deterministic):
+   - PSP events (`e12`, `e13`, `e14`) are ordered by `source_seq` (e12 < e13 < e14).
+
+5. **Ingestion Time** (fallback, not primary):
+   - Only used if all else fails (e.g., `ingested_at` for e04 vs. e05).
+
+6. **Stable Fallback** (deterministic):
+   - `eid` lexicographical order if all else is equal.
+
+### **Why Microseconds Are Risky**
+Adding microseconds (e.g., `ingested_at`) to enforce order can **artificially break concurrency** (e.g., `e03` and `e05` at 10:00:00). This may distort lifecycle analysis (e.g., appearing as rework when they are parallel).
+
+### **Admissible Orders**
+- **e03–e07 at 10:00**:
+  `e03 (WMS pick)  e04 (SCANNER pick, merged)  e05 (SCANNER pick I2)  e06 (WMS pack)  e07 (ERP summary)`
+  *(e06 must precede e07 due to WMS  ERP message flow.)*
+
+- **e08–e10 at 10:15**:
+  `e08 (WMS dispatch)  e09 (CARRIER accept)  e10 (CARRIER handover)`
+  *(e09 must precede e10 by lifecycle constraint.)*
+
+- **e11–e16 at 12:00**:
+  `e11 (ERP invoice)  e12 (PSP auth M1)  e13 (PSP capture M1)  e14 (PSP capture M2)  e16 (BILLING invoice)  e15 (ERP summary)`
+  *(e11/e16 merged under V1; e13/e14 retained separately.)*
+
+---
+
+## **4. Conservative Cleaning Pipeline**
+
+### **Steps:**
+1. **Exact Duplicates**: Drop all but one (e.g., if `payload_hash` and `source_event_key` are identical).
+2. **Same-Physical-Event Merges**: Merge `e03`/`e04` (WMS enriches SCANNER).
+3. **Concurrent Events**: Retain `e03`/`e05`/`e06`/`e07` separately.
+4. **Harmonization Collisions**: Retain `e08`/`e09` with qualifiers.
+5. **Lifecycle Enforcement**: Use `source_seq` + domain rules (e.g., `e09`  `e10`).
+6. **Invoice Merges**: Merge `e11`/`e16` under `V1` (ERP authoritative).
+7. **Ordering**: Apply rules above; use `source_seq` for ties.
+
+### **Expected Retained Events**:
+- **Original**: 17 events.
+- **After conservative cleaning**: ~12–14 events (e.g., e03/e04 merged, e11/e16 merged, others retained).
+
+---
+
+## **5. Aggressive Alternatives**
+
+### **A. Evidence-Based Semantic Merging**
+- **Merge Policy**: Use `related_objects` + `activity` + `source` to infer relationships.
+  - Example: `e06`/`e07` merged if `related_objects` are identical and `source` is different.
+- **Risk**: Over-merging (e.g., `e13`/`e14` if only `O1`/`V1` are checked).
+- **Expected Events**: ~8–10 (aggressive merging of summaries/details).
+- **Damage**: Losing granularity (e.g., `e06` vs. `e07` distinctions).
+
+### **B. Mechanically Aggressive PM4Py Merging**
+- **Use**: `pm4py.ocel_merge_duplicates(ocel, key_columns=['timestamp', 'activity'])`.
+- **Risk**: Merges `e03`/`e05` (same activity/timestamp but distinct items).
+- **Expected Events**: ~5–7 (highly aggressive).
+- **Damage**: Collapsing `e13`/`e14` into a single payment (losing `M1`/`M2` distinction).
+
+**Why `have_common_object=True` Fails for `e13`/`e14`**:
+- Both share `O1`/`V1`, but `e13` relates to `M1` and `e14` to `M2`. Merging would lose payment granularity.
+
+---
+
+## **6. PM4Py-Oriented Python Implementation**
+
+```python
+import pm4py
+import pandas as pd
+from copy import deepcopy
+
+def clean_ocel_conservative(ocel_raw):
+    # Step 1: Drop exact duplicates (same payload_hash + source_event_key)
+    exact_duplicates = ocel_raw.duplicated(
+        subset=['payload_hash', 'source_event_key'],
+        keep=False
+    )
+    ocel_clean = ocel_raw[~exact_duplicates].copy()
+
+    # Step 2: Merge e03/e04 (same physical event, WMS enriches)
+    verified_pairs = {
+        ('e03', 'e04'): {
+            'merge_rule': 'WMS_enrichment',
+            'canonical': 'e03',
+            'attributes': ['payload_hash', 'related_objects']
+        }
+    }
+    for eid1, eid2 in verified_pairs:
+        mask = (ocel_clean['eid'].isin([eid1, eid2]))
+        events = ocel_clean[mask].copy()
+        canonical = events[events['eid'] == verified_pairs[(eid1, eid2)]['canonical']]
+        other = events[events['eid'] != canonical['eid'].iloc[0]]
+        # Merge attributes (WMS takes precedence)
+        merged = canonical.copy()
+        merged['payload_hash'] = canonical['payload_hash'].iloc[0]  # WMS hash
+        merged['related_objects'] = canonical['related_objects'].iloc[0]
+        ocel_clean = ocel_clean.drop(mask).append(merged)
+
+    # Step 3: Merge e11/e16 (same invoice, ERP authoritative)
+    invoice_pairs = {
+        ('e11', 'e16'): {
+            'canonical': 'e11',
+            'merge_rule': 'invoice_canonical',
+            'attributes': ['payload_hash']
+        }
+    }
+    for eid1, eid2 in invoice_pairs:
+        mask = (ocel_clean['eid'].isin([eid1, eid2]))
+        events = ocel_clean[mask].copy()
+        canonical = events[events['eid'] == invoice_pairs[(eid1, eid2)]['canonical']]
+        other = events[events['eid'] != canonical['eid'].iloc[0]]
+        merged = canonical.copy()
+        merged['related_objects'] = canonical['related_objects'].iloc[0]  # Keep ERP
+        ocel_clean = ocel_clean.drop(mask).append(merged)
+
+    # Step 4: Enforce lifecycle constraints (e09  e10)
+    lifecycle_rules = {
+        ('e09', 'e10'): 'carrier_handover'
+    }
+    for eid1, eid2 in lifecycle_rules:
+        e1 = ocel_clean[ocel_clean['eid'] == eid1].iloc[0]
+        e2 = ocel_clean[ocel_clean['eid'] == eid2].iloc[0]
+        if e1['timestamp'] > e2['timestamp']:
+            # Swap if ingestion time violates lifecycle
+            ocel_clean.loc[ocel_clean['eid'] == eid1, 'timestamp'] = e2['timestamp']
+            ocel_clean.loc[ocel_clean['eid'] == eid2, 'timestamp'] = e1['timestamp']
+
+    # Step 5: Order by rules
+    ocel_ordered = pm4py.ocel_sort_by_additional_column(
+        ocel_clean,
+        column_name='timestamp',
+        additional_columns=['source_seq', 'source', 'related_objects']
+    )
+    return ocel_ordered
+
+def aggressive_merge(ocel_raw):
+    # WARNING: Aggressive merging may lose granularity!
+    ocel_merged = pm4py.ocel_merge_duplicates(
+        ocel_raw,
+        key_columns=['timestamp', 'activity'],
+        merge_attributes=['payload_hash', 'related_objects'],
+        merge_relations=True
+    )
+    return ocel_merged
+
+# Example usage
+ocel_raw = pd.read_csv("ocel_events.csv")
+ocel_conservative = clean_ocel_conservative(deepcopy(ocel_raw))
+ocel_aggressive = aggressive_merge(deepcopy(ocel_raw))
+```
+
+---
+
+## **7. Sensitivity Analysis**
+
+| Dataset               | Event Count | E2O Relations | Order-Flattened DFG Changes                          | Key Interpretation Risks                          |
+|-----------------------|-------------|---------------|----------------------------------------------------|---------------------------------------------------|
+| **Raw**               | 17          | 25            | High concurrency, unclear duplicates               | e03/e04, e11/e16, e13/e14 ambiguous                 |
+| **Conservative**      | ~12–14      | ~18–20        | Retains parallelism, enforces lifecycle            | e06/e07 may appear as rework if not linked         |
+| **Evidence-Based**    | ~8–10       | ~12–15        | Over-merges summaries/details                      | e13/e14 collapsed into single payment             |
+| **Aggressive PM4Py**   | ~5–7        | ~8–10         | Loses granularity, artificial dependencies         | e03/e05 merged incorrectly                          |
+
+**Concrete Edges/Patterns Affected**:
+1. `e03  e06` (pick  pack) may appear as rework if `e06` is merged with `e07`.
+2. `e12  e13` (auth  capture) may be lost if `e13`/`e14` are merged.
+3. `e08  e10` (dispatch  handover) may be violated if ingestion time is used.
+4. `e11  e15` (invoice  summary) may appear as rework if not linked.
+5. `e09` and `e10` may be incorrectly ordered if lifecycle rules are ignored.
+6. `e13` and `e14` may be collapsed into a single payment if only `O1`/`V1` are checked.
+
+---
+
+## **8. Audit Trail and Reversibility**
+
+### **Provenance Schema**:
+```python
+{
+    "canonical_eid": str,
+    "source_eids": list[str],
+    "merge_rule": str,  # e.g., "WMS_enrichment", "invoice_canonical"
+    "reviewer": str,
+    "original_activity": str,
+    "refined_activity": str,
+    "original_timestamp": str,
+    "adjusted_timestamp": str,
+    "attributes_merged": dict[str, str],  # {source: attribute}
+    "relations_discarded": list[str],
+    "confidence": float,
+    "reason": str
+}
+```
+
+### **Reconstruction**:
+- Store raw events in a time-series DB with provenance links.
+- Use `ocel_raw` + audit log to reconstruct any cleaned version.
+
+---
+
+## **9. Failure Modes and Safeguards**
+
+1. **Collapsing Distinct Payments** (*Risk*: `e13`/`e14` merged).
+   - *Safeguard*: Explicitly check `related_objects` for `Payment` objects.
+
+2. **Converting Abstraction Updates to Rework** (*Risk*: `e06`/`e07` misordered).
+   - *Safeguard*: Use `source` + `related_objects` to infer hierarchy.
+
+3. **Ordering by Ingestion Time** (*Risk*: `e09`  `e10` reversed).
+   - *Safeguard*: Enforce lifecycle constraints before ordering.
+
+4. **Treating Shared Objects as Proof of Duplication** (*Risk*: `e13`/`e14` merged).
+   - *Safeguard*: Require `related_objects` to match **and** `activity` to differ.
+
+5. **Unioning Incompatible E2O Relations** (*Risk*: `e06`/`e07` relations merged incorrectly).
+   - *Safeguard*: Validate referential integrity post-merge.
+
+6. **Changing Durations via Synthetic Microseconds** (*Risk*: Artificial delays).
+   - *Safeguard*: Never modify `original_timestamp`.
+
+7. **Losing Source-Authoritative Attributes** (*Risk*: `e16` attributes dropped).
+   - *Safeguard*: Preserve `source` + `payload_hash` in audit log.
+
+8. **Applying Duplicate Functions Blindly** (*Risk*: `e03`/`e05` merged).
+   - *Safeguard*: Pre-check candidate groups manually.
+
+---
+**Final Note**: The conservative pipeline minimizes risk but may retain ambiguity. Aggressive methods risk semantic damage but reduce event count. Always validate lifecycle constraints post-ordering.

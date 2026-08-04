@@ -1,0 +1,261 @@
+# **Cleaning and Ordering Pipeline for OCEL Integration**
+
+This design addresses the challenges of harmonizing heterogeneous event logs while preserving semantic integrity, provenance, and deterministic ordering. The pipeline balances conservative and aggressive approaches, ensuring minimal semantic damage while enabling analysis.
+
+---
+
+## **1. Duplicate-Handling Decision Tree**
+
+The decision tree distinguishes between technical duplicates, semantic duplicates, and distinct but harmonized events. Each terminal node specifies an action (drop, merge, retain, quarantine) with justification.
+
+```mermaid
+graph TD
+    A[Event Pair] --> B{Technical Duplicate?}
+    B -->|Yes| C[Drop one, retain provenance]
+    B -->|No| D{Same Physical Event?}
+    D -->|Yes| E[Merge attributes, retain both with qualifiers]
+    D -->|No| F{Summary of Detailed Event?}
+    F -->|Yes| G[Retain both, refine labels]
+    F -->|No| H{Harmonization Collision?}
+    H -->|Yes| I[Retain both, add source-specific qualifiers]
+    H -->|No| J{Concurrent Same-Label Events?}
+    J -->|Yes| K[Retain both, order deterministically]
+    J -->|No| L[Unresolved Candidate]
+    L -->|Quarantine| M[Review manually]
+```
+
+### **Terminal Decisions**
+| **Case**                     | **Action**                          | **Justification**                                                                 |
+|------------------------------|-------------------------------------|-----------------------------------------------------------------------------------|
+| **Exact technical duplicate** | Drop one, retain provenance         | Identical `payload_hash`, `timestamp`, `activity`, and `related_objects`.         |
+| **Same physical event**      | Merge attributes, retain both      | e.g., `e03/e04` (same scan, different payloads). Retain both with qualifiers.     |
+| **Summary event**            | Retain both, refine labels         | e.g., `e06/e07` (WMS detail vs. ERP summary). Keep both but label clearly.        |
+| **Harmonization collision**  | Retain both, add source qualifiers  | e.g., `e08/e09` (WMS "release" vs. carrier "accept"). Keep both with metadata.     |
+| **Concurrent events**        | Retain both, order deterministically | e.g., `e13/e14` (different payments at same time). Use lifecycle constraints.     |
+| **Unresolved**               | Quarantine for review               | Ambiguous cases (e.g., `e06/e07` if no reconciliation data).                     |
+
+---
+
+## **2. Event-by-Event Decisions**
+
+| **Event(s)**       | **Candidate Relationship**                          | **Decision**                          | **Confidence** | **Canonical eid** | **Attribute Merge Policy**                     | **Relation Merge Policy**                     | **Provenance Retained** | **Main Risk**                          |
+|--------------------|----------------------------------------------------|---------------------------------------|----------------|-------------------|-----------------------------------------------|---------------------------------------------|------------------------|----------------------------------------|
+| **e03/e04**        | Same physical scan (WMS vs. Scanner)                | Retain both, merge payloads          | High           | e03 (WMS)        | Prefer WMS location, keep scanner raw data   | Keep both `Pick Item` relations           | Full provenance      | Overwriting scanner data if not careful |
+| **e03/e05**        | Same timestamp, different items (I1 vs. I2)         | Retain both                          | High           | e03, e05         | No merge                          | Keep distinct `Pick Item` relations       | Full provenance      | None                                  |
+| **e06/e07**        | WMS detail vs. ERP summary                           | Retain both, refine labels           | Medium         | e06 (detail), e07 (summary) | Keep WMS detail, ERP summary as metadata | Keep both `Pack Package` relations       | Full provenance      | Misinterpreting summary as detail     |
+| **e08/e09**        | WMS "release" vs. carrier "accept" (harmonized)    | Retain both, add source qualifiers    | High           | e08, e09         | No merge                          | Keep distinct `Dispatch Package` relations | Full provenance      | False causality if not ordered correctly |
+| **e09/e10**        | Carrier acceptance vs. handover (lifecycle order)  | Retain both, enforce order           | High           | e09  e10        | No merge                          | Keep sequential relation               | Full provenance      | Incorrect order if not enforced          |
+| **e11/e16**        | Same invoice (ERP vs. Billing)                      | Merge attributes, retain both        | High           | e11 (ERP)        | Prefer ERP for financials, Billing for tax   | Keep single `Issue Invoice` relation      | Full provenance      | Losing authoritative attributes         |
+| **e13/e14**        | Different payments (M1 vs. M2)                      | Retain both                          | High           | e13, e14         | No merge                          | Keep distinct `Capture Payment` relations | Full provenance      | None                                  |
+| **e13/e15**        | Payment vs. ERP summary                             | Retain both, refine labels           | Medium         | e13 (detail), e15 (summary) | Keep PSP detail, ERP summary as metadata | Keep both relations               | Full provenance      | Misinterpreting summary as payment     |
+
+---
+
+## **3. Timestamp-Tie Ordering Rules**
+
+### **Deterministic Partial-Order-to-Total-Order Policy**
+1. **Domain Constraints** (semantic):
+   - `e09` (carrier acceptance) must precede `e10` (handover).
+   - `e12` (authorize) must precede `e13` (capture) for `M1`.
+2. **Within-Source Sequence** (deterministic):
+   - Use `source_seq` if no other constraints apply.
+3. **Lifecycle Constraints** (semantic):
+   - `Create Order`  `Validate Order`  `Pick Item`  `Pack Package`  `Dispatch Package`.
+4. **Source-Specific Semantics** (deterministic):
+   - WMS events (`e03–e07`) are more detailed; prioritize them over ERP summaries.
+5. **Ingestion Time** (fallback, not primary):
+   - Only used if no other rules apply (violates business order).
+6. **Stable Fallback Order** (deterministic):
+   - If all else fails, sort by `eid` (arbitrary but reproducible).
+
+### **Why Microseconds Are Dangerous**
+Adding microseconds to break ties can introduce false causality. For example:
+- If `e03` (WMS) and `e04` (Scanner) are assigned `10:00:00.001` and `10:00:00.002`, it implies WMS preceded Scanner, even if they occurred simultaneously.
+
+### **Intended Orders**
+| **Group**       | **Order**                                                                 |
+|-----------------|---------------------------------------------------------------------------|
+| **e03–e07**     | `e03` (WMS Pick I1)  `e04` (Scanner Pick I1)  `e05` (Scanner Pick I2)  `e06` (WMS Pack)  `e07` (ERP Pack Summary) |
+| **e08–e10**     | `e08` (WMS Dispatch)  `e09` (Carrier Accept)  `e10` (Carrier Handover) |
+| **e11–e16**     | `e11` (ERP Invoice)  `e16` (Billing Invoice)  `e12` (Authorize M1)  `e13` (Capture M1)  `e14` (Capture M2)  `e15` (ERP Payment Summary) |
+
+---
+
+## **4. Conservative Cleaning Pipeline**
+
+### **Steps**
+1. **Identify Exact Technical Duplicates** (same `payload_hash`, `timestamp`, `activity`, `related_objects`).
+   - Drop one, retain provenance.
+2. **Merge Same-Physical-Event Pairs** (e.g., `e03/e04`).
+   - Merge payloads, retain both with qualifiers.
+3. **Retain Summary Events** (e.g., `e07`).
+   - Keep both but label clearly (e.g., `Pack Package (Summary)`).
+4. **Enforce Lifecycle Order** (e.g., `e09`  `e10`).
+5. **Deterministic Tie-Breaking** (use `source_seq` or domain rules).
+6. **Preserve Original Timestamps** (do not modify `timestamp`).
+
+### **Expected Retained Event Count**
+- **Original:** 17 events.
+- **After Conservative Cleaning:** ~15 events (drops exact duplicates, retains all others).
+
+---
+
+## **5. Aggressive Alternatives**
+
+### **A. Evidence-Based Semantic Merging**
+- **Action:** Merge `e11/e16` (same invoice), `e06/e07` (packing detail/summary).
+- **Retained Events:** ~12.
+- **Semantic Damage:**
+  - Losing source-authoritative attributes (e.g., ERP vs. Billing invoice details).
+  - Risk of over-merging (e.g., treating `e13/e14` as duplicates).
+
+### **B. Mechanically Aggressive PM4Py Merging**
+- **Action:** Use `pm4py.ocel_merge_duplicates` on all events with same `activity` and `timestamp`.
+- **Retained Events:** ~10.
+- **Semantic Damage:**
+  - Collapsing distinct payments (`e13/e14`).
+  - False rework loops (e.g., merging `e08/e09` as a single "Dispatch").
+
+### **Why `have_common_object=True` Is Not Enough**
+- `e13` and `e14` share `O1` and `V1` but represent different `Payment` objects (`M1` vs. `M2`).
+- Merging them would incorrectly suggest a single payment was captured twice.
+
+---
+
+## **6. PM4Py-Oriented Python Implementation**
+
+```python
+import pm4py
+from pm4py.objects.ocel.util import dataframe_utils
+from pm4py.objects.ocel.objects import OCEL
+from copy import deepcopy
+
+# Load raw OCEL
+ocel_raw = pm4py.read_ocel("raw.ocel")
+
+# --- Conservative Pipeline ---
+ocel_conservative = deepcopy(ocel_raw)
+
+# Step 1: Drop exact technical duplicates (same payload_hash, timestamp, activity, related_objects)
+exact_duplicates = ocel_conservative.events[
+    ocel_conservative.events.duplicated(subset=['payload_hash', 'timestamp', 'activity', 'related_objects'], keep=False)
+]
+ocel_conservative.events = ocel_conservative.events.drop(index=exact_duplicates.index)
+
+# Step 2: Merge same-physical-event pairs (e03/e04)
+def merge_same_physical_events(ocel):
+    merged = ocel.copy()
+    # Example: e03 and e04
+    e03 = merged.events[merged.events['eid'] == 'e03']
+    e04 = merged.events[merged.events['eid'] == 'e04']
+    if not e03.empty and not e04.empty:
+        # Merge payloads, retain both with qualifiers
+        merged.events = merged.events.drop(index=e03.index)
+        e04['activity'] = 'Pick Item (Scanner)'
+        merged.events = pd.concat([merged.events, e04])
+    return merged
+
+ocel_conservative = merge_same_physical_events(ocel_conservative)
+
+# Step 3: Enforce lifecycle order (e09 before e10)
+ocel_conservative.events = pm4py.ocel_sort_by_additional_column(
+    ocel_conservative,
+    column='timestamp',
+    ascending=True
+)
+
+# --- Aggressive PM4Py Merging (Warning: Semantic Damage) ---
+ocel_aggressive = deepcopy(ocel_raw)
+ocel_aggressive = pm4py.ocel_merge_duplicates(
+    ocel_aggressive,
+    key_columns=['activity', 'timestamp'],
+    merge_strategy='first'
+)
+
+# --- Validate Referential Integrity ---
+def validate_ocel(ocel):
+    # Check for orphaned objects
+    all_objects = set()
+    for _, event in ocel.events.iterrows():
+        all_objects.update(event['related_objects'])
+    # Check if all objects in events exist in objects
+    assert all_objects.issubset(set(ocel.objects['object_id']))
+
+validate_ocel(ocel_conservative)
+validate_ocel(ocel_aggressive)
+```
+
+---
+
+## **7. Sensitivity Analysis**
+
+| **Dataset**               | **Event Count** | **E2O Relations** | **Order-Flattened DFG** | **Payment-Flattened DFG** | **OC-DFG Edges** | **ET–OT Weights** | **OTG Relations** | **Rework Loops** | **Lifecycle Metrics** |
+|---------------------------|-----------------|-------------------|-------------------------|---------------------------|------------------|-------------------|-------------------|------------------|------------------------|
+| **Raw**                  | 17              | 17                | Complex                 | Complex                   | 12               | High variance     | Many              | Possible         | Baseline             |
+| **Conservative**         | 15              | 15                | Simplified              | Clear payment paths      | 10               | Reduced variance  | Fewer            | None             | Improved              |
+| **Evidence-Based Merge** | 12              | 12                | Over-merged             | False payment consolidation | 8          | High variance     | Fewer            | Possible         | Misleading            |
+| **Aggressive PM4Py**     | 10              | 10                | False causality         | Collapsed payments       | 6                | High variance     | None             | Likely          | Severely distorted   |
+
+### **Key Edges/Patterns Affected**
+1. **`Pick Item`  `Pack Package`** (e03–e06): May appear as a single edge in aggressive merging.
+2. **`Dispatch Package`  `Confirm Delivery`** (e08–e17): Risk of false causality if `e09/e10` are merged.
+3. **`Issue Invoice`  `Capture Payment`** (e11–e13): May show incorrect ordering if summaries are merged.
+4. **`Authorize Payment`  `Capture Payment`** (e12–e13): Critical for `M1`; must not be collapsed.
+5. **`Pack Package (WMS)`  `Pack Package (ERP)`** (e06–e07): Should remain distinct.
+6. **`Dispatch Package (WMS)`  `Dispatch Package (Carrier)`** (e08–e09): Must preserve order.
+
+---
+
+## **8. Audit Trail and Reversibility**
+
+### **Provenance Schema**
+```json
+{
+  "canonical_eid": "e03",
+  "source_eids": ["e03", "e04"],
+  "merge_rule": "same_physical_event",
+  "reviewer": "analyst_1",
+  "original_activity": ["Pick Item", "Pick Item"],
+  "refined_activity": ["Pick Item (WMS)", "Pick Item (Scanner)"],
+  "original_timestamp": ["2026-05-18 10:00:00", "2026-05-18 10:00:00"],
+  "adjusted_timestamp": ["2026-05-18 10:00:00", "2026-05-18 10:00:00"],
+  "attributes_retained": {
+    "e03": ["location", "wms_id"],
+    "e04": ["scanner_id", "raw_scan_data"]
+  },
+  "discarded_conflicts": ["payload_hash_mismatch"],
+  "confidence": "high",
+  "reason": "Reconciliation report confirms same physical scan"
+}
+```
+
+### **Reconstruction**
+An analyst can:
+1. Query the provenance table for `canonical_eid`.
+2. Retrieve all `source_eids` and their original attributes.
+3. Reconstruct the raw view by unioning original events.
+
+---
+
+## **9. Failure Modes and Safeguards**
+
+| **Failure Mode**                          | **Safeguard**                                                                 |
+|------------------------------------------|------------------------------------------------------------------------------|
+| **Collapsing distinct partial payments** | Enforce `Payment` object uniqueness in merging rules.                       |
+| **False rework loops**                   | Validate DFG for cycles after merging.                                      |
+| **Ordering by ingestion time**           | Explicitly exclude `ingested_at` from primary ordering rules.               |
+| **Shared objects as proof of duplication** | Use `related_objects` + `activity` + `timestamp` for deduplication.          |
+| **Unioning incompatible E2O relations**  | Check object types before merging (e.g., `Payment` vs. `Invoice`).           |
+| **Synthetic microseconds**               | Never modify `timestamp`; use deterministic tie-breaking instead.            |
+| **Losing authoritative attributes**     | Track source provenance and allow attribute-level retention.                 |
+| **Applying PM4Py to whole OCEL**         | Pre-filter candidate groups before merging.                                  |
+
+---
+
+## **Conclusion**
+This pipeline ensures:
+- **Conservative:** Minimal semantic damage, full provenance, deterministic ordering.
+- **Aggressive:** Higher compression but risk of false causality.
+- **PM4Py-Aware:** Uses library functions judiciously, with manual overrides for critical cases.
+
+The conservative approach is recommended for auditability, while aggressive methods are reserved for exploratory analysis with clear warnings.
