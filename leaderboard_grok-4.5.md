@@ -4,9 +4,10 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 
 | Model                          | Score    | OS                 | LRM                | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
 | ------------------------------ | -------- | ------------------ | ------------------ | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
-| gpt-5.6-sol-XHIGH              | **44.9** | :x:                | :white_check_mark: | :mage_woman: **5.5** | :mage_woman: **6.1** | **5.3**              | **5.5**              | :mage_woman: **5.5** | :mage_woman: **5.6** | :mage_woman: **5.7** | **5.7**              |
+| gpt-5.6-sol-XHIGH              | **44.9** | :x:                | :white_check_mark: | :mage_woman: **5.5** | :mage_woman: **6.1** | **5.3**              | **5.5**              | **5.5**              | :mage_woman: **5.6** | :mage_woman: **5.7** | **5.7**              |
 | GPT-5.6-Sol-Pro                | **44.3** | :x:                | :white_check_mark: | :mage_woman: **5.5** | 5.7                  | **5.4**              | **5.5**              | **5.4**              | **5.5**              | **5.4**              | :mage_woman: **5.8** |
 | gpt-5.6-terra-XHIGH            | **44.3** | :x:                | :white_check_mark: | :mage_woman: **5.5** | 5.7                  | :mage_woman: **5.5** | **5.5**              | **5.4**              | **5.5**              | **5.5**              | **5.7**              |
+| GPT-5.5-Pro                    | **43.0** | :x:                | :white_check_mark: | **5.4**              | 5.6                  | **5.2**              | 4.8                  | :mage_woman: **5.6** | **5.3**              | **5.4**              | **5.6**              |
 | gpt-5.6-sol-NONE               | **42.4** | :x:                | :x:                | 5.1                  | 5.0                  | **5.3**              | 5.1                  | **5.3**              | **5.5**              | **5.6**              | **5.7**              |
 | grok-4.5                       | **42.2** | :x:                | :white_check_mark: | **5.3**              | 5.3                  | **5.4**              | 5.0                  | 5.0                  | 5.1                  | **5.4**              | **5.7**              |
 | qwen3.8-max                    | **41.9** | :x:                | :white_check_mark: | **5.4**              | 4.7                  | **5.2**              | :mage_woman: **5.6** | 5.0                  | **5.3**              | **5.5**              | 5.2                  |
@@ -218,6 +219,66 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat08_04_sustainability_redesign               | 9.0   |
 | cat08_05_disruption_resilience_recovery        | 8.0   |
 | cat08_06_digital_twin_experiments              | 7.7   |
+| cat08_07_contradictory_evidence_memo           | 8.4   |
+
+### GPT-5.5-Pro   => 43.0 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 8.0   |
+| cat01_02_staggered_automation                  | 7.6   |
+| cat01_03_flag_mediation                        | 8.2   |
+| cat01_04_conformance_root_cause                | 7.7   |
+| cat01_05_mixed_drift_attribution               | 7.6   |
+| cat01_06_intervention_transportability         | 7.7   |
+| cat01_07_case_counterfactuals                  | 7.0   |
+| cat02_01_reconstruct_partial_queue             | 8.0   |
+| cat02_02_infer_queue_disciplines               | 7.6   |
+| cat02_03_fork_join_delay_decomposition         | 8.4   |
+| cat02_04_batching_vs_bulk_logging              | 8.0   |
+| cat02_05_nonstationary_queue_regimes           | 7.7   |
+| cat02_06_sla_survival_censoring                | 7.7   |
+| cat02_07_robust_multiskill_staffing            | 9.0   |
+| cat03_01_case_notion_tradeoffs                 | 7.6   |
+| cat03_02_relation_repair                       | 7.2   |
+| cat03_03_cross_instance_bottlenecks            | 8.0   |
+| cat03_04_incomplete_norm_conformance           | 7.6   |
+| cat03_05_execution_equivalence_clustering      | 7.5   |
+| cat03_06_compact_ocel_pipeline                 | 7.3   |
+| cat03_07_duplicate_tie_cleaning                | 7.2   |
+| cat04_01_dual_formalism_synthesis              | 8.0   |
+| cat04_03_hybrid_procedural_declarative         | 7.8   |
+| cat04_04_sparse_evidence_model_completion      | 8.0   |
+| cat04_05_behavioral_equivalence_simplification | 8.0   |
+| cat04_06_conversion_semantic_loss_audit        | 7.8   |
+| cat04_07_adversarial_model_review              | 8.0   |
+| cat05_01_norm_hierarchy_conflicts              | 9.0   |
+| cat05_02_compensating_controls                 | 7.5   |
+| cat05_03_data_aware_obligations                | 7.8   |
+| cat05_04_uncertain_temporal_conformance        | 7.7   |
+| cat05_05_delegation_resource_conformance       | 8.4   |
+| cat05_06_alignment_business_severity           | 7.7   |
+| cat05_07_normative_model_dialectic             | 7.7   |
+| cat06_01_latent_state_next_event               | 7.1   |
+| cat06_02_competing_clocks_remaining_time       | 7.6   |
+| cat06_03_censored_outcome_study                | 7.6   |
+| cat06_04_capacity_aware_early_warning          | 7.6   |
+| cat06_05_process_aware_explanation_audit       | 8.0   |
+| cat06_06_conformant_next_best_action           | 7.7   |
+| cat06_07_process_evidence_drift_diagnosis      | 7.6   |
+| cat07_01_reconcile_org_networks                | 7.9   |
+| cat07_02_formal_shadow_roles                   | 8.0   |
+| cat07_03_collusion_or_necessity                | 8.0   |
+| cat07_04_procedural_fairness_complexity        | 7.8   |
+| cat07_05_learning_fatigue_queue_pressure       | 7.8   |
+| cat07_06_dynamic_resource_assignment           | 7.1   |
+| cat07_07_restructuring_impact                  | 7.8   |
+| cat08_01_conflicting_evidence_redesign         | 9.0   |
+| cat08_02_demand_shock_robustness               | 8.0   |
+| cat08_03_automation_portfolio_dependencies     | 8.0   |
+| cat08_04_sustainability_redesign               | 7.7   |
+| cat08_05_disruption_resilience_recovery        | 7.8   |
+| cat08_06_digital_twin_experiments              | 7.2   |
 | cat08_07_contradictory_evidence_memo           | 8.4   |
 
 ### gpt-5.6-sol-NONE   => 42.4 points
