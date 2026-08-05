@@ -1,0 +1,496 @@
+## 1. Temporal Data Semantics
+
+Basis: the policy rules, event log, exemption register, and additional semantic facts are taken from the uploaded source. 
+
+I reconstruct each case as an event-time state machine ordered by `(time:timestamp, event_index)`. A blank attribute cell means “no update at this event,” so it is forward-filled from the latest prior known value within the same case. It is never treated as a nullifying update.
+
+Final-state leakage is explicitly disallowed. For example, TX-305’s `Settlement_Confirmed` amount of EUR 150,000 is reliable at settlement time, but it cannot be copied backward to `Release_Funds` because the release message has no immutable amount payload. Similarly, a late `Record_Exemption` event is not automatically the time of approval; it is a record-time event that may or may not evidence an earlier approval.
+
+I distinguish four time notions:
+
+| Time notion    | Meaning in this assessment                                                       | Consequence                                                                                                    |
+| -------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Event time     | The event’s `time:timestamp` in the log.                                         | Attribute updates are effective at this time unless evidence says otherwise.                                   |
+| Effective time | A business-valid-from time, especially for exemptions.                           | An exemption may be effective before it is recorded, but only if evidence supports that approval existed then. |
+| Record time    | When a fact was inserted or recorded, e.g. `Record_Exemption`.                   | Record time can lag effective time; it is not enough by itself to prove timely approval.                       |
+| Evidence time  | When supporting evidence became trustworthy, e.g. qualified signature timestamp. | For EX-77 this supports timely approval; for EX-88 it undermines the displayed pre-release approval time.      |
+
+For equal timestamps, I use `event_index` as the tie-breaker. TX-311 is the key example: `Enhanced_Review` has event_index 3 and `Update_Jurisdiction` has event_index 4 at the same timestamp, so the jurisdiction update to DE occurred after the enhanced review but before release.
+
+Material amount changes are assessed relative to the latest `Standard_Review` or `Enhanced_Review`. An increase of more than 20 percent after that review invalidates the review for amount-dependent obligations. A decrease does not by itself invalidate the review. An increase from an unknown amount is not safely classifiable.
+
+Missing amount, risk, jurisdiction, or customer type is not defaulted to low risk. If a decisive trigger cannot be established or excluded, the classification is `INDETERMINATE`.
+
+## 2. Normalized Rule Table
+
+| Rule | Trigger event and condition                                                                                  | Required prior/subsequent event                                                                       | Ordering constraint                                                                                                                | State snapshot used                                                                             | Exception                                                                      | Missing-data treatment                                                                                                                        | Evidence needed                                                                                                                   |
+| ---- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| R1   | At `Release_Funds`, current `jurisdiction != DE` and current `amount >= 100000`.                             | Prior `Enhanced_Review`.                                                                              | `Enhanced_Review` must be before release and after the latest material data change relevant to the amount/jurisdiction obligation. | Latest known amount and jurisdiction at release; review validity checked against later changes. | Valid matching exemption waiving R1.                                           | If jurisdiction is non-DE but amount is unknown, trigger is indeterminate. If jurisdiction unknown and amount high, trigger is indeterminate. | Amount, jurisdiction, enhanced-review completion time, material-change history, exemption scope and approval evidence.            |
+| R2   | At `Release_Funds`, current `risk_level == HIGH` or current `customer_type == PEP`.                          | Prior `Enhanced_Review` and prior `Compliance_Approve`.                                               | `Enhanced_Review < Compliance_Approve < Release_Funds`; approval must be after the relevant enhanced review.                       | Latest known risk and customer type at release; risk/customer changes before review matter.     | None stated.                                                                   | If risk/customer type is unknown and no other activating value is known, trigger is indeterminate.                                            | Risk/customer state, enhanced-review event, compliance approval event, evidence that approval reviewed the enhanced packet.       |
+| R3   | Current release jurisdiction was added to sanctions list after latest `Sanctions_Screen` and before release. | Subsequent new `Sanctions_Screen`.                                                                    | `latest Sanctions_Screen < Sanctions_List_Update < new Sanctions_Screen < Release_Funds`.                                          | Current release jurisdiction and sanctions-list update events.                                  | None stated.                                                                   | If current jurisdiction or list-update timing is unknown, cannot safely clear.                                                                | Jurisdiction at release, sanctions-list update content/effective time, screen timestamp and list version.                         |
+| R4   | Amount increase of more than 20 percent after latest `Standard_Review` or `Enhanced_Review`.                 | A new valid review is needed if relying on the invalidated review for an amount-dependent obligation. | Invalidating increase occurs after review and before release.                                                                      | Amount at review versus later amount updates before release.                                    | Decrease does not by itself invalidate review.                                 | Increase from unknown amount is not safely classifiable.                                                                                      | Review snapshot amount, update amount, update time, old/new amount provenance.                                                    |
+| R5   | Exemption is asserted for an obligation.                                                                     | Approved exemption by `Head_Compliance`, matching scope.                                              | Approval/effective time must be no later than obligation trigger; exemption must not be expired at trigger/release.                | Release-time obligation state and exemption register state.                                     | Applies only to the rule waived by the exemption, here R1 for EX-77 and EX-88. | Missing or contradictory evidence of timely approval prevents automatic acceptance.                                                           | Approver role, effective_from, expiry, jurisdiction/customer/amount scope, signature/evidence timestamp, record-time explanation. |
+| R6   | Any rule whose trigger depends on missing amount, risk, jurisdiction, or customer type.                      | Human/evidential review unless other evidence resolves the value.                                     | No silent defaulting to low-risk/non-triggering state.                                                                             | Latest known state at the relevant event.                                                       | None.                                                                          | Classify as `INDETERMINATE` when the trigger cannot be established or excluded.                                                               | Immutable payload, source feed, audit trail, or contemporaneous document.                                                         |
+| R7   | All evaluations.                                                                                             | Not an activity obligation; it is the ordering/state rule.                                            | Sort by timestamp, then `event_index`; updates are effective at their event timestamp unless evidence says otherwise.              | Forward-filled event-time state only; no future backfill.                                       | None.                                                                          | Same-timestamp ambiguity is resolved by `event_index`; missing values remain missing.                                                         | Stable event order, event_index semantics, timestamp precision.                                                                   |
+
+Formal pseudo-logic:
+
+* Define `before(e1,e2)` as `(timestamp(e1), event_index(e1)) < (timestamp(e2), event_index(e2))` within the case.
+* Define `state(c, attr, e)` as the latest nonblank value of `attr` in case `c` at an event `u` where `u <= e` under the event ordering.
+* Define `Release(c,r)` where event `r` has activity `Release_Funds`.
+
+R1:
+`R1_trigger(c,r)` is true when `Release(c,r)`, `state(c,jurisdiction,r) != DE`, and `state(c,amount,r) >= 100000`.
+
+`R1_satisfied(c,r)` is true when either:
+
+1. there exists `er` such that `activity(er)=Enhanced_Review`, `before(er,r)`, and no invalidating material amount/jurisdiction change relevant to R1 occurs between `er` and `r`; or
+2. there exists `ex` such that `ValidExemption(ex,c,r,R1)`.
+
+If the jurisdiction is known non-DE but amount is unknown, `R1_trigger` is unknown rather than false.
+
+R2:
+`R2_trigger(c,r)` is true when `state(c,risk_level,r)=HIGH` or `state(c,customer_type,r)=PEP`.
+
+`R2_satisfied(c,r)` is true when there exist `er` and `ca` such that `activity(er)=Enhanced_Review`, `activity(ca)=Compliance_Approve`, `before(er,ca)`, `before(ca,r)`, and `er` occurs after the latest risk/customer-type change that made R2 applicable. A `Compliance_Approve` over only a standard packet does not satisfy this unless explicitly reinterpreted.
+
+R3:
+Let `screen` be the latest `Sanctions_Screen` before release. Let `lu` be a `Sanctions_List_Update` adding the current release jurisdiction. R3 is triggered if `before(screen,lu)` and `before(lu,r)`. It is satisfied only if a later `Sanctions_Screen` exists with `before(lu,new_screen)` and `before(new_screen,r)`.
+
+R4:
+For the latest review `rev` in `{Standard_Review, Enhanced_Review}` before release, let `amount_at_review = state(c,amount,rev)`. If a later amount update before release has `new_amount > 1.2 * amount_at_review`, then `rev` is invalid for amount-dependent obligations. If `amount_at_review` is unknown, the effect is indeterminate.
+
+R5:
+`ValidExemption(ex,c,r,rule)` requires: `approved_by=Head_Compliance`, `effective_from <= obligation_trigger_time`, `release_time < expires`, scope matches release-time jurisdiction/customer type/amount, `ex` waives the relevant rule, and evidence supports that approval existed at the relevant time. Displayed backdating alone is insufficient.
+
+R6:
+If a decisive state value is unknown and no other evidence resolves it, the rule result is `INDETERMINATE`, not compliant.
+
+R7:
+All state snapshots use event-time reconstruction only. No final case attribute is copied backward.
+
+## 3. Case Findings
+
+| Case   | Reconstructed state at release                                              | Triggered rules                                                      | Satisfied obligations                                                                      | Deviations                                                                                                                         | Exemption analysis                                                                                                                                   | Classification | Severity                                        | Confidence                                                                           | Decisive evidence                                                                                                   |
+| ------ | --------------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| TX-301 | amount EUR 125,000; risk LOW; jurisdiction US; customer CORPORATE           | R1; R4 invalidates prior standard review for amount-dependent review | None for R1                                                                                | No `Enhanced_Review` before release; amount increased from EUR 80,000 to EUR 125,000 after `Standard_Review`, more than 20 percent | No exemption                                                                                                                                         | NONCOMPLIANT   | High                                            | High                                                                                 | `Standard_Review` 08:10, amount update 08:20, release 08:25                                                         |
+| TX-302 | amount EUR 180,000; risk MEDIUM; jurisdiction GB; customer CORPORATE        | R1                                                                   | `Enhanced_Review` at 09:20 before release; EX-77 also valid if needed                      | None                                                                                                                               | EX-77 scope matches GB/CORPORATE/<=250k, waives R1 only, effective 09:00, signature 09:05; database insert at 11:00 explained by outage              | COMPLIANT      | None                                            | High                                                                                 | Approval evidence 09:05, review 09:20, release 09:40                                                                |
+| TX-303 | amount EUR 90,000; risk HIGH; jurisdiction US; customer RETAIL              | R2                                                                   | `Enhanced_Review` occurred after high-risk reclassification                                | Missing `Compliance_Approve` after enhanced review and before release                                                              | No exemption                                                                                                                                         | NONCOMPLIANT   | High                                            | High                                                                                 | Risk reclassified HIGH 10:15, enhanced review 10:20, release 10:30, no compliance approval                          |
+| TX-304 | amount EUR 60,000; risk MEDIUM; jurisdiction XZ; customer CORPORATE         | R3                                                                   | Initial `Sanctions_Screen` occurred before list update only                                | XZ added to sanctions list after screen and before release; no new screen                                                          | No exemption                                                                                                                                         | NONCOMPLIANT   | Critical                                        | High                                                                                 | Screen 08:10, list update adding XZ 08:30, release 08:45                                                            |
+| TX-305 | amount unknown at release; risk MEDIUM; jurisdiction CA; customer CORPORATE | R1 cannot be established or excluded because amount is unknown       | `Enhanced_Review` exists, but the review document has no amount                            | Missing immutable release amount; later settlement amount may be EUR 150,000 but cannot be copied backward                         | No exemption                                                                                                                                         | INDETERMINATE  | Potentially high; evidential/data-quality issue | High confidence that evidence is insufficient; low confidence on actual breach state | Create amount unavailable, release message omits amount, settlement amount appears next day only                    |
+| TX-306 | amount EUR 230,000; risk HIGH; jurisdiction SG; customer PEP                | R1 and R2                                                            | `Enhanced_Review` 12:15; `Compliance_Approve` 12:25; release 12:40                         | None; amount increased from EUR 220,000 to EUR 230,000, below 20 percent                                                           | No exemption                                                                                                                                         | COMPLIANT      | None                                            | High                                                                                 | High/PEP at create, enhanced review before approval, small amount increase only                                     |
+| TX-307 | amount EUR 70,000; risk LOW; jurisdiction DE; customer PEP                  | R2                                                                   | `Compliance_Approve` exists, but only after standard packet                                | No `Enhanced_Review`; standard review is not enhanced review; approval of standard packet does not cure R2                         | No exemption                                                                                                                                         | NONCOMPLIANT   | High                                            | High                                                                                 | Customer type changed to PEP 13:05, standard review 13:10, compliance approve 13:12, release 13:20                  |
+| TX-308 | amount EUR 100,000; risk MEDIUM; jurisdiction US; customer CORPORATE        | R1                                                                   | `Enhanced_Review` 14:20 covers prior EUR 140,000 state; later decrease does not invalidate | None                                                                                                                               | No exemption                                                                                                                                         | COMPLIANT      | None                                            | High                                                                                 | Enhanced review at EUR 140,000, later decrease to EUR 100,000, release 14:30                                        |
+| TX-309 | amount EUR 145,000; risk LOW; jurisdiction US; customer CORPORATE           | R1; R4                                                               | Earlier enhanced review existed at 15:25                                                   | Amount increased from EUR 118,000 at enhanced review to EUR 145,000 before release, more than 20 percent; no new enhanced review   | No exemption                                                                                                                                         | NONCOMPLIANT   | High                                            | High                                                                                 | Enhanced review 15:25, amount update 15:28, release 15:35                                                           |
+| TX-310 | amount EUR 200,000; risk MEDIUM; jurisdiction AE; customer CORPORATE        | R1                                                                   | None, unless EX-88 is accepted                                                             | No `Enhanced_Review`; EX-88 evidence does not reliably prove pre-release Head Compliance approval                                  | EX-88 scope/displayed fields match, but qualified signing certificate was created at 10:30 after 10:00 release; requester witness is weak/conflicted | NONCOMPLIANT   | High                                            | Medium                                                                               | Release 10:00, no enhanced review, EX-88 signature 10:30, late record 11:00                                         |
+| TX-311 | amount EUR 115,000; risk LOW; jurisdiction DE; customer CORPORATE           | None at release                                                      | No R1/R2/R3 obligation at release                                                          | None                                                                                                                               | No exemption                                                                                                                                         | COMPLIANT      | None                                            | High, assuming event_index is authoritative                                          | Amount update 16:10, enhanced review event_index 3 at 16:20, jurisdiction update to DE event_index 4, release 16:30 |
+
+## 4. Ambiguities and Alternative Readings
+
+TX-305 is the central `INDETERMINATE` case. If the release payload or bank instruction showed EUR 150,000 at 11:30, R1 would be triggered. The case would then need a judgment about whether the 11:15 `Enhanced_Review` is valid despite the note that the review document has no amount. If the release amount was below EUR 100,000, R1 would not trigger. The next-day settlement amount is suggestive but not decisive because the source explicitly says there is no immutable release payload.
+
+TX-302 involves late record time but strong earlier evidence. If one naively treated the 11:00 `Record_Exemption` as the approval time, the exemption would appear post-release. That would be wrong here because the qualified signature timestamp is 09:05 and the outage explains the late database insertion. In any case, TX-302 also had an `Enhanced_Review` at 09:20 before the 09:40 release, so it remains compliant even without relying on EX-77. If an audit taxonomy classifies any release referencing a valid waiver as an exception, TX-302 could be labelled `JUSTIFIED_EXCEPTION`; I classify it as `COMPLIANT` because the substantive R1 review obligation was also met.
+
+TX-310 is not missing the trigger: R1 clearly applies because AE is non-DE and the amount is EUR 200,000. The ambiguity is the attempted exemption. If there were a contemporaneous Head Compliance approval record, a pre-release qualified signature, or independent corroboration of the oral approval, EX-88 could become a `JUSTIFIED_EXCEPTION`. If the control standard requires cryptographic approval before release, it is plainly noncompliant. I classify it as `NONCOMPLIANT` under an audit-evidence standard because the only strong timestamp is after release and the witness is the requester.
+
+TX-311 depends on same-timestamp ordering. Because event_index 3 precedes event_index 4, the jurisdiction changed to DE after the enhanced review but before release. The release-time jurisdiction is DE, so R1 is not triggered. If the jurisdiction update had an explicit effective time after release, then release jurisdiction would remain US and R1 would trigger; even then, the 16:20 enhanced review after the 16:10 amount increase would likely satisfy R1 unless another material change occurred. If a reviewer ignored event_index and treated same-timestamp events as unordered, TX-311 would become less certain.
+
+TX-308 depends on whether a decrease is treated as material. A literal but over-strict reading of “after latest material data change” could demand a new enhanced review after the decrease from EUR 140,000 to EUR 100,000. I reject that reading because R4 explicitly says a decrease does not by itself invalidate a review. Reviewing the higher amount is at least as conservative for the amount-dependent R1 obligation.
+
+TX-307 could change only under a different interpretation of the approval packet. The source says a `Compliance_Approve` that reviewed only a standard packet does not cure the absence of `Enhanced_Review` unless a different interpretation is defended. On the supplied facts, there is no evidence that the standard packet was functionally equivalent to enhanced review, so R2 remains breached.
+
+TX-306 has a small post-approval amount increase. If the policy required renewed compliance approval after any amount change, TX-306 would need a new approval. But R4 sets the invalidation threshold at more than 20 percent for amount-dependent obligations, and the increase from EUR 220,000 to EUR 230,000 is far below that threshold.
+
+## 5. PM4Py and pandas Checking Code
+
+```python
+import io
+import numpy as np
+import pandas as pd
+
+CSV = """case:concept:name,event_index,concept:name,time:timestamp,org:resource,amount,risk_level,jurisdiction,customer_type,exemption_id,note
+TX-301,1,Create_Transaction,2026-04-06T08:00:00Z,ops01,80000,LOW,US,CORPORATE,,
+TX-301,2,Standard_Review,2026-04-06T08:10:00Z,rev01,,,,,,reviewed current state
+TX-301,3,Update_Amount,2026-04-06T08:20:00Z,ops01,125000,,,,,customer increased order
+TX-301,4,Release_Funds,2026-04-06T08:25:00Z,rel01,,,,,,
+TX-302,1,Create_Transaction,2026-04-06T09:00:00Z,ops02,180000,MEDIUM,GB,CORPORATE,,
+TX-302,2,Enhanced_Review,2026-04-06T09:20:00Z,rev02,,,,,,
+TX-302,3,Release_Funds,2026-04-06T09:40:00Z,rel02,,,,,EX-77,release references exemption
+TX-302,4,Record_Exemption,2026-04-06T11:00:00Z,compsys,,,,,EX-77,database insert after outage
+TX-303,1,Create_Transaction,2026-04-06T10:00:00Z,ops03,90000,LOW,US,RETAIL,,
+TX-303,2,Risk_Reclassify,2026-04-06T10:15:00Z,risk01,,HIGH,,,,adverse-media hit
+TX-303,3,Enhanced_Review,2026-04-06T10:20:00Z,rev03,,,,,,
+TX-303,4,Release_Funds,2026-04-06T10:30:00Z,rel03,,,,,,
+TX-304,1,Create_Transaction,2026-04-06T08:00:00Z,ops04,60000,MEDIUM,XZ,CORPORATE,,
+TX-304,2,Sanctions_Screen,2026-04-06T08:10:00Z,screen01,,,,,,clear at screening time
+TX-304,3,Sanctions_List_Update,2026-04-06T08:30:00Z,listsys,,,XZ,,,XZ added to list
+TX-304,4,Release_Funds,2026-04-06T08:45:00Z,rel04,,,,,,
+TX-305,1,Create_Transaction,2026-04-06T11:00:00Z,ops05,,MEDIUM,CA,CORPORATE,,amount feed unavailable
+TX-305,2,Enhanced_Review,2026-04-06T11:15:00Z,rev05,,,,,,review document has no amount
+TX-305,3,Release_Funds,2026-04-06T11:30:00Z,rel05,,,,,,release message omits amount
+TX-305,4,Settlement_Confirmed,2026-04-07T08:00:00Z,banksys,150000,,,,,settlement amount may equal release amount
+TX-306,1,Create_Transaction,2026-04-06T12:00:00Z,ops06,220000,HIGH,SG,PEP,,
+TX-306,2,Enhanced_Review,2026-04-06T12:15:00Z,rev06,,,,,,
+TX-306,3,Compliance_Approve,2026-04-06T12:25:00Z,hc02,,,,,,
+TX-306,4,Update_Amount,2026-04-06T12:30:00Z,ops06,230000,,,,,increase below 20 percent
+TX-306,5,Release_Funds,2026-04-06T12:40:00Z,rel06,,,,,,
+TX-307,1,Create_Transaction,2026-04-06T13:00:00Z,ops07,70000,LOW,DE,RETAIL,,
+TX-307,2,Update_Customer_Type,2026-04-06T13:05:00Z,kyc01,,,,PEP,,beneficial owner matched PEP
+TX-307,3,Standard_Review,2026-04-06T13:10:00Z,rev07,,,,,,
+TX-307,4,Compliance_Approve,2026-04-06T13:12:00Z,hc03,,,,,,approved standard review packet
+TX-307,5,Release_Funds,2026-04-06T13:20:00Z,rel07,,,,,,
+TX-308,1,Create_Transaction,2026-04-06T14:00:00Z,ops08,140000,MEDIUM,US,CORPORATE,,
+TX-308,2,Enhanced_Review,2026-04-06T14:20:00Z,rev08,,,,,,
+TX-308,3,Update_Amount,2026-04-06T14:25:00Z,ops08,100000,,,,,decrease
+TX-308,4,Release_Funds,2026-04-06T14:30:00Z,rel08,,,,,,
+TX-309,1,Create_Transaction,2026-04-06T15:00:00Z,ops09,95000,LOW,US,CORPORATE,,
+TX-309,2,Standard_Review,2026-04-06T15:10:00Z,rev09,,,,,,
+TX-309,3,Update_Amount,2026-04-06T15:20:00Z,ops09,118000,,,,,first increase
+TX-309,4,Enhanced_Review,2026-04-06T15:25:00Z,rev09,,,,,,
+TX-309,5,Update_Amount,2026-04-06T15:28:00Z,ops09,145000,,,,,increase over 20 percent since enhanced review
+TX-309,6,Release_Funds,2026-04-06T15:35:00Z,rel09,,,,,,
+TX-310,1,Create_Transaction,2026-04-06T09:00:00Z,ops10,200000,MEDIUM,AE,CORPORATE,,
+TX-310,2,Standard_Review,2026-04-06T09:20:00Z,rev10,,,,,,
+TX-310,3,Release_Funds,2026-04-06T10:00:00Z,rel10,,,,,EX-88,release references exemption
+TX-310,4,Record_Exemption,2026-04-06T11:00:00Z,compsys,,,,,EX-88,late database record
+TX-311,1,Create_Transaction,2026-04-06T16:00:00Z,ops11,90000,LOW,US,CORPORATE,,
+TX-311,2,Update_Amount,2026-04-06T16:10:00Z,ops11,115000,,,,,
+TX-311,3,Enhanced_Review,2026-04-06T16:20:00Z,rev11,,,,,,
+TX-311,4,Update_Jurisdiction,2026-04-06T16:20:00Z,ops11,,,DE,,,same timestamp after review by event_index
+TX-311,5,Release_Funds,2026-04-06T16:30:00Z,rel11,,,,,,
+"""
+
+# 1) Parse log and preserve source ordering.
+df = pd.read_csv(io.StringIO(CSV), dtype=str, keep_default_na=False)
+df["event_index"] = df["event_index"].astype(int)
+df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], utc=True)
+df["amount"] = pd.to_numeric(df["amount"].replace("", pd.NA), errors="coerce")
+for col in ["risk_level", "jurisdiction", "customer_type", "exemption_id", "note"]:
+    df[col] = df[col].replace("", pd.NA)
+
+df = df.sort_values(["case:concept:name", "time:timestamp", "event_index"]).reset_index(drop=True)
+df["event_order"] = df.groupby("case:concept:name").cumcount()
+
+# 2) Call PM4Py formatting while keeping event_index for same-timestamp ordering.
+try:
+    import pm4py
+    pm4py_log = pm4py.format_dataframe(
+        df.copy(),
+        case_id="case:concept:name",
+        activity_key="concept:name",
+        timestamp_key="time:timestamp",
+    )
+except ImportError:
+    pm4py_log = df.copy()
+    print("PM4Py is not installed in this environment; pandas checks still run.")
+
+# 3) Forward-fill changing attributes within each case. This is not backward filling.
+state_cols = ["amount", "risk_level", "jurisdiction", "customer_type"]
+for col in state_cols:
+    df[f"{col}_state"] = df.groupby("case:concept:name")[col].ffill()
+    prev_state = df.groupby("case:concept:name")[f"{col}_state"].shift()
+    df[f"{col}_updated"] = df[col].notna()
+    df[f"{col}_changed"] = df[col].notna() & (
+        prev_state.isna() | (df[col].astype("object") != prev_state.astype("object"))
+    )
+df["state_changed"] = df[[f"{c}_changed" for c in state_cols]].any(axis=1)
+
+# Exemption register with evidence-time fields.
+exemptions = pd.DataFrame([
+    {
+        "exemption_id": "EX-77",
+        "approved_by": "Head_Compliance",
+        "displayed_approval": "2026-04-06T09:05:00Z",
+        "effective_from": "2026-04-06T09:00:00Z",
+        "expires": "2026-04-06T18:00:00Z",
+        "jurisdiction_scope": "GB",
+        "customer_type_scope": "CORPORATE",
+        "amount_max": 250000.0,
+        "waives": "R1",
+        "signature_ts": "2026-04-06T09:05:00Z",
+        "evidence_strength": "strong",
+    },
+    {
+        "exemption_id": "EX-88",
+        "approved_by": "Head_Compliance",
+        "displayed_approval": "2026-04-06T08:50:00Z",
+        "effective_from": "2026-04-06T08:00:00Z",
+        "expires": "2026-04-06T12:00:00Z",
+        "jurisdiction_scope": "AE",
+        "customer_type_scope": "CORPORATE",
+        "amount_max": 250000.0,
+        "waives": "R1",
+        "signature_ts": "2026-04-06T10:30:00Z",
+        "evidence_strength": "weak_or_conflicted",
+    },
+])
+for col in ["displayed_approval", "effective_from", "expires", "signature_ts"]:
+    exemptions[col] = pd.to_datetime(exemptions[col], utc=True)
+
+def is_unknown(x):
+    return pd.isna(x)
+
+def r1_trigger(amount, jurisdiction):
+    if is_unknown(jurisdiction):
+        return pd.NA
+    if jurisdiction == "DE":
+        return False
+    if is_unknown(amount):
+        return pd.NA
+    return bool(amount >= 100000)
+
+def r2_trigger(risk_level, customer_type):
+    if (not is_unknown(risk_level) and risk_level == "HIGH") or (
+        not is_unknown(customer_type) and customer_type == "PEP"
+    ):
+        return True
+    if is_unknown(risk_level) or is_unknown(customer_type):
+        return pd.NA
+    return False
+
+def last_row(rows):
+    return None if rows.empty else rows.iloc[-1]
+
+def event_time(row):
+    return pd.NaT if row is None else row["time:timestamp"]
+
+def gt20_amount_increase_after(sub, review_row, release_order):
+    """R4: increase >20% after latest Standard_Review or Enhanced_Review."""
+    if review_row is None:
+        return False, False, pd.NaT, np.nan
+    basis = review_row["amount_state"]
+    updates = sub[
+        (sub["event_order"] > review_row["event_order"]) &
+        (sub["event_order"] < release_order) &
+        (sub["amount_updated"])
+    ]
+    if updates.empty:
+        return False, False, pd.NaT, basis
+    if is_unknown(basis):
+        return False, True, updates.iloc[-1]["time:timestamp"], basis
+    over_20 = updates[updates["amount"] > 1.2 * float(basis)]
+    if over_20.empty:
+        return False, False, pd.NaT, basis
+    return True, False, over_20.iloc[-1]["time:timestamp"], basis
+
+def r1_active_at(row):
+    if row is None:
+        return pd.NA
+    return r1_trigger(row["amount_state"], row["jurisdiction_state"])
+
+def diagnose_case(case_id, sub):
+    release_rows = sub[sub["concept:name"].eq("Release_Funds")]
+    if release_rows.empty:
+        return None
+    release = release_rows.iloc[-1]
+    ro = release["event_order"]
+    before = sub[sub["event_order"] < ro]
+
+    latest = {}
+    for act in ["Standard_Review", "Enhanced_Review", "Compliance_Approve", "Sanctions_Screen"]:
+        latest[act] = last_row(before[before["concept:name"].eq(act)])
+    latest_review = last_row(before[before["concept:name"].isin(["Standard_Review", "Enhanced_Review"])])
+    latest_material = last_row(before[before["state_changed"]])
+
+    r1 = r1_trigger(release["amount_state"], release["jurisdiction_state"])
+    r2 = r2_trigger(release["risk_level_state"], release["customer_type_state"])
+
+    r4_latest, r4_unknown, r4_time, r4_basis_amount = gt20_amount_increase_after(
+        sub, latest_review, ro
+    )
+    r4_after_er, r4_after_er_unknown, _, _ = gt20_amount_increase_after(
+        sub, latest["Enhanced_Review"], ro
+    )
+
+    r1_activated_after_er = (
+        latest["Enhanced_Review"] is not None and
+        r1_active_at(latest["Enhanced_Review"]) is not True and
+        r1 is True
+    )
+    r1_enhanced_ok = (
+        r1 is True and
+        latest["Enhanced_Review"] is not None and
+        not r4_after_er and
+        not r4_after_er_unknown and
+        not r1_activated_after_er
+    )
+
+    latest_r2_change = last_row(before[before["risk_level_changed"] | before["customer_type_changed"]])
+    er = latest["Enhanced_Review"]
+    ca = latest["Compliance_Approve"]
+    r2_er_ok = er is not None and (
+        latest_r2_change is None or er["event_order"] > latest_r2_change["event_order"]
+    )
+    r2_ca_ok = er is not None and ca is not None and ca["event_order"] > er["event_order"]
+    r2_ok = (r2 is True and r2_er_ok and r2_ca_ok)
+
+    screen = latest["Sanctions_Screen"]
+    current_jurisdiction = release["jurisdiction_state"]
+    if screen is not None and not is_unknown(current_jurisdiction):
+        relevant_updates = before[
+            (before["concept:name"].eq("Sanctions_List_Update")) &
+            (before["jurisdiction"].eq(current_jurisdiction)) &
+            (before["event_order"] > screen["event_order"])
+        ]
+    else:
+        relevant_updates = before.iloc[0:0]
+    latest_list_update = last_row(relevant_updates)
+    r3 = latest_list_update is not None
+    r3_rescreen_ok = True
+    if r3:
+        rescreens = before[
+            (before["concept:name"].eq("Sanctions_Screen")) &
+            (before["event_order"] > latest_list_update["event_order"])
+        ]
+        r3_rescreen_ok = not rescreens.empty
+
+    release_exemption = release["exemption_id"]
+    ex_scope_ok = False
+    ex_evidence_timely = False
+    ex_human_review_needed = False
+    if not is_unknown(release_exemption):
+        hit = exemptions[exemptions["exemption_id"].eq(release_exemption)]
+        if not hit.empty:
+            ex = hit.iloc[0]
+            ex_scope_ok = (
+                "R1" in ex["waives"] and
+                ex["approved_by"] == "Head_Compliance" and
+                ex["effective_from"] <= release["time:timestamp"] < ex["expires"] and
+                release["jurisdiction_state"] == ex["jurisdiction_scope"] and
+                release["customer_type_state"] == ex["customer_type_scope"] and
+                not is_unknown(release["amount_state"]) and
+                release["amount_state"] <= ex["amount_max"]
+            )
+            ex_evidence_timely = bool(
+                ex_scope_ok and
+                ex["signature_ts"] <= release["time:timestamp"] and
+                ex["evidence_strength"] == "strong"
+            )
+            ex_human_review_needed = bool(ex_scope_ok and not ex_evidence_timely)
+
+    decisive_unknown = bool(
+        is_unknown(release["amount_state"]) or r1 is pd.NA or r2 is pd.NA or r4_unknown or r4_after_er_unknown
+    )
+    potential_noncompliance = (
+        (r1 is True and not (r1_enhanced_ok or ex_evidence_timely)) or
+        (r2 is True and not r2_ok) or
+        (r3 and not r3_rescreen_ok)
+    )
+
+    if decisive_unknown or ex_human_review_needed:
+        automated_assessment = "REVIEW_REQUIRED"
+    elif potential_noncompliance:
+        automated_assessment = "POTENTIAL_NONCOMPLIANCE"
+    else:
+        automated_assessment = "NO_ISSUE_COARSE"
+
+    return {
+        "case": case_id,
+        "release_time": release["time:timestamp"],
+        "release_event_index": release["event_index"],
+        "amount_at_release": release["amount_state"],
+        "risk_at_release": release["risk_level_state"],
+        "jurisdiction_at_release": release["jurisdiction_state"],
+        "customer_type_at_release": release["customer_type_state"],
+        "release_exemption_id": release_exemption,
+        "r1_trigger": r1,
+        "r1_enhanced_ok_coarse": r1_enhanced_ok if r1 is True else pd.NA,
+        "r1_valid_exemption_by_evidence": ex_evidence_timely,
+        "r2_trigger": r2,
+        "r2_ok_coarse": r2_ok if r2 is True else pd.NA,
+        "r3_trigger": r3,
+        "r3_rescreen_ok": r3_rescreen_ok if r3 else pd.NA,
+        "r4_gt20_after_latest_review": r4_latest,
+        "r4_unknown_increase_after_latest_review": r4_unknown,
+        "latest_standard_review_time": event_time(latest["Standard_Review"]),
+        "latest_enhanced_review_time": event_time(latest["Enhanced_Review"]),
+        "latest_compliance_approve_time": event_time(latest["Compliance_Approve"]),
+        "latest_sanctions_screen_time": event_time(latest["Sanctions_Screen"]),
+        "latest_sanctions_list_update_time": event_time(latest_list_update),
+        "latest_material_change_time": event_time(latest_material),
+        "review_amount_basis_for_r4": r4_basis_amount,
+        "r4_gt20_time": r4_time,
+        "amount_unknown_at_release": is_unknown(release["amount_state"]),
+        "exemption_scope_display_ok": ex_scope_ok,
+        "exemption_evidence_timely": ex_evidence_timely,
+        "exemption_human_review_needed": ex_human_review_needed,
+        "automated_assessment": automated_assessment,
+    }
+
+diagnostics = pd.DataFrame(
+    diagnose_case(case_id, sub)
+    for case_id, sub in df.groupby("case:concept:name", sort=True)
+)
+
+# 8) A coarse trace-order demonstration: useful as a quick screen but not as data-aware conformance.
+def trace_order_summary(case_id, sub):
+    acts = list(sub["concept:name"])
+    release_pos = acts.index("Release_Funds") if "Release_Funds" in acts else None
+
+    def before_release(activity):
+        return release_pos is not None and activity in acts[:release_pos]
+
+    return {
+        "case": case_id,
+        "trace": " -> ".join(acts),
+        "cf_has_enhanced_before_release": before_release("Enhanced_Review"),
+        "cf_has_compliance_before_release": before_release("Compliance_Approve"),
+        "cf_has_screen_before_release": before_release("Sanctions_Screen"),
+    }
+
+control_flow_only = pd.DataFrame(
+    trace_order_summary(case_id, sub)
+    for case_id, sub in df.groupby("case:concept:name", sort=True)
+)
+
+pd.set_option("display.max_columns", 100)
+pd.set_option("display.width", 240)
+print("\nCase-level data-aware diagnostics:")
+print(diagnostics.to_string(index=False))
+print("\nCoarse control-flow-only trace-order screen:")
+print(control_flow_only.to_string(index=False))
+print(
+    "\nNote: the control-flow screen cannot know whether R1/R2/R3 were activated, "
+    "whether an exemption was valid, or whether a later attribute update invalidated an earlier review."
+)
+```
+
+## 6. Why Control-Flow-Only Conformance Is Insufficient
+
+1. Final-state leakage: a classical trace check might attach the settlement amount in TX-305 to the release, but event-time semantics do not permit copying the next day’s settlement state backward.
+
+2. Post-hoc exemptions: control flow can see `Record_Exemption` after release, but it cannot decide whether the approval actually existed earlier. EX-77 is supported by a timely qualified signature; EX-88 is not.
+
+3. Material changes after review: a trace containing `Enhanced_Review -> Release_Funds` looks compliant, but TX-309 is not compliant because the amount increased by more than 20 percent after enhanced review.
+
+4. Conditional activation: `Enhanced_Review` is not required for every release. TX-307 has no R1 trigger because it is domestic and below EUR 100,000, but it does trigger R2 because the customer became PEP.
+
+5. Missing data: a control-flow model cannot express “unknown amount means indeterminate, not compliant.” TX-305 needs evidence review, not a pass or fail based only on its activity sequence.
+
+6. Same-timestamp ordering: TX-311 requires `event_index` to decide whether the jurisdiction update occurred before or after the enhanced review. A pure activity sequence may lose this distinction.
+
+7. Review type semantics: `Standard_Review` and `Enhanced_Review` are different. A control-flow abstraction that treats both as “review” would wrongly clear TX-307 or TX-301.
+
+8. Packet lineage: `Compliance_Approve` is not enough unless it approves the relevant enhanced review. TX-307’s approval of a standard packet does not satisfy R2.
+
+9. Global or cross-cutting facts: sanctions-list updates are not ordinary case-local progress steps. TX-304’s noncompliance depends on the current jurisdiction and the timing/content of the list update.
+
+10. Exemption scope: even if an exemption event appears in the trace, its jurisdiction, customer type, amount cap, rule waiver, expiry, approval role, and evidence quality must match.
+
+## 7. Recommended Logging and Control Improvements
+
+Log an immutable release payload for every `Release_Funds` event: amount, currency, jurisdiction, risk level, customer type, exemption ID, sanctions-list version, review IDs relied upon, rule version, and a payload hash. This would resolve TX-305-type ambiguity.
+
+For every attribute update, store old value, new value, effective time, record time, source system, actor, provenance, reason code, and whether the value was validated or provisional. Blank cells should be avoided in audit exports; use explicit “no update” versus “unknown at source” flags.
+
+For reviews, record the reviewed snapshot ID: amount, jurisdiction, risk level, customer type, documents reviewed, sanctions-list version, and applicable rule triggers at the time of review. `Enhanced_Review` should not be only an activity label; it should identify the obligation scope it covers.
+
+For `Compliance_Approve`, require a reference to the exact `Enhanced_Review` and packet version approved. Store approver role, approval timestamp, signature timestamp, and whether the approval was for a standard or enhanced packet.
+
+For exemptions, store structured fields: exemption ID, waived rule IDs, jurisdiction scope, customer-type scope, amount cap, effective_from, expires_at, approved_by, approval event time, record time, qualified signature timestamp, certificate metadata, and backfill/outage reason. Displayed approval time should be separate from cryptographic evidence time.
+
+For sanctions screening, log the sanctions-list version screened against, the response payload, jurisdictions covered, screening completion time, and any list-update event with added/removed jurisdictions, effective time, publication time, and source.
+
+For event ordering, maintain a stable per-case and preferably global sequence number in addition to timestamps. `event_index` should be mandatory and unique within a case timestamp. Same-timestamp ties should never rely on display order.
+
+Finally, emit a machine-readable compliance-decision event before release: triggered rules, required controls, satisfied controls, missing evidence, exemption evaluation result, reviewer override if any, and the exact policy/rule version used.
