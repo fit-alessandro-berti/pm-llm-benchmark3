@@ -7,7 +7,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | gpt-5.6-sol-XHIGH              | **44.9** | :x:                | :white_check_mark: | :mage_woman: **5.5** | :mage_woman: **6.1** | **5.3**              | **5.5**              | **5.5**              | :mage_woman: **5.6** | :mage_woman: **5.7** | **5.7**              |
 | GPT-5.6-Sol-Pro                | **44.3** | :x:                | :white_check_mark: | :mage_woman: **5.5** | 5.7                  | **5.4**              | **5.5**              | **5.4**              | **5.5**              | **5.4**              | :mage_woman: **5.8** |
 | gpt-5.6-terra-XHIGH            | **44.3** | :x:                | :white_check_mark: | :mage_woman: **5.5** | 5.7                  | :mage_woman: **5.5** | **5.5**              | **5.4**              | **5.5**              | **5.5**              | **5.7**              |
-| GPT-5.5-Pro                    | **43.0** | :x:                | :white_check_mark: | **5.4**              | 5.6                  | **5.2**              | 4.8                  | :mage_woman: **5.6** | **5.3**              | **5.4**              | **5.6**              |
+| GPT-5.5-Pro                    | **43.8** | :x:                | :white_check_mark: | **5.4**              | 5.6                  | **5.2**              | :mage_woman: **5.6** | :mage_woman: **5.6** | **5.3**              | **5.4**              | **5.6**              |
 | gpt-5.6-sol-NONE               | **42.4** | :x:                | :x:                | 5.1                  | 5.0                  | **5.3**              | 5.1                  | **5.3**              | **5.5**              | **5.6**              | **5.7**              |
 | grok-4.5                       | **42.2** | :x:                | :white_check_mark: | **5.3**              | 5.3                  | **5.4**              | 5.0                  | 5.0                  | 5.1                  | **5.4**              | **5.7**              |
 | qwen3.8-max                    | **41.9** | :x:                | :white_check_mark: | **5.4**              | 4.7                  | **5.2**              | :mage_woman: **5.6** | 5.0                  | **5.3**              | **5.5**              | 5.2                  |
@@ -221,7 +221,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 7.7   |
 | cat08_07_contradictory_evidence_memo           | 8.4   |
 
-### GPT-5.5-Pro   => 43.0 points
+### GPT-5.5-Pro   => 43.8 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -247,6 +247,7 @@ A score in the range **20-25** is considered **sufficient**; a score in the rang
 | cat03_06_compact_ocel_pipeline                 | 7.3   |
 | cat03_07_duplicate_tie_cleaning                | 7.2   |
 | cat04_01_dual_formalism_synthesis              | 8.0   |
+| cat04_02_unsound_petri_net_repair              | 8.4   |
 | cat04_03_hybrid_procedural_declarative         | 7.8   |
 | cat04_04_sparse_evidence_model_completion      | 8.0   |
 | cat04_05_behavioral_equivalence_simplification | 8.0   |
