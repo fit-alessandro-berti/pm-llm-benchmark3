@@ -34,7 +34,7 @@ TARGET_REASONING_EFFORT = "low"  # low | medium | high | xhigh | max
 
 # Max concurrent Claude CLI invocations. Each worker handles one question
 # end-to-end (including its own retries) independently of the others.
-MAX_WORKERS = 1
+MAX_WORKERS = 3
 
 # Command template. {prompt}, {model}, and {effort} are filled per question.
 # The prompt itself instructs Claude to read questions/<q>.txt and write
