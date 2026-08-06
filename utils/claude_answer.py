@@ -58,7 +58,13 @@ def build_prompt(question_name: str, answer_path: str) -> str:
         f"writing the output to {answer_path}. "
         "Read the question file carefully and produce a complete answer. "
         "Write only the final answer text into the output file "
-        "(no meta-commentary about this instruction)."
+        "(no meta-commentary about this instruction). "
+        "STRICTLY FORBIDDEN: do not look at, open, list, search, copy, or otherwise "
+        f"consult any existing files under the {ANSWERS_DIR}/ folder (including other "
+        "models' answers or any prior answer to this or other questions). "
+        "It is also strictly forbidden to connect to GitHub, the web, remote repos, "
+        "or any external source to spy on, fetch, or recover benchmark answers. "
+        "Solve the question solely from the question file and your own knowledge."
     )
 
 
