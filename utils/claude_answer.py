@@ -33,7 +33,7 @@ TARGET_REASONING_EFFORT = "low"  # low | medium | high | xhigh | max
 # Command template. {prompt}, {model}, and {effort} are filled per question.
 # The prompt itself instructs Claude to read questions/<q>.txt and write
 # answers/<model>_<q>.txt.
-CLAUDE_COMMAND = 'claude -p "{prompt}" --model {model} --effort {effort}'
+CLAUDE_COMMAND = 'claude -p "{prompt}" --model {model} --effort {effort} --dangerously-skip-permissions'
 
 SLEEP_BETWEEN_QUESTIONS_SEC = 60
 QUESTIONS_DIR = "questions"
@@ -63,7 +63,14 @@ def build_prompt(question_name: str, answer_path: str) -> str:
 
 
 def run_claude(question_name: str, answer_path: str) -> bool:
-    """Invoke claude -p for one question. Returns True on success."""
+    """Invoke claude -p for one question. Returns True on success.
+
+    Does not re-run when the answer file already exists and is non-empty.
+    """
+    if is_completed_output(answer_path):
+        print(f"Skipping (already answered): {answer_path}")
+        return True
+
     os.makedirs(ANSWERS_DIR, exist_ok=True)
     prompt = build_prompt(question_name, answer_path)
 
@@ -102,6 +109,7 @@ def main() -> None:
     )
     print(f"{len(questions)} question file(s) under {QUESTIONS_DIR}/")
 
+    # Only questions without an existing non-empty answer are executed.
     pending: list[str] = []
     for q in questions:
         path = answer_path_for(q, TARGET_MODEL_NAME)
@@ -114,6 +122,11 @@ def main() -> None:
 
     for index, q in enumerate(pending):
         path = answer_path_for(q, TARGET_MODEL_NAME)
+        # Re-check immediately before each run (file may have appeared meanwhile).
+        if is_completed_output(path):
+            print(f"\n[{index + 1}/{len(pending)}] Skipping (already answered): {path}")
+            continue
+
         print(f"\n[{index + 1}/{len(pending)}] {q} -> {path}")
         ok = run_claude(q, path)
         if not ok:
