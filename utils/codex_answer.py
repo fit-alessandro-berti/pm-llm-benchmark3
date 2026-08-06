@@ -44,6 +44,9 @@ CODEX_COMMAND = (
 )
 
 SLEEP_BETWEEN_QUESTIONS_SEC = 60
+# Backoff after consecutive failures of the *same* question. After the last
+# entry, further retries keep using that delay (max every 10 minutes).
+RETRY_BACKOFF_SEC = (60, 300, 600)
 QUESTIONS_DIR = "questions"
 ANSWERS_DIR = "answers"
 
@@ -142,9 +145,18 @@ def main() -> None:
             continue
 
         print(f"\n[{index + 1}/{len(pending)}] {q} -> {path}")
-        ok = run_codex(q, path)
-        if not ok:
-            print(f"Failed on {q}; continuing to next question after sleep")
+        fail_count = 0
+        while True:
+            ok = run_codex(q, path)
+            if ok:
+                break
+            delay = RETRY_BACKOFF_SEC[min(fail_count, len(RETRY_BACKOFF_SEC) - 1)]
+            fail_count += 1
+            print(
+                f"Failed on {q} (attempt {fail_count}); "
+                f"retrying same question after {delay} seconds..."
+            )
+            time.sleep(delay)
 
         if index + 1 < len(pending):
             print(
