@@ -3,6 +3,7 @@
 | Model | Total | 1a_instruction_override | 1b_context_omission | 1c_prompt_contradiction | 2a_concept_fabrication | 2b_spurious_numeric | 2c_false_citation | 3a_unsupported_leap | 3b_self_contradiction | 3c_circular_reasoning | 4a_syntax_error | 4b_model_semantics_breach | 4c_visual_descr_mismatch |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | gpt-5.6-sol-XHIGH | 4 | 0 | 0 | 0 | 0 | 1 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
+| gpt-5.6-luna-XHIGH | 6 | 0 | 0 | 0 | 3 | 0 | 0 | 1 | 2 | 0 | 0 | 0 | 0 |
 | qwenqwen3.8-max | 8 | 0 | 0 | 0 | 0 | 3 | 0 | 4 | 1 | 0 | 0 | 0 | 0 |
 | GPT-5.5-Pro | 9 | 0 | 0 | 0 | 1 | 5 | 1 | 0 | 1 | 0 | 0 | 1 | 0 |
 | thinkingmachinesinkling | 10 | 0 | 0 | 0 | 1 | 7 | 0 | 0 | 2 | 0 | 0 | 0 | 0 |
@@ -11,6 +12,7 @@
 | z-aiglm-5.2 | 11 | 0 | 0 | 0 | 2 | 2 | 0 | 4 | 3 | 0 | 0 | 0 | 0 |
 | gpt-5.6-terra-XHIGH | 14 | 0 | 0 | 0 | 0 | 4 | 0 | 8 | 1 | 0 | 0 | 1 | 0 |
 | gemini-3.5-flash-lite | 15 | 0 | 0 | 0 | 0 | 7 | 0 | 5 | 3 | 0 | 0 | 0 | 0 |
+| claude-opus-5-low | 15 | 1 | 0 | 0 | 0 | 3 | 0 | 4 | 7 | 0 | 0 | 0 | 0 |
 | qwenqwen3.5-397b-a17b | 17 | 0 | 0 | 0 | 0 | 8 | 1 | 7 | 1 | 0 | 0 | 0 | 0 |
 | deepseekdeepseek-v4-pro | 17 | 0 | 0 | 0 | 1 | 11 | 0 | 4 | 1 | 0 | 0 | 0 | 0 |
 | qwenqwen3.6-27b | 18 | 0 | 1 | 0 | 1 | 5 | 0 | 6 | 4 | 0 | 1 | 0 | 0 |
