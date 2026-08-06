@@ -1,7 +1,7 @@
 """Answer PM-LLM-Benchmark questions using the Claude Code CLI.
 
 Hard-code TARGET_MODEL_NAME (answer filename prefix), TARGET_MODEL (claude --model),
-TARGET_REASONING_EFFORT, and CLAUDE_COMMAND below, then run:
+TARGET_REASONING_EFFORT, MAX_WORKERS, and CLAUDE_COMMAND below, then run:
 
     python -m utils.claude_answer
     # or: python utils/claude_answer.py
@@ -13,7 +13,9 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -30,17 +32,29 @@ TARGET_MODEL_NAME = "claude-opus-5-low"  # prefix used in answers/
 TARGET_MODEL = "claude-opus-5"  # value passed to claude --model
 TARGET_REASONING_EFFORT = "low"  # low | medium | high | xhigh | max
 
+# Max concurrent Claude CLI invocations. Each worker handles one question
+# end-to-end (including its own retries) independently of the others.
+MAX_WORKERS = 1
+
 # Command template. {prompt}, {model}, and {effort} are filled per question.
 # The prompt itself instructs Claude to read questions/<q>.txt and write
 # answers/<model>_<q>.txt.
 CLAUDE_COMMAND = 'claude -p "{prompt}" --model {model} --effort {effort} --dangerously-skip-permissions'
 
+# Used only when MAX_WORKERS == 1 (sequential mode).
 SLEEP_BETWEEN_QUESTIONS_SEC = 60
 # Backoff after consecutive failures of the *same* question. After the last
 # entry, further retries keep using that delay (max every 10 minutes).
 RETRY_BACKOFF_SEC = (60, 300, 600)
 QUESTIONS_DIR = "questions"
 ANSWERS_DIR = "answers"
+
+_print_lock = threading.Lock()
+
+
+def _log(msg: str) -> None:
+    with _print_lock:
+        print(msg, flush=True)
 
 
 def list_questions() -> list[str]:
@@ -77,7 +91,7 @@ def run_claude(question_name: str, answer_path: str) -> bool:
     Does not re-run when the answer file already exists and is non-empty.
     """
     if is_completed_output(answer_path):
-        print(f"Skipping (already answered): {answer_path}")
+        _log(f"Skipping (already answered): {answer_path}")
         return True
 
     os.makedirs(ANSWERS_DIR, exist_ok=True)
@@ -90,18 +104,45 @@ def run_claude(question_name: str, answer_path: str) -> bool:
     )
     cmd = shlex.split(cmd_str)
 
-    print("Running:", cmd_str)
+    _log(f"Running: {cmd_str}")
     result = subprocess.run(cmd, cwd=str(Path.cwd()))
     if result.returncode != 0:
-        print(f"claude exited with status {result.returncode} for {question_name}")
+        _log(f"claude exited with status {result.returncode} for {question_name}")
         return False
 
     if not is_completed_output(answer_path):
-        print(f"No completed answer written to {answer_path}")
+        _log(f"No completed answer written to {answer_path}")
         return False
 
-    print(f"Wrote {answer_path}")
+    _log(f"Wrote {answer_path}")
     return True
+
+
+def process_question(question_name: str, label: str) -> bool:
+    """Run one question to completion with independent retries. Thread-safe."""
+    path = answer_path_for(question_name, TARGET_MODEL_NAME)
+    if is_completed_output(path):
+        _log(f"{label} Skipping (already answered): {path}")
+        return True
+
+    _log(f"{label} {question_name} -> {path}")
+    fail_count = 0
+    while True:
+        # Re-check in case another worker (or a previous attempt) finished it.
+        if is_completed_output(path):
+            _log(f"{label} Skipping (already answered): {path}")
+            return True
+
+        ok = run_claude(question_name, path)
+        if ok:
+            return True
+        delay = RETRY_BACKOFF_SEC[min(fail_count, len(RETRY_BACKOFF_SEC) - 1)]
+        fail_count += 1
+        _log(
+            f"{label} Failed on {question_name} (attempt {fail_count}); "
+            f"retrying same question after {delay} seconds..."
+        )
+        time.sleep(delay)
 
 
 def main() -> None:
@@ -111,10 +152,15 @@ def main() -> None:
         print(f"Missing {QUESTIONS_DIR}/ directory", file=sys.stderr)
         sys.exit(1)
 
+    if MAX_WORKERS < 1:
+        print("MAX_WORKERS must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
     questions = list_questions()
     print(
         f"Claude answering with model_name={TARGET_MODEL_NAME!r}, "
-        f"model={TARGET_MODEL!r}, reasoning_effort={TARGET_REASONING_EFFORT!r}"
+        f"model={TARGET_MODEL!r}, reasoning_effort={TARGET_REASONING_EFFORT!r}, "
+        f"max_workers={MAX_WORKERS}"
     )
     print(f"{len(questions)} question file(s) under {QUESTIONS_DIR}/")
 
@@ -127,34 +173,39 @@ def main() -> None:
         else:
             pending.append(q)
 
-    print(f"{len(pending)} question(s) remaining")
+    total = len(pending)
+    print(f"{total} question(s) remaining")
+    if not pending:
+        print("\nDone.")
+        return
 
-    for index, q in enumerate(pending):
-        path = answer_path_for(q, TARGET_MODEL_NAME)
-        # Re-check immediately before each run (file may have appeared meanwhile).
-        if is_completed_output(path):
-            print(f"\n[{index + 1}/{len(pending)}] Skipping (already answered): {path}")
-            continue
-
-        print(f"\n[{index + 1}/{len(pending)}] {q} -> {path}")
-        fail_count = 0
-        while True:
-            ok = run_claude(q, path)
-            if ok:
-                break
-            delay = RETRY_BACKOFF_SEC[min(fail_count, len(RETRY_BACKOFF_SEC) - 1)]
-            fail_count += 1
-            print(
-                f"Failed on {q} (attempt {fail_count}); "
-                f"retrying same question after {delay} seconds..."
-            )
-            time.sleep(delay)
-
-        if index + 1 < len(pending):
-            print(
-                f"Sleeping {SLEEP_BETWEEN_QUESTIONS_SEC} seconds before next question..."
-            )
-            time.sleep(SLEEP_BETWEEN_QUESTIONS_SEC)
+    if MAX_WORKERS == 1:
+        # Sequential path preserves the original inter-question sleep.
+        for index, q in enumerate(pending):
+            process_question(q, label=f"[{index + 1}/{total}]")
+            if index + 1 < total:
+                print(
+                    f"Sleeping {SLEEP_BETWEEN_QUESTIONS_SEC} seconds "
+                    f"before next question..."
+                )
+                time.sleep(SLEEP_BETWEEN_QUESTIONS_SEC)
+    else:
+        # Concurrent: each question runs independently on its own worker
+        # (own subprocess + own retry/backoff loop).
+        print(f"Running up to {MAX_WORKERS} concurrent Claude process(es)")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    process_question, q, f"[{index + 1}/{total}]"
+                ): q
+                for index, q in enumerate(pending)
+            }
+            for future in as_completed(futures):
+                q = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    _log(f"Unexpected error on {q}: {exc!r}")
 
     print("\nDone.")
 
