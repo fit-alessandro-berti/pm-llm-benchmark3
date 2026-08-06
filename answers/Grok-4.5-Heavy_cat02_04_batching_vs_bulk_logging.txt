@@ -1,0 +1,261 @@
+# 1. Cluster diagnoses
+
+| cluster | top_explanation | second_explanation | confidence_0_to_100 | strongest_evidence | strongest_counterevidence | physical_concurrency_plausible | data_correction_needed |
+|---------|-----------------|--------------------|---------------------|--------------------|---------------------------|--------------------------------|------------------------|
+| G1 | genuine simultaneous batch | start batching/common setup | 92 | RBT-7 fixture holds exactly 4 + identical 1 s PLC start/complete timestamps + consecutive sequence_nos | possible wait-for-full-load then common trigger | Yes | No (flag as batch for formation wait) |
+| G2 | start batching/common setup | concurrent work or multitasking | 88 | single “begin group” button + all starts exactly 10:00 + staggered individual completes | coarsening unlikely (1 min precision, varying ends) | Partial | Yes (common-start treatment) |
+| G3 | end batching/common completion or bulk submission | sequential with delayed logging | 90 | staggered starts + identical complete 11:30 + recorded 11:31 + context of folder submission | true simultaneous physical finish possible | No | Yes (impute or discount bulk ends) |
+| G4 | sequential batching | another: pure sequential work | 95 | exact adjacency chain (start_n = complete_{n-1}) + 1 s scanner precision + max concurrent = 1 | none material | No | No |
+| G5 | concurrent work or multitasking | shared-account artifact | 80 | overlapping intervals (max concurrent 4) + shared_VDI login used by up to 3 analysts | 4 > stated pool max 3 (mild over-subscription) | Yes | Yes (resource identity disambiguation) |
+| G6 | end batching/common completion or bulk submission | queue accumulation after capacity loss | 95 | all start = complete = 17:00 (zero duration) + manual_bulk_form + arrivals hours earlier | genuine simultaneous zero-work closes | No | Yes (strongly; exclude or special-handle) |
+| G7 | timestamp coarsening | genuine simultaneous batch | 85 | 15 min precision + explicit undocumented rounding rule + identical times despite staggered arrivals and sequential recorded_at | possible physical group measure (no capacity context) | No | Yes (interval-censor by precision) |
+| G8 | sequential batching | queue accumulation after capacity loss | 90 | exact adjacency chain after safety-check window + 1 s scanner + max concurrent = 1 | different clocks between safety and repair systems | No | Minor (clock alignment) |
+
+# 2. Expected temporal signatures
+
+| Explanation | start equality | end equality | adjacency | overlap | recording lag | source precision match | resource ID reliability | queue-arrival pattern | under smaller time tolerance |
+|---|---|---|---|---|---|---|---|---|---|
+| genuine simultaneous batch | high | high | none | full | low | supports high-prec sources | high | staggered then common | remains |
+| start batching/common setup | high | low/variable | none | partial (from common start) | low | – | high | staggered then common | remains |
+| end batching/bulk submission | low/variable | high | none | partial (long tails) | medium (submit lag) | – | high | staggered | remains |
+| sequential batching | low | low | high | none | low | high-prec sources | high | often clustered | holds if gaps ≈ 0 |
+| concurrent work or multitasking | low | low | none | high | low | – | medium | any | persists |
+| shared-account artifact | variable | variable | variable | artificial high | variable | – | low | any | depends |
+| timestamp coarsening | high | high | possible | artificial | medium (sequential inserts) | aligns to precision bin | high | staggered | may dissolve into bin uncertainty |
+| queue accumulation after capacity loss | low | low | possible post-gap | none | – | – | high | early cluster + long pre-start wait | holds |
+| bulk/end-of-shift (zero-dur) | high (0-dur) | high (0-dur) | none | none | low (same recorded) | – | high | long spread | stays zero |
+
+# 3. Consequences for performance analysis
+
+**G1 (genuine simultaneous).** Waiting time is overstated for early arrivals because the observed start includes batch-formation wait until the fixture is ready; service time (~3 min) is accurate under true parallelism; utilization correctly reflects capacity-4 concurrency; bottleneck detection may correctly surface fixture size but underestimates parallel capacity if the batch is ignored. Mechanism: identical high-precision intervals produce maximal overlap.
+
+**G2 (start batching).** Waiting is inflated by the common “begin group” start; service times measured from the common start to individual completes appear variable (8–27 min) and may be realistic if work proceeds in parallel after the group begin, or overstated if the resource works sequentially; utilization shows continuous occupation from first start to last complete; the group-start delay can be misread as a capacity constraint. Mechanism: forced start equality.
+
+**G3 (end batching).** Waiting (queue → start) is relatively unbiased; service is overstated, especially for earlier cases (start-to-common-complete includes hold time until folder submission); utilization appears busy until the common 11:30 for all cases; bottleneck detection creates a false late congestion at submission time. Mechanism: common complete collapses ends and lengthens apparent tails.
+
+**G4 (sequential batching).** Waiting, service (~4 min), utilization (near-100 % sequential chain) and bottleneck detection are largely unbiased. Minor risk only if a batch-aware algorithm mis-applies concurrent metrics to the adjacency pattern. Mechanism: perfect non-overlapping adjacency.
+
+**G5 (concurrent under shared account).** Waiting and per-case service are mostly usable; utilization is severely understated when the single resource ID is treated as one worker (actual capacity up to three, observed max concurrent 4); bottleneck detection underestimates analyst-pool capacity. Mechanism: shared login hides multiplicity while real overlaps exist.
+
+**G6 (end-of-shift bulk).** Waiting is massively inflated (queue arrivals 14:05–16:25 mapped to a single 17:00 timestamp, average ~103 min); service collapses to near-zero (start = complete); utilization shows only an instantaneous spike at 17:00 and understates any earlier effort; bottleneck detection fabricates an end-of-day pile-up and hides true process times.  
+**Why both inflated waiting and near-zero service occur together:** the bulk form writes identical lifecycle timestamps long after the actual (unrecorded) work and the queue arrivals; the entire interval is collapsed to a single late point, stretching every wait to the logging moment while setting every duration to zero. Throughput therefore appears artificially delayed.
+
+**G7 (timestamp coarsening).** Waiting is distorted by rounding (some arrivals after the rounded start produce negative waits); service is fixed at the artificial 15 min bin for every case; utilization overstates concurrency (all five appear simultaneous); bottleneck detection reports a spurious simultaneous load. Mechanism: precision forces equality inside bins and the undocumented rounding rule.
+
+**G8 (sequential after downtime).** Waiting is elevated by genuine queue accumulation during the safety-check window (arrivals ~15:00–15:08, first start 15:38); service (~7 min) is unbiased; utilization is sequential after recovery; bottleneck detection correctly surfaces the capacity-loss interval then the sequential triage. Clock-skew caveat may shift the exact downtime length. Mechanism: adjacency after a clear temporal gap.
+
+Overall, batch-like temporal patterns (G1–G3, G6, G7) systematically trade waiting against service and distort concurrency metrics; pure sequential chains (G4, G8) are cleaner; shared identity (G5) primarily harms utilization and capacity estimates.
+
+# 4. PM4Py and pandas analysis
+
+```python
+import pandas as pd
+from datetime import datetime, timedelta
+import pm4py
+
+# 1. Construct the supplied rows in memory
+raw = [
+    {"cluster":"G1","case":"L01","activity":"Apply label","resource":"RBT-7","queue_arrival":"08:54","start":"09:00","complete":"09:03","recorded_at":"09:03:02","source":"PLC","precision":"1 sec","sequence_no":501},
+    {"cluster":"G1","case":"L02","activity":"Apply label","resource":"RBT-7","queue_arrival":"08:55","start":"09:00","complete":"09:03","recorded_at":"09:03:02","source":"PLC","precision":"1 sec","sequence_no":502},
+    {"cluster":"G1","case":"L03","activity":"Apply label","resource":"RBT-7","queue_arrival":"08:56","start":"09:00","complete":"09:03","recorded_at":"09:03:03","source":"PLC","precision":"1 sec","sequence_no":503},
+    {"cluster":"G1","case":"L04","activity":"Apply label","resource":"RBT-7","queue_arrival":"08:58","start":"09:00","complete":"09:03","recorded_at":"09:03:03","source":"PLC","precision":"1 sec","sequence_no":504},
+    {"cluster":"G2","case":"S01","activity":"Surface inspection","resource":"T-B","queue_arrival":"09:42","start":"10:00","complete":"10:08","recorded_at":"10:09","source":"tablet","precision":"1 min","sequence_no":810},
+    {"cluster":"G2","case":"S02","activity":"Surface inspection","resource":"T-B","queue_arrival":"09:46","start":"10:00","complete":"10:14","recorded_at":"10:15","source":"tablet","precision":"1 min","sequence_no":811},
+    {"cluster":"G2","case":"S03","activity":"Surface inspection","resource":"T-B","queue_arrival":"09:49","start":"10:00","complete":"10:21","recorded_at":"10:22","source":"tablet","precision":"1 min","sequence_no":812},
+    {"cluster":"G2","case":"S04","activity":"Surface inspection","resource":"T-B","queue_arrival":"09:54","start":"10:00","complete":"10:27","recorded_at":"10:28","source":"tablet","precision":"1 min","sequence_no":813},
+    {"cluster":"G3","case":"E01","activity":"Release review","resource":"T-C","queue_arrival":"10:40","start":"11:02","complete":"11:30","recorded_at":"11:31","source":"desktop_form","precision":"1 min","sequence_no":1201},
+    {"cluster":"G3","case":"E02","activity":"Release review","resource":"T-C","queue_arrival":"10:52","start":"11:10","complete":"11:30","recorded_at":"11:31","source":"desktop_form","precision":"1 min","sequence_no":1202},
+    {"cluster":"G3","case":"E03","activity":"Release review","resource":"T-C","queue_arrival":"10:58","start":"11:17","complete":"11:30","recorded_at":"11:31","source":"desktop_form","precision":"1 min","sequence_no":1203},
+    {"cluster":"G3","case":"E04","activity":"Release review","resource":"T-C","queue_arrival":"11:05","start":"11:24","complete":"11:30","recorded_at":"11:31","source":"desktop_form","precision":"1 min","sequence_no":1204},
+    {"cluster":"G4","case":"P01","activity":"Pack item","resource":"T-D","queue_arrival":"11:58","start":"12:05","complete":"12:09","recorded_at":"12:09:04","source":"scanner","precision":"1 sec","sequence_no":2101},
+    {"cluster":"G4","case":"P02","activity":"Pack item","resource":"T-D","queue_arrival":"11:59","start":"12:09","complete":"12:13","recorded_at":"12:13:05","source":"scanner","precision":"1 sec","sequence_no":2102},
+    {"cluster":"G4","case":"P03","activity":"Pack item","resource":"T-D","queue_arrival":"12:00","start":"12:13","complete":"12:17","recorded_at":"12:17:03","source":"scanner","precision":"1 sec","sequence_no":2103},
+    {"cluster":"G4","case":"P04","activity":"Pack item","resource":"T-D","queue_arrival":"12:01","start":"12:17","complete":"12:21","recorded_at":"12:21:06","source":"scanner","precision":"1 sec","sequence_no":2104},
+    {"cluster":"G4","case":"P05","activity":"Pack item","resource":"T-D","queue_arrival":"12:02","start":"12:21","complete":"12:25","recorded_at":"12:25:05","source":"scanner","precision":"1 sec","sequence_no":2105},
+    {"cluster":"G5","case":"A01","activity":"Root-cause analysis","resource":"analyst_pool","queue_arrival":"12:45","start":"13:00","complete":"13:25","recorded_at":"13:26","source":"shared_VDI","precision":"1 min","sequence_no":3051},
+    {"cluster":"G5","case":"A02","activity":"Root-cause analysis","resource":"analyst_pool","queue_arrival":"12:50","start":"13:05","complete":"13:20","recorded_at":"13:21","source":"shared_VDI","precision":"1 min","sequence_no":3052},
+    {"cluster":"G5","case":"A03","activity":"Root-cause analysis","resource":"analyst_pool","queue_arrival":"12:54","start":"13:10","complete":"13:30","recorded_at":"13:31","source":"shared_VDI","precision":"1 min","sequence_no":3053},
+    {"cluster":"G5","case":"A04","activity":"Root-cause analysis","resource":"analyst_pool","queue_arrival":"12:57","start":"13:12","complete":"13:22","recorded_at":"13:23","source":"shared_VDI","precision":"1 min","sequence_no":3054},
+    {"cluster":"G6","case":"C01","activity":"Close ticket","resource":"T-F","queue_arrival":"14:05","start":"17:00","complete":"17:00","recorded_at":"17:01","source":"manual_bulk_form","precision":"1 min","sequence_no":4401},
+    {"cluster":"G6","case":"C02","activity":"Close ticket","resource":"T-F","queue_arrival":"14:32","start":"17:00","complete":"17:00","recorded_at":"17:01","source":"manual_bulk_form","precision":"1 min","sequence_no":4402},
+    {"cluster":"G6","case":"C03","activity":"Close ticket","resource":"T-F","queue_arrival":"14:58","start":"17:00","complete":"17:00","recorded_at":"17:01","source":"manual_bulk_form","precision":"1 min","sequence_no":4403},
+    {"cluster":"G6","case":"C04","activity":"Close ticket","resource":"T-F","queue_arrival":"15:10","start":"17:00","complete":"17:00","recorded_at":"17:01","source":"manual_bulk_form","precision":"1 min","sequence_no":4404},
+    {"cluster":"G6","case":"C05","activity":"Close ticket","resource":"T-F","queue_arrival":"15:44","start":"17:00","complete":"17:00","recorded_at":"17:01","source":"manual_bulk_form","precision":"1 min","sequence_no":4405},
+    {"cluster":"G6","case":"C06","activity":"Close ticket","resource":"T-F","queue_arrival":"16:02","start":"17:00","complete":"17:00","recorded_at":"17:01","source":"manual_bulk_form","precision":"1 min","sequence_no":4406},
+    {"cluster":"G6","case":"C07","activity":"Close ticket","resource":"T-F","queue_arrival":"16:25","start":"17:00","complete":"17:00","recorded_at":"17:01","source":"manual_bulk_form","precision":"1 min","sequence_no":4407},
+    {"cluster":"G7","case":"M01","activity":"Manual measure","resource":"T-G","queue_arrival":"13:58","start":"14:00","complete":"14:15","recorded_at":"14:16","source":"legacy_MES","precision":"15 min","sequence_no":7071},
+    {"cluster":"G7","case":"M02","activity":"Manual measure","resource":"T-G","queue_arrival":"14:01","start":"14:00","complete":"14:15","recorded_at":"14:17","source":"legacy_MES","precision":"15 min","sequence_no":7072},
+    {"cluster":"G7","case":"M03","activity":"Manual measure","resource":"T-G","queue_arrival":"14:04","start":"14:00","complete":"14:15","recorded_at":"14:18","source":"legacy_MES","precision":"15 min","sequence_no":7073},
+    {"cluster":"G7","case":"M04","activity":"Manual measure","resource":"T-G","queue_arrival":"14:07","start":"14:00","complete":"14:15","recorded_at":"14:19","source":"legacy_MES","precision":"15 min","sequence_no":7074},
+    {"cluster":"G7","case":"M05","activity":"Manual measure","resource":"T-G","queue_arrival":"14:11","start":"14:00","complete":"14:15","recorded_at":"14:20","source":"legacy_MES","precision":"15 min","sequence_no":7075},
+    {"cluster":"G8","case":"Q01","activity":"Repair triage","resource":"T-H","queue_arrival":"15:00","start":"15:38","complete":"15:45","recorded_at":"15:45:06","source":"scanner","precision":"1 sec","sequence_no":9201},
+    {"cluster":"G8","case":"Q02","activity":"Repair triage","resource":"T-H","queue_arrival":"15:02","start":"15:45","complete":"15:52","recorded_at":"15:52:05","source":"scanner","precision":"1 sec","sequence_no":9202},
+    {"cluster":"G8","case":"Q03","activity":"Repair triage","resource":"T-H","queue_arrival":"15:04","start":"15:52","complete":"15:59","recorded_at":"15:59:03","source":"scanner","precision":"1 sec","sequence_no":9203},
+    {"cluster":"G8","case":"Q04","activity":"Repair triage","resource":"T-H","queue_arrival":"15:05","start":"15:59","complete":"16:06","recorded_at":"16:06:04","source":"scanner","precision":"1 sec","sequence_no":9204},
+    {"cluster":"G8","case":"Q05","activity":"Repair triage","resource":"T-H","queue_arrival":"15:08","start":"16:06","complete":"16:13","recorded_at":"16:13:02","source":"scanner","precision":"1 sec","sequence_no":9205},
+]
+
+df = pd.DataFrame(raw)
+base = datetime(2026, 5, 26)
+
+def parse_ts(t):
+    if pd.isna(t) or t == "":
+        return pd.NaT
+    parts = str(t).split(":")
+    if len(parts) == 2:
+        return base + timedelta(hours=int(parts[0]), minutes=int(parts[1]))
+    return base + timedelta(hours=int(parts[0]), minutes=int(parts[1]), seconds=int(parts[2]))
+
+for c in ["queue_arrival", "start", "complete", "recorded_at"]:
+    df[c] = df[c].apply(parse_ts)
+
+# 2–3. PM4Py-compatible interval log + format_dataframe
+df_pm = df.rename(columns={
+    "case": "case:concept:name",
+    "activity": "concept:name",
+    "complete": "time:timestamp",
+    "start": "start_timestamp",
+    "resource": "org:resource"
+})
+df_pm = pm4py.format_dataframe(
+    df_pm,
+    case_id="case:concept:name",
+    activity_key="concept:name",
+    timestamp_key="time:timestamp",
+    start_timestamp_key="start_timestamp"
+)
+
+# 4. Batch discovery under multiple parameter combinations
+print("=== PM4Py discover_batches ===")
+for md in [0, 60]:
+    for mbs in [2, 3]:
+        batches = pm4py.discover_batches(df_pm, merge_distance=md, min_batch_size=mbs)
+        print(f"\nmerge_distance={md}s, min_batch_size={mbs} -> {len(batches)} activity-resource groups")
+        for (act_res, size, detail) in batches:
+            cats = list(detail.keys()) if isinstance(detail, dict) else [str(detail)]
+            print(f"  {act_res}: size={size}, categories={cats}")
+
+# 5–6. Independent pandas diagnostics (preserve all clusters, including zero-duration)
+df["service_s"] = (df["complete"] - df["start"]).dt.total_seconds()
+df["wait_s"] = (df["start"] - df["queue_arrival"]).dt.total_seconds()
+df["lag_s"] = (df["recorded_at"] - df["complete"]).dt.total_seconds()
+
+rows = []
+for cl, g in df.groupby("cluster"):
+    n = len(g)
+    uniq_s = g["start"].nunique()
+    uniq_e = g["complete"].nunique()
+    start_eq = uniq_s == 1
+    end_eq = uniq_e == 1
+    mean_svc = g["service_s"].mean()
+    mean_wait = g["wait_s"].mean()
+    mean_lag = g["lag_s"].mean()
+    # adjacency
+    gs = g.sort_values("start")
+    adj = sum(1 for i in range(n-1) if gs.iloc[i]["complete"] == gs.iloc[i+1]["start"])
+    # max concurrent (sweep line)
+    ev = []
+    for _, r in g.iterrows():
+        ev.append((r["start"], 1))
+        ev.append((r["complete"], -1))
+    ev.sort(key=lambda x: (x[0], -x[1]))
+    cur = mx = 0
+    for _, d in ev:
+        cur += d
+        mx = max(mx, cur)
+    # queue build-up indicator
+    q_span = (g["queue_arrival"].max() - g["queue_arrival"].min()).total_seconds() / 60
+    pre_start = (g["start"].min() - g["queue_arrival"].min()).total_seconds() / 60
+    rows.append({
+        "cluster": cl, "n": n, "start_eq": start_eq, "end_eq": end_eq,
+        "uniq_starts": uniq_s, "uniq_ends": uniq_e,
+        "adj_rate": round(adj / max(n-1, 1), 2), "max_conc": mx,
+        "mean_svc_min": round(mean_svc / 60, 1), "mean_wait_min": round(mean_wait / 60, 1),
+        "mean_lag_s": round(mean_lag, 0), "q_span_min": round(q_span, 1),
+        "pre_start_min": round(pre_start, 1)
+    })
+
+diag = pd.DataFrame(rows).set_index("cluster")
+print("\n=== Independent pandas cluster diagnostics ===")
+print(diag.to_string())
+
+# 7. Compact comparison with PM4Py categories (from runs above)
+print("\n=== Comparison summary ===")
+print("""
+PM4Py (any of the tested merge_distance / min_batch_size) detects:
+  G1 Apply label / RBT-7          -> Simultaneous
+  G2 Surface inspection / T-B     -> Batching on Start
+  G3 Release review / T-C         -> Batching on End
+  G4 Pack item / T-D              -> Sequential batching
+  G5 Root-cause analysis / pool   -> Concurrent batching
+  G6 Close ticket / T-F           -> Simultaneous (zero-duration)
+  G7 Manual measure / T-G         -> Simultaneous
+  G8 Repair triage / T-H          -> Sequential batching
+
+Pandas independent evidence aligns but adds critical qualifiers:
+  G1: max_conc=4 + lag~2 s + fixture context -> genuine simultaneous (not only temporal)
+  G2: start_eq + staggered ends + begin-group button -> start batching
+  G3: end_eq + staggered starts + form context -> end/bulk batching
+  G4/G8: adj_rate=1.0 + max_conc=1 -> sequential (clean)
+  G5: max_conc=4 under shared ID -> concurrent + shared-account
+  G6: mean_svc=0 + mean_wait~103 min + bulk form -> end-of-shift bulk (not physical simultaneous)
+  G7: start/end_eq + negative waits + 15 min prec + rounding -> coarsening artifact
+""")
+```
+
+# 5. Robustness and alternative explanations
+
+**Resource IDs trusted as single workers.**  
+G1 remains simultaneous only because of the explicit fixture capacity; without it the identical timestamps would be anomalous for one robot. G5 overlaps force either intensive single-person multitasking or data error; utilization appears >100 % or concurrent under one ID, flagging an anomaly. All other clusters are unaffected because their resource IDs behave as dedicated.
+
+**Resource IDs treated as potentially shared accounts.**  
+G5 becomes the expected concurrent multi-person pattern (capacity up to 3); utilization can be normalized by the known pool size. Shared-account artifact rises in ranking for any unexpected overlap. Dedicated resources (RBT-7, T-x) stay single.
+
+**Timestamps treated as exact.**  
+Exact equalities become strong evidence for simultaneous / start-batch / end-batch / bulk (G1, G2, G3, G6). G7 equalities become suspicious given the stated 15 min precision.
+
+**Timestamps interval-censored by stated precision.**  
+- G1 (1 s): windows remain tiny; simultaneous interpretation survives.  
+- G2 / G3 (1 min): starts and ends acquire ±30 s uncertainty; exact equality weakens to “within precision,” lowering confidence slightly but still favoring the batch readings.  
+- G7 (15 min): every timestamp expands to a large bin; observed equality is an artifact of rounding; true order and service duration inside each bin are unknown; sequential or concurrent work both become possible; confidence in any physical batch collapses.  
+- G4 / G8 (1 s): adjacency chains remain robust.  
+- G6 zero-duration remains zero even under censoring.
+
+**Three cases in which the same temporal pattern supports multiple physical explanations**  
+1. Identical start *and* complete timestamps (G1 vs G7): genuine simultaneous physical batch (supported by fixture capacity and high-precision PLC) versus pure timestamp coarsening/rounding (supported by 15 min precision + undocumented rule). Pattern alone is insufficient; source semantics and capacity context decide.  
+2. Identical completion timestamps with staggered starts (G3 vs G6): end-batching of real sequential work followed by bulk form submission versus pure bulk/end-of-shift logging that never captured intermediate lifecycle events (zero duration). Distinguisher: presence of plausible staggered starts and non-zero service.  
+3. Non-overlapping adjacency chains (G4 vs G8): pure sequential processing of a contiguous block of cases versus sequential work that begins only after a capacity-loss / downtime interval that allowed a queue to accumulate. Distinguisher: external safety-check event + early clustered arrivals + long pre-start wait.
+
+These ambiguities demonstrate why PM4Py batch labels (purely temporal) must be combined with independent data-quality evidence (precision, resource type, recording lag, external context) before any physical execution semantics are assigned.
+
+# 6. Data-collection redesign
+
+Prioritized recommendations:
+
+1. **Badge-level / individual resource identity** captured separately from shared logins or VDI accounts (critical for analyst_pool / G5).  
+2. **Sensor- or PLC-driven high-resolution lifecycle timestamps** (true start / complete) independent of UI form or bulk-submit events (eliminates G3 / G6 bulk-logging bias).  
+3. **Explicit group / batch / fixture identifiers** together with workstation capacity metadata emitted by the PLC or cell controller (strengthens G1 and any future multi-item stations).  
+4. **Cross-system clock synchronization** and explicit recording of which clock source each timestamp belongs to (resolves G8 safety-versus-repair skew).  
+5. **Pause / resume or downtime events** linked to resource and (where possible) case, so capacity-loss intervals are first-class (G8 and any future downtime).  
+6. **Documented and machine-readable precision** plus any rounding or binning rules applied by the source system (makes G7-style coarsening detectable and correctable).  
+7. **Always separate recorded_at (database insertion)** from execution timestamps; retain both.  
+8. **For tablet / form sources**: log intermediate button events (begin-group, individual complete presses) in addition to final submit, preserving the true lifecycle that G2 / G3 currently collapse.
+
+Implementation order should follow impact on waiting-time and service-time bias: identity and independent lifecycle timestamps first, then capacity / batch IDs, then clocks and downtime, then precision metadata.
+
+# 7. Final adjudication
+
+**High-confidence interpretations** (temporal pattern + source semantics + context align, confidence ≥ 88):  
+G1 (genuine simultaneous batch), G2 (start batching), G3 (end / bulk batching), G4 (sequential batching), G6 (end-of-shift bulk), G8 (sequential after capacity loss).
+
+**Exclude or interval-censor in queue / waiting-time analysis**:  
+- G6 – zero-duration lifecycle and multi-hour artificial waits render conventional waiting and service statistics meaningless; treat arrivals as “still open at shift end” or impute from other sources.  
+- G7 – 15 min coarsening plus negative waits; expand every timestamp to its precision window or drop exact equality assumptions.
+
+**Require operational validation before any performance conclusion**:  
+- G5 – shared-account concurrency is real but the 4-versus-“up to 3” tension and missing badge identity leave residual uncertainty about true capacity and utilization.  
+- G7 – coarsening is the strongest reading, yet a physical multi-item measure cannot be ruled out without observing the station.  
+- G8 – sequential pattern is clear, yet the causal contribution of the safety-check (and any clock skew) needs field confirmation before downtime is declared the sole driver of the observed queue.  
+- Mild validation also advisable for G3 (confirm that reviews truly finished before the common submit time).
+
+In all cases PM4Py batch labels should be treated strictly as temporal-pattern detections; physical semantics are assigned only after the independent evidence (precision, capacity, resource identity, recording lag, external events) has been weighed.
