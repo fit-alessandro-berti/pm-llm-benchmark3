@@ -642,7 +642,8 @@ def is_large_reasoning_model(m_name):
         return False
 
     return (
-        _config_enables_reasoning(_manual_model_config(m_name))
+        model_name.endswith("-low")
+        or _config_enables_reasoning(_manual_model_config(m_name))
         or _qwen_reasoning_model(model_name)
         or any(marker in model_name for marker in _REASONING_MARKERS)
         or any(re.search(pattern, model_name) for pattern in _REASONING_PATTERNS)
