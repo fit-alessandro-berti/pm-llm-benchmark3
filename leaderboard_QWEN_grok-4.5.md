@@ -8,7 +8,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | qwen3.6-27b       | **36.7** | :white_check_mark: | :white_check_mark: | 4.5                  | 4.1                  | :mage_woman: **5.2** | 4.0                  | 4.3                  | 4.6                  | 5.1                  | **5.0**              |
 | qwen3.5-397b-a17b | **36.2** | :white_check_mark: | :white_check_mark: | 4.4                  | 4.1                  | **4.9**              | 4.0                  | 4.4                  | 4.5                  | 4.9                  | **4.9**              |
 | qwen3.5-122b-a10b | **33.5** | :white_check_mark: | :white_check_mark: | 4.1                  | 3.5                  | 4.3                  | 3.1                  | 3.9                  | 4.7                  | 4.7                  | **5.1**              |
-| qwen3.6-35b-a3b   | **33.4** | :white_check_mark: | :white_check_mark: | 4.2                  | 3.2                  | 4.3                  | 3.2                  | 4.0                  | 4.7                  | 5.0                  | 4.7                  |
+| qwen3.6-35b-a3b   | **33.4** | :white_check_mark: | :white_check_mark: | 4.3                  | 3.2                  | 4.3                  | 3.2                  | 4.0                  | 4.7                  | 5.0                  | 4.8                  |
 | qwen3.5-9b        | **25.7** | :white_check_mark: | :white_check_mark: | 3.4                  | 2.2                  | 3.3                  | 2.6                  | 2.7                  | 3.1                  | 4.6                  | 3.8                  |
 
 ### qwenqwen3.8-max   => 41.9 points
