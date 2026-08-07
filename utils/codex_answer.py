@@ -1,7 +1,8 @@
 """Answer PM-LLM-Benchmark questions using the OpenAI Codex CLI.
 
 Hard-code TARGET_MODEL_NAME (answer filename prefix), TARGET_MODEL (codex --model),
-TARGET_REASONING_EFFORT, MAX_WORKERS, and CODEX_COMMAND below, then run:
+TARGET_REASONING_EFFORT, MAX_WORKERS, MAX_QUESTIONS, and CODEX_COMMAND below,
+then run:
 
     python -m utils.codex_answer
     # or: python utils/codex_answer.py
@@ -35,6 +36,9 @@ TARGET_REASONING_EFFORT = "xhigh"  # none | low | medium | high | xhigh
 # Max concurrent Codex CLI invocations. Each worker handles one question
 # end-to-end (including its own retries) independently of the others.
 MAX_WORKERS = 30
+
+# Max unanswered questions to process in this run. Set to None for no limit.
+MAX_QUESTIONS = None
 
 # Command template. {prompt}, {model}, and {effort} are filled per question.
 # The prompt itself instructs Codex to read questions/<q>.txt and write
@@ -163,12 +167,15 @@ def main() -> None:
     if MAX_WORKERS < 1:
         print("MAX_WORKERS must be >= 1", file=sys.stderr)
         sys.exit(1)
+    if MAX_QUESTIONS is not None and MAX_QUESTIONS < 1:
+        print("MAX_QUESTIONS must be >= 1 or None", file=sys.stderr)
+        sys.exit(1)
 
     questions = list_questions()
     print(
         f"Codex answering with model_name={TARGET_MODEL_NAME!r}, "
         f"model={TARGET_MODEL!r}, reasoning_effort={TARGET_REASONING_EFFORT!r}, "
-        f"max_workers={MAX_WORKERS}"
+        f"max_workers={MAX_WORKERS}, max_questions={MAX_QUESTIONS}"
     )
     print(f"{len(questions)} question file(s) under {QUESTIONS_DIR}/")
 
@@ -181,8 +188,12 @@ def main() -> None:
         else:
             pending.append(q)
 
+    pending_count = len(pending)
+    if MAX_QUESTIONS is not None:
+        pending = pending[:MAX_QUESTIONS]
+
     total = len(pending)
-    print(f"{total} question(s) remaining")
+    print(f"{pending_count} question(s) remaining; {total} selected for this run")
     if not pending:
         print("\nDone.")
         return
