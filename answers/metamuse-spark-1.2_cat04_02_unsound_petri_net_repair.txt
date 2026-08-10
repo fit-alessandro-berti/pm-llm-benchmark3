@@ -1,0 +1,226 @@
+# 1. Executive Verdict
+The net **is a workflow net** structurally (unique source `source`, unique sink `sink`, every node on a source-to-sink path) and `pm4py.check_is_workflow_net` should return `True`. It **should be expected to be sound** because the intent is a safe, option-to-complete block with proper completion to `fm = [sink:1]`.
+
+It is **not sound**. Principal defect: `t_join_waived` synchronizes only `p_waived` (1 input) while the parallel token in `p_analysis`/`p_analysis_done` is ignored. Authorization via the waiver path can fire without `t_analyze` completing and leaves a stray token that can never be removed to reach the exact final marking.
+
+Business consequence: a waived review case can be authorized before analysis is done or leave analysis in-flight/orphaned, violating *“authorization only after analysis AND (standard review OR waiver)”* and producing improper completion with remaining tokens.
+
+# 2. Structural Diagnosis
+
+| Element or subnet | Intended role | Actual structural effect | Potential symptom |
+|---|---|---|---|
+| `source`->`t_register`->`p_ready`, `im=[source:1]`, `fm=[sink:1]` | Unique start/end, one case token | Correct single source/sink framing | No structural violation; workflow-net check passes on this alone |
+| `t_split` : `p_ready` -> `p_analysis` + `p_review` | AND-split: start analysis and review in parallel | Correct fork producing 2 concurrent tokens | Enables true parallelism; requires matching AND-join later |
+| `p_analysis`->`t_analyze`->`p_analysis_done` | Mandatory analysis branch | Correct linear sub-process, always available after split | If not joined, token survives to end |
+| `p_review`->`t_standard_review`->`p_review_done` and `p_review`->`t_waive_review`->`p_waived` | XOR-choice inside review branch: one of standard vs waiver consumes `p_review` | Correct mutual exclusion on `p_review`; two disjoint output places | Creates two alternative completion places that must be re-converged |
+| `t_join_normal`: `p_analysis_done`+`p_review_done` -> `p_decision` | AND-join for standard path | Correct 2-input synchronization | Only usable when standard review chosen |
+| `t_join_waived`: `p_waived` -> `p_decision` | Intended AND-join for waiver path (analysis + waiver) | **Defect: 1-input “join”** – consumes only waiver token, no dependency on `p_analysis`/`p_analysis_done` | Authorization enabled without analysis; analysis token orphaned => improper completion, violation of option-to-complete properly |
+| `p_decision`->`t_authorize`->`sink` | Final authorization gate | Linear join output | Inherits defect of upstream joins |
+| Source-to-sink path condition | Every node must lie on some source->sink path | Satisfied: even `p_waived` and `t_join_waived` are on a path `source-...-split-p_review-waive-p_waived-join_waived-p_decision-authorize-sink`, similarly `p_analysis_done` can reach sink via `join_normal` | Net passes `check_is_workflow_net`; structure alone does not catch the AND/XOR join mismatch |
+
+Structural workflow-net property  soundness. Soundness requires behavioural guarantees: option to complete to *exactly* `fm`, proper completion (no extra tokens when sink marked), and no dead transitions.
+
+# 3. Marking-Based Counterexample
+
+Legal firing sequence exposing waiver-by-pass and leftover token:
+
+`t_register`, `t_split`, `t_waive_review`, `t_join_waived`, `t_authorize` — with `t_analyze` fired either never, before `t_authorize`, or after.
+
+Primary trace: waive, then authorize **before** analysis, then attempt to clean up.
+
+| Step | Fired transition | Resulting nonzero marking | Enabled transitions | Observation |
+|---|---|---|---|---|
+| 0 | - | `source:1` | `t_register` | `im` |
+| 1 | `t_register` | `p_ready:1` | `t_split` | case registered |
+| 2 | `t_split` | `p_analysis:1, p_review:1` | `t_analyze, t_standard_review, t_waive_review` | AND-split creates two parallel tokens as intended |
+| 3 | `t_waive_review` | `p_analysis:1, p_waived:1` | `t_analyze, t_join_waived` | XOR choice resolved to waiver; analysis still pending |
+| 4 | `t_join_waived` | `p_analysis:1, p_decision:1` | `t_analyze, t_authorize` | **Defect:** join consumed only `p_waived`, preserved analysis token. Marking shows parallel branch ignored |
+| 5 | `t_authorize` | `p_analysis:1, sink:1` | `t_analyze` | **“Token in sink”  “exact final marking”.** `sink:1` exists but `fm=[sink:1]` not reached because `p_analysis:1` remains. This is improper completion. Authorization occurred **without** analysis. |
+| 6 | `t_analyze` | `p_analysis_done:1, sink:1` | *(none)* | Late analysis now produces `p_analysis_done:1`. No transition can consume it: `t_join_normal` needs `p_review_done` (consumed earlier), `t_join_waived` already fired and needs `p_waived`. Token is dead / unsound. Net deadlocks with extra token. |
+
+Why it cannot be consumed: After step 5, `p_waived` and `p_review_done` are empty, `p_decision` is empty. Both joins are dead. The only consumer of `p_analysis_done` is `t_join_normal`, which will never be enabled again.
+
+Interleaving variant shows ordering violation is independent: If we fire `t_analyze` between steps 3 and 4 (`p_analysis_done:1, p_waived:1` -> `t_join_waived` -> `p_analysis_done:1, p_decision:1` -> `t_authorize` -> `p_analysis_done:1, sink:1`), the same leftover `p_analysis_done:1` remains. In both interleavings `t_authorize` is enabled **before** `t_analyze` has to fire.
+
+Second counterexample (completeness contrast, not a second defect but shows asymmetry):
+Sequence `t_register, t_split, t_analyze, t_standard_review, t_join_normal, t_authorize` yields `sink:1` only, proper completion, all transitions join correctly. This proves the net is *not* dead for the standard path, making the waiver-specific soundness failure subtle and not detectable by structure alone.
+
+# 4. Minimal-Repair Alternatives
+
+Edit-cost model: **cost = #arc_add + #arc_remove + 2×#place_add/remove + 2×#transition_add/remove** (places/transitions cost more than arcs because they change state space). Label change on an existing transition costs 1. Preservation measured against business intent: mandatory analysis + (standard XOR waiver) + authorization after both.
+
+| Repair | Exact edits | Edit cost | Preserved intent | Changed behavior | New risk |
+|---|---|---|---|---|---|
+| **R1 – Convergent review completion (merge)** | Change `t_waive_review` output from `p_waived` to `p_review_done`; remove `p_waived` (1 place), `t_join_waived` (1 trans), arcs `p_reviewt_waive_review` stays, `t_waive_reviewp_waived`, `p_waivedt_join_waived`, `t_join_waivedp_decision` (3 arcs removed + 1 arc redirected: remove 1, add 1) | 1 add + 3 rem =4 arcs +2 +2 =8 | Retains mandatory analysis on both paths: both need `p_analysis_done`+`p_review_done` via `t_join_normal` | Waiver vs standard review become **indistinguishable downstream** (same place `p_review_done`). Both paths identical after review. | Loss of audit distinguishability: waiver no longer recorded as distinct state; reporting/mining cannot differentiate waived vs performed review without log label alone. No silent transitions. |
+| **R2 – Dual synchronizer (keep distinguishability)** | Add one arc `p_analysis_done  t_join_waived` . No deletions. `t_join_waived` becomes 2-input AND-join: `p_analysis_done`+`p_waived``p_decision`, mirroring `t_join_normal`. | **1 arc add =1** | Retains mandatory analysis and keeps `p_review_done` vs `p_waived` distinct; fulfills *“analysis AND (review OR waiver)”* exactly | Behavior now has two alternative AND-joins competing for `p_analysis_done`. Waiver and standard are separate silent synchronizers producing `p_decision`. | Duplicate silent behavior / confusion: `p_analysis_done` can be consumed by either join; free-choice violation, potential for duplicate traces indistinguishable in reachability graph; analysts may misinterpret two tor silent routes. No livelock, but non-determinism on `p_analysis_done` (harmless because only one review token exists). |
+| **R3 – Policy change: optional analysis under waiver** (explicit) | Add arc `p_analysis  t_join_waived` OR add cleanup transition; simplest minimal version: keep `t_join_waived` as 1-input but add arc `p_analysis  t_join_waived` and add arc `p_analysis_done  t_join_waived` alternative? Minimal illustration: Add `p_analysis  t_join_waived` consuming the analysis token before it is performed, remove need for `t_analyze` on waiver path. | 1 arc add =1 (but label change required to document policy) | **Does NOT preserve mandatory analysis** – explicitly declares waiver bypasses analysis | Waiver path can authorize while analysis is still in `p_analysis`, i.e., analysis skippable/aborted when waived. Sound because no leftover token. | Violates original business rule unless business approves; hides non-compliance; regression tests would need to forbid this if policy not changed. Introduces “abort” semantics via token consumption. |
+
+Minimality justification: Under the cost model, **R2 is strictly minimal (cost 1)** and dominates all repairs that retain mandatory analysis and distinguishability – any sound repair that keeps `p_waived` distinct must at least connect the orphaned analysis token to the waiver join, which needs 1 arc. R1 costs 8 because it deletes a place/transition and rewires, but is minimal *among merging repairs* that deliberately sacrifice distinguishability to avoid duplicate synchronizers. R3 also costs 1 but changes the policy; it ties R2 on cost but is not comparable because it relaxes the requirement from R2. Therefore no repair with cost 0 exists (soundness requires at least one structural change), R2 is the global minimal repair preserving intent and distinguishability, R1 is minimal if distinguishability is not required, R3 is minimal only if the business accepts optional analysis.
+
+# 5. Corrected PM4Py Code
+
+Selected repair: **R2 – Dual synchronizer** (preserves mandatory analysis and keeps waiver distinguishable; cost 1; no policy change). Change is commented.
+
+```python
+from pm4py.objects.petri_net.obj import PetriNet, Marking
+from pm4py.objects.petri_net.utils import petri_utils
+
+repaired_net = PetriNet("parallel_review_with_waiver_R2_dual_sync")
+
+# Places (identical to original)
+source = PetriNet.Place("source")
+p_ready = PetriNet.Place("p_ready")
+p_analysis = PetriNet.Place("p_analysis")
+p_review = PetriNet.Place("p_review")
+p_analysis_done = PetriNet.Place("p_analysis_done")
+p_review_done = PetriNet.Place("p_review_done")
+p_waived = PetriNet.Place("p_waived")
+p_decision = PetriNet.Place("p_decision")
+sink = PetriNet.Place("sink")
+
+for p in {source, p_ready, p_analysis, p_review, p_analysis_done,
+          p_review_done, p_waived, p_decision, sink}:
+    repaired_net.places.add(p)
+
+# Transitions (labels preserved)
+register = PetriNet.Transition("t_register", "Register Case")
+split = PetriNet.Transition("t_split", None)
+analyze = PetriNet.Transition("t_analyze", "Perform Analysis")
+standard_review = PetriNet.Transition("t_standard_review", "Perform Standard Review")
+waive_review = PetriNet.Transition("t_waive_review", "Record Review Waiver")
+join_normal = PetriNet.Transition("t_join_normal", None)
+join_waived = PetriNet.Transition("t_join_waived", None)
+authorize = PetriNet.Transition("t_authorize", "Authorize Case")
+
+for t in {register, split, analyze, standard_review, waive_review,
+          join_normal, join_waived, authorize}:
+    repaired_net.transitions.add(t)
+
+# Arcs – same as original
+petri_utils.add_arc_from_to(source, register, repaired_net)
+petri_utils.add_arc_from_to(register, p_ready, repaired_net)
+petri_utils.add_arc_from_to(p_ready, split, repaired_net)
+petri_utils.add_arc_from_to(split, p_analysis, repaired_net)
+petri_utils.add_arc_from_to(split, p_review, repaired_net)
+
+petri_utils.add_arc_from_to(p_analysis, analyze, repaired_net)
+petri_utils.add_arc_from_to(analyze, p_analysis_done, repaired_net)
+
+petri_utils.add_arc_from_to(p_review, standard_review, repaired_net)
+petri_utils.add_arc_from_to(standard_review, p_review_done, repaired_net)
+
+petri_utils.add_arc_from_to(p_review, waive_review, repaired_net)
+petri_utils.add_arc_from_to(waive_review, p_waived, repaired_net)
+
+petri_utils.add_arc_from_to(p_analysis_done, join_normal, repaired_net)
+petri_utils.add_arc_from_to(p_review_done, join_normal, repaired_net)
+petri_utils.add_arc_from_to(join_normal, p_decision, repaired_net)
+
+petri_utils.add_arc_from_to(p_waived, join_waived, repaired_net)
+petri_utils.add_arc_from_to(join_waived, p_decision, repaired_net)
+
+# --- REPAIR R2: make waiver join synchronized with analysis ---
+# Original had only p_waived -> t_join_waived.
+# Adding this arc forces authorization to wait for analysis even on waiver path.
+petri_utils.add_arc_from_to(p_analysis_done, join_waived, repaired_net)
+
+petri_utils.add_arc_from_to(p_decision, authorize, repaired_net)
+petri_utils.add_arc_from_to(authorize, sink, repaired_net)
+
+repaired_im = Marking()
+repaired_im[source] = 1
+repaired_fm = Marking()
+repaired_fm[sink] = 1
+```
+
+# 6. Diagnostic and Reachability Code
+
+```python
+import pm4py
+from pm4py.objects.petri_net.obj import Marking
+
+# helper: fire by transition name with enabledness check and print marking
+def fire_and_print(net, marking, t_name):
+    # map name -> transition
+    t = next((x for x in net.transitions if x.name == t_name), None)
+    if t is None:
+        raise ValueError(f"Transition {t_name} not found")
+    enabled = pm4py.get_enabled_transitions(net, marking)
+    if t not in enabled:
+        print(f"NOT ENABLED: {t_name} | marking={dict((p.name, v) for p,v in marking.items() if v>0)} | enabled={[x.name for x in enabled]}")
+        return marking, False
+    # fire manually (pm4py semantics: consume inputs, produce outputs)
+    new_marking = Marking(marking)
+    for arc in t.in_arcs:
+        new_marking[arc.source] -= 1
+        if new_marking[arc.source] == 0:
+            del new_marking[arc.source]
+    for arc in t.out_arcs:
+        new_marking[arc.target] = new_marking.get(arc.target, 0) + 1
+    print(f"FIRED {t_name} -> {dict((p.name, v) for p,v in new_marking.items() if v>0)} | enabled next={[x.name for x in pm4py.get_enabled_transitions(net, new_marking)]}")
+    return new_marking, True
+
+def diagnostics(label, net, im, fm):
+    print(f"\n=== {label} ===")
+    print("is_workflow_net:", pm4py.check_is_workflow_net(net))
+    print("soundness:")
+    # print_diagnostics=True prints WOFLAN-style behavioural checks
+    pm4py.check_soundness(net, im, fm, print_diagnostics=True)
+    print("enabled at im:", [t.name for t in pm4py.get_enabled_transitions(net, im)])
+    rg = pm4py.convert_to_reachability_graph(net, im, fm)
+    print("reachability graph:", rg)
+
+# original variables assumed: net, im, fm
+# repaired variables assumed: repaired_net, repaired_im, repaired_fm
+diagnostics("ORIGINAL", net, im, fm)
+diagnostics("REPAIRED R2", repaired_net, repaired_im, repaired_fm)
+
+# counterexample replay on original (waiver bypass)
+print("\n--- Counterexample replay ORIGINAL (waiver without analysis) ---")
+m = Marking(im)
+for name in ["t_register","t_split","t_waive_review","t_join_waived","t_authorize"]:
+    m, ok = fire_and_print(net, m, name)
+    if not ok:
+        break
+print(f"Final marking equals fm? {m == fm} | sink tokens={m.get(sink,0)} | leftover analysis tokens={m.get(next(p for p in net.places if p.name=='p_analysis'),0)+m.get(next(p for p in net.places if p.name=='p_analysis_done'),0)}")
+# try to fire analyze late
+if sink in m:
+    fire_and_print(net, m, "t_analyze")
+
+# same sequence on repaired should NOT allow join/authorize before analyze
+print("\n--- Same sequence on REPAIRED (should block at t_join_waived) ---")
+m2 = Marking(repaired_im)
+for name in ["t_register","t_split","t_waive_review","t_join_waived"]:
+    m2, ok = fire_and_print(repaired_net, m2, name)
+    if not ok:
+        print("Blocked as expected: waiver join waits for analysis")
+        break
+# correct repaired sequence
+print("\n--- Correct repaired sequence ---")
+m2 = Marking(repaired_im)
+for name in ["t_register","t_split","t_waive_review","t_analyze","t_join_waived","t_authorize"]:
+    m2, ok = fire_and_print(repaired_net, m2, name)
+print(f"Repaired final marking equals fm? {m2 == repaired_fm}")
+```
+
+Expected qualitative difference: `check_is_workflow_net` returns `True` for **both** nets (structural property unchanged). `check_soundness` prints diagnostics indicating **unsound** for original (improper completion / remaining tokens, option-to-complete violation on waiver path; reachable marking `[sink:1, p_analysis(_done):1]`); and **sound** (or at least no improper completion) for repaired R2/R1. `get_enabled_transitions` at marking `[p_analysis:1, p_waived:1]` shows `t_join_waived` enabled in original but **not** in repaired until `p_analysis_done` present. `convert_to_reachability_graph` for original contains an extra dead branch with leftover tokens; repaired graph has no marking with `sink` + extra token and all markings can reach `fm`.
+
+# 7. Repair Trade-Offs and Residual Risks
+
+* **Distinguishability:** R2 preserves it (`p_waived` vs `p_review_done` remain distinct places, enabling reporting, conformance checking, and berbeda rework). R1 merges them: labels `Record Review Waiver` vs `Perform Standard Review` remain different events in the log, but the *state* after review is identical, so any downstream rule that should treat waivers differently (e.g., extra audit) cannot be encoded in the net. Choose R2 if audit trail matters.
+
+* **Duplicate silent behavior / confusion:** R2 introduces two silent AND-joins (`t_join_normal`, `t_join_waived`) both consuming `p_analysis_done`. This is not free-choice and creates structural non-determinism: the token in `p_analysis_done` could be consumed by either join, but only one is enabled because only one of `p_review_done` / `p_waived` exists. It is behaviorally correct but may confuse analysts and cause duplicate markings in the reachability graph (two transitions leading to `p_decision`). R1 avoids this by having a single join. The silent transitions remain in both repairs; they do not cause livelocks but require careful naming/documentation.
+
+* **Soundness  business alignment:** A sound net can still violate intent (e.g., R3 is sound yet allows waivers without analysis). `check_soundness` only guarantees no deadlocks, proper completion, and option to complete – it does not verify that `t_authorize` always *requires* `t_analyze`. Trace-level validation is mandatory.
+
+* **Regression trace testing:**
+  - *Positive (must be accepted, end in `fm`):* `register-split-analyze-standard_review-join_normal-authorize` ; `register-split-waive_review-analyze-join_waived-authorize` ; interleavings `analyze` before/after `waive/standard`.
+  - *Negative (must be rejected or blocked):* `register-split-waive-join_waived-authorize` **without** `analyze` (should be blocked after repair); any trace where `authorize` occurs with `p_analysis` still marked; trace ending in `sink`+`p_analysis_done`; double review `standard_review` followed by `waive_review` (should not be enabled). Use `pm4py` conformance or custom replay with `get_enabled_transitions`.
+
+* **Detecting accidental bypass of mandatory analysis:** Add a place invariant or assert that `p_analysis`+`p_analysis_done`+`p_decision`+`sink` token count is 1 along the path; monitor liveness of `t_analyze` (should not be dead); run `pm4py` discovery of footprints or use “would `t_authorize` be enabled if we remove `t_analyze`?” mutation testing. In production, add a data guard: `authorize` requires attribute `analysis_done==true`. A reachability query: search for reachable marking where `t_authorize` fires without `t_analyze` in its prefix.
+
+# 8. Final Recommendation
+
+**Deploy R2 (Dual synchronizer: add `p_analysis_done  t_join_waived`).** Cost 1 arc, preserves the mandatory-analysis rule and keeps standard and waived outcomes distinguishable for audit/compliance, which the business most likely needs. It fixes improper completion without merging semantically different review outcomes.
+
+**Fallback: R1 (Convergent completion).** If the organization decides waiver need not be distinguishable as a state (only as an event label) and wants the simplest single-join topology with no duplicate silent transitions, migrate to R1. It is cleaner structurally but sacrifices post-review place distinguishability; keep the label difference in the log. Do not deploy R3 unless business formally redefines analysis as optional under waiver, as it silently changes policy while appearing sound.
