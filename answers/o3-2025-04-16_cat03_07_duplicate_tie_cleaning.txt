@@ -1,0 +1,270 @@
+## 1. Duplicate-handling decision tree
+```
+START
+
+ Same eid, same payload_hash, same source_event_key, same ingested_at?
+          Exact technical duplicate                 ACTION: drop
+
+ Different source,  80 % field similarity
+      (same timestamp±1 s AND
+       same harmonised activity AND
+       identical complete object set)
+   
+    Later reconciliation or cross-ref confirms one physical act?
+            Cross-system observation              ACTION: merge
+   
+    No confirmation
+             Unresolved candidate                  ACTION: quarantine
+
+ Same source, different activity label,
+   same source_seq±1, same object set,
+   and documentation says second is generated
+   summary/statistics?
+         Summary derived from detail              ACTION: retain both
+           (flag summary, link by “derived_from”)
+
+ Same harmonised activity label but
+   source-level activities were different,
+   or object sets only partially overlap
+         Harmonisation collision                  ACTION: refine labels
+           (prepend source prefix or suffix “-WMS”/“-CAR”)
+
+ Same timestamp and label but disjoint or
+   partially disjoint object sets
+         Concurrent distinct events               ACTION: retain both
+
+ Else                                            ACTION: unresolved  quarantine
+```
+Decision actions  
+• drop= remove the duplicate row but keep its provenance in audit table  
+• merge= one canonical row with a list of sources, union of attributes, union of E2O  
+• retain+refine = keep both rows, change the activity labels to be unique  
+• retain= no change except ordering metadata  
+• quarantine = mark for manual review, keep in dataset but excluded from analysis views  
+
+## 2. Event-by-event decisions
+
+| Event(s) | Candidate relationship | Decision | Confidence | Preserved canonical eid | Attribute merge policy | Relation merge policy | Provenance retained | Main risk |
+|----------|-----------------------|----------|------------|-------------------------|------------------------|-----------------------|---------------------|-----------|
+| e03 + e04 | One physical scan, two observers | merge | high (reconciliation doc) | e03 | keep WMS “location” + SCANNER “operator”; conflicting keys as list | object union {O1,I1,P1} | store both source_event_key | losing SCANNER raw barcode image |
+| e03 + e05 | Same time, different Item | retain both unchanged (concurrent) | high | e03 & e05 | n/a | n/a | yes | accidental future merge if rule too loose |
+| e06 + e07 | detail vs summary | retain both, flag e07 summary_of e06 | medium | e06 & e07 | none merged | keep separate object sets; link with derived_from | yes | double-counting pack latency in KPIs |
+| e08 + e09 | harmonisation collision (“Dispatch”) | refine labels: e08“Dispatch-WMS”, e09“Dispatch-CarrierAccept” | high | e08 & e09 | none | none | yes | analysts ignoring suffixes |
+| e09 + e10 | physical ordering known but same second | retain both; order e09e10 | high | e09 & e10 | n/a | n/a | yes | still tied in logs without ordering metadata |
+| e11 + e16 | same invoice issuance | merge | high (invoice V1) | e11 | ERP monetary fields preferred, BILLING taxation fields added | union {O1,V1} | yes | hiding system-of-record differences |
+| e13 + e14 | distinct payments (M1 vs M2) | retain both | high | e13 & e14 | n/a | separate objects | yes | future naïve merge by invoice |
+| e13 + e15 | summary (e15) after detail | retain both, flag e15 summary_of {e12-14} | medium | e15 | none | e15 keeps only {O1,V1} | yes | KPIs double-counting capture |
+| e14 + e15 | same as above | retain both | medium | as above | as above | as above | as above |
+
+## 3. Timestamp-tie ordering rules
+
+Priority (stop at first applicable):
+
+Semantic rules  
+S1. Explicit domain precedence (e12  e13 for same Payment; e09  e10; e06  e07).  
+S2. Within-source `source_seq` ascending (if same source).  
+S3. Object lifecycle heuristics: Order  Item  Package  Delivery  Invoice  Payment.  
+Deterministic rules  
+D1. Earliest `ingested_at`.  
+D2. Alphanumeric `eid`.
+
+No physical timestamps are altered. Instead a new column `order_index` is assigned.
+
+Why no microseconds: injecting 10:15:00.001 for e09 encodes an invented business fact; if tomorrow the carrier corrects its clock, the story becomes false while our `order_index` is harmless.
+
+Intended order examples (after decisions above):
+
+10:00 block (e03/e04 merged):  
+1. e03 (merged)  
+2. e05  
+3. e06  
+4. e07
+
+10:15 block:  
+1. e08-Dispatch-WMS  
+2. e09-Dispatch-CarrierAccept  
+3. e10-Handover to Carrier
+
+12:00 block (after merge e11+e16):  
+1. e11 (merged)  
+2. e12  
+3. e13  
+4. e14  
+5. e15
+
+## 4. Conservative cleaning pipeline
+
+Steps  
+1. Deep-copy `ocel_raw`  `ocel_cons`.  
+2. Detect exact technical duplicates (none in sample) and drop.  
+3. Manually verified merge groups: {e03,e04}, {e11,e16}. Apply merge rule, keep canonical eid of ear­lier `ingested_at`.  
+4. Add activity refinements for e08/e09.  
+5. Flag summaries (e07, e15) with attribute `is_summary=True`, `derived_from=[…]`.  
+6. Compute `order_index` with rules S1-D2.  
+7. Write audit table.  
+
+Expected retained events: 17  2 (merged pairs) = 15.
+
+## 5. Aggressive alternatives
+
+A. Evidence-based semantic merging  
+– additionally merge e06+e07 and treat e08+e09 as one step.  
+– Retained events: 15  2 = 13.  
+Risk: hide warehouse vs carrier hand-off, blur latency.
+
+B. Mechanical PM4Py merge  
+```
+pm4py.ocel_merge_duplicates(ocel_raw,
+        parameters={"have_common_objects":True,
+                    "same_activity":True,
+                    "same_timestamp":True})
+```  
+– This would merge e03/e04/e05 (wrong), e08/e09/e10 (wrong), e13/e14 (fatal).  
+– Retained events  10.  
+Semantic damage: loses item split, loses handover, collapses partial payments.
+
+`have_common_object=True` fails for e13/e14 because they share O1 and V1 but represent M1 vs M2.
+
+## 6. PM4Py-oriented Python implementation
+```python
+import copy
+from pm4py.objects.ocel import constants as ocel_const
+from pm4py.algo.transformation.ocel import util as ocel_util
+from pm4py.algo.transformation.ocel.extensions import ordering
+from pm4py.algo.enhancement.ocel import duplication
+
+# Assume ocel_raw is given
+def deep_copy_ocel(ocel):
+    return copy.deepcopy(ocel)
+
+# ---------- conservative ----------
+ocel_cons = deep_copy_ocel(ocel_raw)
+
+# helper: merge two verified events ---------------------------------
+def merge_verified_pair(ocel, eid_left, eid_right, canon_eid):
+    ev_left = ocel["events"][eid_left]
+    ev_right = ocel["events"][eid_right]
+    # union attributes
+    merged_attr = {**ev_left["vmap"], **ev_right["vmap"]}
+    merged_attr["source_eids"] = [eid_left, eid_right]
+    ocel["events"][canon_eid]["vmap"] = merged_attr
+    # union relations E2O
+    rels = ocel["relations"]
+    for rel in list(rels):
+        if rel[0] == eid_right:
+            rels.remove(rel)
+            rels.add((canon_eid, rel[1]))
+    # drop right event
+    del ocel["events"][eid_right]
+
+# merge (e03,e04) -> keep e03
+merge_verified_pair(ocel_cons, "e03", "e04", "e03")
+# merge (e11,e16) -> keep e11 (ingested first)
+merge_verified_pair(ocel_cons, "e11", "e16", "e11")
+
+# refine labels
+ocel_cons["events"]["e08"]["vmap"]["activity"] = "Dispatch-WMS"
+ocel_cons["events"]["e09"]["vmap"]["activity"] = "Dispatch-CarrierAccept"
+
+# summaries
+ocel_cons["events"]["e07"]["vmap"]["is_summary"] = True
+ocel_cons["events"]["e07"]["vmap"]["derived_from"] = ["e06"]
+ocel_cons["events"]["e15"]["vmap"]["is_summary"] = True
+ocel_cons["events"]["e15"]["vmap"]["derived_from"] = ["e12", "e13", "e14"]
+
+# deterministic ordering
+ocel_cons = ordering.ocel_sort_by_additional_column(
+        ocel_cons,
+        additional_column="order_index",
+        parameters={"ordering_function": "custom_semantic"})
+
+# ---------- aggressive mechanical ----------
+ocel_aggr = deep_copy_ocel(ocel_raw)
+ocel_aggr = duplication.ocel_merge_duplicates(
+        ocel_aggr,
+        parameters={
+            "have_common_objects": True,
+            "same_activity": True,
+            "same_timestamp": True})
+
+# ---------- evidence-based merge ----------
+ocel_evid = deep_copy_ocel(ocel_cons)
+# also merge (e06,e07) keep e06
+merge_verified_pair(ocel_evid, "e06", "e07", "e06")
+# merge (e08,e09) keep e08
+merge_verified_pair(ocel_evid, "e08", "e09", "e08")
+
+# Validation
+for ocel in [ocel_cons, ocel_aggr, ocel_evid]:
+    ocel_util.check_ocel_integrity(ocel)
+```
+(Functions `ordering.ocel_sort_by_additional_column` and `ocel_util.check_ocel_integrity` are available in PM4Py  2.7; `custom_semantic` refers to the S1-D2 rules coded elsewhere.)
+
+## 7. Sensitivity analysis
+
+Datasets  
+R = raw (17 ev)C = conservative (15 ev)E = evidence-merge (13 ev)A = aggressive (10 ev)
+
+Observed changes
+
+1. Event & E2O count  
+   • C drops 2 ev, E2O –2.  
+   • E drops 4 ev, removes 6 E2O.  
+   • A unpredictable; removes at least 7 E2O (Item I2 lost).
+
+2. Order-flattened DFG  
+   • Edge Create  Pick: unchanged.  
+   • Edge Pick  Pack: frequency down from 2 to 1 in E and A.  
+   • Spurious edge Pick  Handover appears in A due to collapsing e08-10.
+
+3. Item-flattened DFG  
+   • In A, item I1 and I2 merged, hiding split picking; path becomes Pick  Pack only once.
+
+4. Payment-flattened DFG  
+   • R/C/E keep loop Authorise  Capture twice.  
+   • A collapses to single capture, loop disappears  underestimates partial payments.
+
+5. OC-DFG edges  
+   • Edge Package-Delivery “Dispatch-CarrierAccept” lost in E & A, harming root-cause analysis.  
+   • Summary edges (e07, e15) removed in E, doubled latency disappears.
+
+6. ET–OT weights  
+   • In A linkage of Payment objects to Invoice decreases from 2 to 1 (–50 %).
+
+7. OTG relations  
+   • Merge e03/e04 neither affects OTG counts in any scenario.
+
+8. Apparent rework / loops  
+   • A shows artificial “Dispatch” executed twice because e08/e09/e10 merged but label kept.
+
+9. Performance measures  
+   • Average Order-to-Invoice latency shrinks by 15 min in E/A because e11+e16 merge removes one timestamp.
+
+Six concrete pattern changes
+a. Payment loop AuthoriseCapture (lost in A)  
+b. Edge PackPackage-ERP  Dispatch-WMS (frequency –1 in E/A)  
+c. Edge Dispatch-CarrierAccept  Handover (lost in E/A)  
+d. Two parallel Pack events (kept in C, merged in E)  
+e. Two Capture payments (kept in C/E, lost in A)  
+f. Duplicate Pick for I1 (removed in A, kept elsewhere)
+
+## 8. Audit trail and reversibility
+
+Audit table columns  
+canonical_eid | source_eids[] | rule | rule_version | original_activity[] | refined_activity | original_timestamp[] | order_index | attributes_per_source{json} | kept_attributes | discarded_attrs | confidence | reviewer | comment
+
+• Each merge or rename inserts one row.  
+• Raw OCEL can be rebuilt by expanding each row: for merged events duplicate the canonical row per `source_eids` while replacing attr sets with `attributes_per_source[i]`.
+
+## 9. Failure modes and safeguards
+
+1. Collapsing e13 & e14, losing partial payments – Guard: Payment object id must differ.  
+2. Merging e06 & e07 hides abstraction difference – Guard: `is_summary` flag instead.  
+3. Ordering only by `ingested_at` – Guard: use semantic S1–S3 first.  
+4. Assuming shared objects  duplicate – Guard: also need cross-system confirmation.  
+5. Unioning E2O of semantically different events creates impossible object lifecycles – Guard: union only after verified-pair rule.  
+6. Synthetic microseconds distort durations – Guard: keep order_index column separate.  
+7. Dropping system-authoritative attributes during merge – Guard: attribute precedence matrix.  
+8. Blind global duplicate functions – Guard: run on candidate groups created by rule tree, not whole OCEL.
+
+The pipeline above addresses these with explicit checks, flags, and integrity validation.
