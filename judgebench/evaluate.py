@@ -32,6 +32,30 @@ JUDGE_LLMS: Sequence[Tuple[Any, ...]] = [
         "grok-4.5",
         {"api_url": "https://api.x.ai/v1/responses", "api_key": os.environ["GROK_API_KEY"]},
     ),
+    (
+        "gpt-5.6-sol",
+        {
+            "api_url": "https://api.openai.com/v1/responses",
+            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+            "additional_payload": {"reasoning": {"effort": "medium"}},
+        },
+    ),
+    (
+        "gpt-5.6-terra",
+        {
+            "api_url": "https://api.openai.com/v1/responses",
+            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+            "additional_payload": {"reasoning": {"effort": "medium"}},
+        },
+    ),
+    (
+        "gpt-5.6-luna",
+        {
+            "api_url": "https://api.openai.com/v1/responses",
+            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+            "additional_payload": {"reasoning": {"effort": "medium"}},
+        },
+    ),
 ]
 
 STRICT_EVALUATION_TEXT = (
