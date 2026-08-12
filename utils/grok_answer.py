@@ -40,7 +40,7 @@ TARGET_REASONING_EFFORT = "high"  # low | medium | high | xhigh
 
 # Max concurrent Grok CLI invocations. Each worker handles one question
 # end-to-end (including its own retries) independently of the others.
-MAX_WORKERS = 10
+MAX_WORKERS = 56
 
 # Max unanswered questions to process in this run. Set to None for no limit.
 MAX_QUESTIONS = None
