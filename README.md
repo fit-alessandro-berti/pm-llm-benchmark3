@@ -96,7 +96,7 @@ The overall score of the benchmark is obtained by summing the per-question score
 Scripts to answer and evaluate questions against OpenAI-compatible APIs (including xAI Grok) are available in **`answer.py`** and **`evalscript.py`**. Shared configuration lives in **`common.py`** and **`models_config.json`**.
 
 * Default **answering** model / API key: configure via CLI args, `models_config.json`, and `answering_api_key.txt` (or provider env vars such as `OPENAI_API_KEY`, `GROK_API_KEY`).
-* Default **judge** model: `grok-4.5` at `https://api.x.ai/v1/` (override with CLI; key via `GROK_API_KEY`).
+* Default **judge** model: `grok-4.6` at `https://api.x.ai/v1/` (override with CLI; key via `GROK_API_KEY`).
 * Aggregated leaderboards are produced with `utils/overall_table.py` and `utils/table_per_model.py`.
 
 Example flow:
@@ -114,4 +114,18 @@ python -m utils.overall_table
 
 ## Leaderboards
 
-Leaderboards will list model results as evaluated by the configured judge LLM (default: **grok-4.5**). Generated files follow the pattern `leaderboard_<judge>.md`.
+The leaderboards include the results of the benchmark, as evaluated by the considered judge LLM:
+
+[**grok-4.6**](leaderboard_grok-4.6.md) (current official judge)
+
+Specialized tables from the same judge:
+
+* [Open-source](leaderboard_os_grok-4.6.md)
+* [Large reasoning models (CoT)](leaderboard_lrms_cot_grok-4.6.md)
+* [Base LLMs](leaderboard_nolrms_grok-4.6.md)
+* [Base open-source LLMs](leaderboard_os_nolrms_grok-4.6.md)
+* [QWEN](leaderboard_QWEN_grok-4.6.md)
+
+Older judge:
+
+* (OLD) [grok-4.5](old/leaderboard_grok-4.5.md)
