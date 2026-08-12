@@ -52,7 +52,7 @@ PROVIDER_API_KEY_FILES = {
 ANSWERING_MODEL_NAME = "ChatGPT-5.5-Pro-20260422" if len(sys.argv) < 3 else sys.argv[1]
 
 # judge model
-EVALUATING_MODEL_NAME = "grok-4.5" if len(sys.argv) < 3 else sys.argv[2]
+EVALUATING_MODEL_NAME = "grok-4.6" if len(sys.argv) < 3 else sys.argv[2]
 
 
 class RateLimiter:

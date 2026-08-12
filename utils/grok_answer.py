@@ -34,8 +34,8 @@ from common import clean_model_name, is_completed_output
 # Hard-coded run configuration — edit these before launching.
 # (Independent of utils/grok_evaluate.py judge settings.)
 # ---------------------------------------------------------------------------
-TARGET_MODEL_NAME = "grok-4.5"  # prefix used in answers/
-TARGET_MODEL = "grok-4.5"  # value passed to grok --model
+TARGET_MODEL_NAME = "grok-4.6"  # prefix used in answers/
+TARGET_MODEL = "grok-4.6"  # value passed to grok --model
 TARGET_REASONING_EFFORT = "high"  # low | medium | high | xhigh
 
 # Max concurrent Grok CLI invocations. Each worker handles one question

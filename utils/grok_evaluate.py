@@ -31,11 +31,11 @@ from utils.script_bootstrap import REPO_ROOT
 from utils.table_per_model import match_regex
 
 
-TARGET_MODEL = "grok-4.5"
+TARGET_MODEL = "grok-4.6"
 TARGET_REASONING_EFFORT = "high"
-MAX_WORKERS = 80
+MAX_WORKERS = 75
 DEFAULT_RETRY_DELAY_SECONDS = 17.0
-EVALUATION_FOLDER = Path("evaluation-grok-4.5")
+EVALUATION_FOLDER = Path("evaluation-grok-4.6")
 
 _print_lock = threading.Lock()
 
