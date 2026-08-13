@@ -11,16 +11,16 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | minimaxminimax-m3              | **30.2** | :white_check_mark: | :white_check_mark: | 4.0                  | 3.5                  | 4.1                  | 2.4                  | 3.6                  | 4.0                  | 4.3                  | 4.3                  |
 | qwen3.6-27b                    | **29.8** | :white_check_mark: | :white_check_mark: | 3.8                  | 3.1                  | 4.0                  | 3.2                  | 3.7                  | 3.9                  | 4.1                  | 4.0                  |
 | qwen3.5-397b-a17b              | **28.5** | :white_check_mark: | :white_check_mark: | 3.5                  | 3.0                  | 3.6                  | 3.2                  | 3.7                  | 3.7                  | 3.9                  | 3.9                  |
-| qwen3.6-35b-a3b                | **26.9** | :white_check_mark: | :white_check_mark: | 3.5                  | 2.9                  | 3.5                  | 2.4                  | 3.3                  | 3.5                  | 4.0                  | 3.8                  |
+| qwen3.6-35b-a3b                | **26.6** | :white_check_mark: | :white_check_mark: | 3.5                  | 2.6                  | 3.5                  | 2.4                  | 3.3                  | 3.5                  | 4.0                  | 3.8                  |
 | mistral-medium-3-5             | **26.5** | :white_check_mark: | :x:                | 3.3                  | 3.0                  | 3.2                  | 2.7                  | 3.2                  | 3.5                  | 3.9                  | 3.7                  |
 | mistral-large-2512             | **26.4** | :white_check_mark: | :x:                | 3.3                  | 2.8                  | 3.4                  | 2.8                  | 3.4                  | 3.3                  | 3.7                  | 3.6                  |
-| qwen3.5-122b-a10b              | **25.8** | :white_check_mark: | :white_check_mark: | 3.1                  | 2.7                  | 3.3                  | 2.5                  | 2.9                  | 3.5                  | 3.9                  | 3.8                  |
+| qwen3.5-122b-a10b              | **25.7** | :white_check_mark: | :white_check_mark: | 3.1                  | 2.6                  | 3.3                  | 2.5                  | 2.9                  | 3.5                  | 3.9                  | 3.8                  |
 | mistral-small-2603             | **23.8** | :white_check_mark: | :x:                | 3.1                  | 2.2                  | 3.1                  | 2.4                  | 2.8                  | 3.2                  | 3.6                  | 3.4                  |
 | ministral-14b-2512             | **23.4** | :white_check_mark: | :x:                | 2.6                  | 2.3                  | 3.0                  | 2.5                  | 2.9                  | 3.0                  | 3.7                  | 3.5                  |
 | ministral-8b-2512              | **22.1** | :white_check_mark: | :x:                | 2.6                  | 2.2                  | 2.6                  | 2.3                  | 2.5                  | 2.9                  | 3.5                  | 3.4                  |
 | ibm-granitegranite-4.1-8b      | **21.4** | :white_check_mark: | :x:                | 2.7                  | 2.1                  | 2.6                  | 2.4                  | 2.5                  | 3.0                  | 3.0                  | 3.2                  |
 | qwen3.5-9b                     | **21.1** | :white_check_mark: | :white_check_mark: | 2.5                  | 1.8                  | 2.8                  | 2.3                  | 2.6                  | 2.8                  | 3.4                  | 2.9                  |
-| ministral-3b-2512              | **19.8** | :white_check_mark: | :x:                | 2.8                  | 2.0                  | 2.3                  | 2.0                  | 2.2                  | 2.5                  | 3.0                  | 2.9                  |
+| ministral-3b-2512              | **19.3** | :white_check_mark: | :x:                | 2.4                  | 2.0                  | 2.3                  | 2.0                  | 2.2                  | 2.5                  | 3.0                  | 2.9                  |
 | ibm-granitegranite-4.0-h-micro | **15.8** | :white_check_mark: | :x:                | 1.8                  | 1.7                  | 1.9                  | 1.7                  | 1.8                  | 1.9                  | 2.4                  | 2.4                  |
 
 ### moonshotaikimi-k3   => 38.7 points
@@ -450,7 +450,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 4.9   |
 | cat08_07_contradictory_evidence_memo           | 5.8   |
 
-### qwenqwen3.6-35b-a3b   => 26.9 points
+### qwenqwen3.6-35b-a3b   => 26.6 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -463,7 +463,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat01_07_case_counterfactuals                  | 4.0   |
 | cat02_01_reconstruct_partial_queue             | 2.0   |
 | cat02_02_infer_queue_disciplines               | 3.9   |
-| cat02_03_fork_join_delay_decomposition         | 7.6   |
+| cat02_03_fork_join_delay_decomposition         | 4.4   |
 | cat02_04_batching_vs_bulk_logging              | 3.6   |
 | cat02_05_nonstationary_queue_regimes           | 4.4   |
 | cat02_06_sla_survival_censoring                | 5.0   |
@@ -633,7 +633,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 4.6   |
 | cat08_07_contradictory_evidence_memo           | 6.2   |
 
-### qwenqwen3.5-122b-a10b   => 25.8 points
+### qwenqwen3.5-122b-a10b   => 25.7 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -646,7 +646,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat01_07_case_counterfactuals                  | 4.4   |
 | cat02_01_reconstruct_partial_queue             | 2.8   |
 | cat02_02_infer_queue_disciplines               | 4.2   |
-| cat02_03_fork_join_delay_decomposition         | 4.4   |
+| cat02_03_fork_join_delay_decomposition         | 2.7   |
 | cat02_04_batching_vs_bulk_logging              | 4.9   |
 | cat02_05_nonstationary_queue_regimes           | 4.8   |
 | cat02_06_sla_survival_censoring                | 3.8   |
@@ -999,12 +999,12 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 4.0   |
 | cat08_07_contradictory_evidence_memo           | 5.3   |
 
-### ministral-3b-2512   => 19.8 points
+### ministral-3b-2512   => 19.3 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
 | cat01_01_bottleneck_causality                  | 3.5   |
-| cat01_02_staggered_automation                  | 7.5   |
+| cat01_02_staggered_automation                  | 3.2   |
 | cat01_03_flag_mediation                        | 2.8   |
 | cat01_04_conformance_root_cause                | 3.8   |
 | cat01_05_mixed_drift_attribution               | 3.4   |

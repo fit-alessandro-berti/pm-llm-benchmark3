@@ -47,7 +47,7 @@ def index_evaluation_files(evaluation_folder, files=None):
     return responses_by_model
 
 
-def match_regex(text):
+def _extract_score_from_text(text):
     matches = list(reg_expr.finditer(text))
     matches_numbers_floats = []
     matches_numbers_ints = []
@@ -68,6 +68,14 @@ def match_regex(text):
         return matches_numbers_floats[0]
     elif matches_numbers_ints:
         return matches_numbers_ints[0]
+
+
+def match_regex(text):
+    first_row = text.split("\n", 1)[0] if text else ""
+    score = _extract_score_from_text(first_row)
+    if score is not None:
+        return score
+    return _extract_score_from_text(text)
 
 
 def execute_script(evaluation_folder, model_name, responses=None):

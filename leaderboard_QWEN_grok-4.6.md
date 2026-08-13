@@ -7,8 +7,8 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | qwen3.8-max       | **37.3** | :x:                | :white_check_mark: | :mage_woman: **4.9** | :mage_woman: **4.4** | :mage_woman: **4.7** | :mage_woman: **4.8** | :mage_woman: **4.6** | :mage_woman: **4.5** | :mage_woman: **4.7** | :mage_woman: **4.7** |
 | qwen3.6-27b       | **29.8** | :white_check_mark: | :white_check_mark: | 3.8                  | 3.1                  | 4.0                  | 3.2                  | 3.7                  | 3.9                  | 4.1                  | 4.0                  |
 | qwen3.5-397b-a17b | **28.5** | :white_check_mark: | :white_check_mark: | 3.5                  | 3.0                  | 3.6                  | 3.2                  | 3.7                  | 3.7                  | 3.9                  | 3.9                  |
-| qwen3.6-35b-a3b   | **26.9** | :white_check_mark: | :white_check_mark: | 3.5                  | 2.9                  | 3.5                  | 2.4                  | 3.3                  | 3.5                  | 4.0                  | 3.8                  |
-| qwen3.5-122b-a10b | **25.8** | :white_check_mark: | :white_check_mark: | 3.1                  | 2.7                  | 3.3                  | 2.5                  | 2.9                  | 3.5                  | 3.9                  | 3.8                  |
+| qwen3.6-35b-a3b   | **26.6** | :white_check_mark: | :white_check_mark: | 3.5                  | 2.6                  | 3.5                  | 2.4                  | 3.3                  | 3.5                  | 4.0                  | 3.8                  |
+| qwen3.5-122b-a10b | **25.7** | :white_check_mark: | :white_check_mark: | 3.1                  | 2.6                  | 3.3                  | 2.5                  | 2.9                  | 3.5                  | 3.9                  | 3.8                  |
 | qwen3.5-9b        | **21.1** | :white_check_mark: | :white_check_mark: | 2.5                  | 1.8                  | 2.8                  | 2.3                  | 2.6                  | 2.8                  | 3.4                  | 2.9                  |
 
 ### qwenqwen3.8-max   => 37.3 points
@@ -194,7 +194,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 4.9   |
 | cat08_07_contradictory_evidence_memo           | 5.8   |
 
-### qwenqwen3.6-35b-a3b   => 26.9 points
+### qwenqwen3.6-35b-a3b   => 26.6 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -207,7 +207,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat01_07_case_counterfactuals                  | 4.0   |
 | cat02_01_reconstruct_partial_queue             | 2.0   |
 | cat02_02_infer_queue_disciplines               | 3.9   |
-| cat02_03_fork_join_delay_decomposition         | 7.6   |
+| cat02_03_fork_join_delay_decomposition         | 4.4   |
 | cat02_04_batching_vs_bulk_logging              | 3.6   |
 | cat02_05_nonstationary_queue_regimes           | 4.4   |
 | cat02_06_sla_survival_censoring                | 5.0   |
@@ -255,7 +255,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 4.4   |
 | cat08_07_contradictory_evidence_memo           | 5.7   |
 
-### qwenqwen3.5-122b-a10b   => 25.8 points
+### qwenqwen3.5-122b-a10b   => 25.7 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -268,7 +268,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat01_07_case_counterfactuals                  | 4.4   |
 | cat02_01_reconstruct_partial_queue             | 2.8   |
 | cat02_02_infer_queue_disciplines               | 4.2   |
-| cat02_03_fork_join_delay_decomposition         | 4.4   |
+| cat02_03_fork_join_delay_decomposition         | 2.7   |
 | cat02_04_batching_vs_bulk_logging              | 4.9   |
 | cat02_05_nonstationary_queue_regimes           | 4.8   |
 | cat02_06_sla_survival_censoring                | 3.8   |

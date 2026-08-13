@@ -20,7 +20,7 @@ def read_text(path: Path) -> str:
     return read_file_with_fallback(path)
 
 
-def extract_raw_pm_score(text: str) -> Optional[float]:
+def _extract_raw_pm_score_from_text(text: str) -> Optional[float]:
     float_scores: List[float] = []
     int_scores: List[float] = []
 
@@ -48,6 +48,14 @@ def extract_raw_pm_score(text: str) -> Optional[float]:
         return int_scores[0]
 
     return None
+
+
+def extract_raw_pm_score(text: str) -> Optional[float]:
+    first_row = text.split("\n", 1)[0] if text else ""
+    score = _extract_raw_pm_score_from_text(first_row)
+    if score is not None:
+        return score
+    return _extract_raw_pm_score_from_text(text)
 
 
 def normalize_pm_score(score: float) -> float:
