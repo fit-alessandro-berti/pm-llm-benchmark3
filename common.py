@@ -525,6 +525,7 @@ _CLOSED_SOURCE_MODEL_MARKERS = (
 
 _OPEN_SOURCE_MODEL_EXCEPTIONS = (
     "muse-glimmer",
+    "mimo-v2.5-pro",
 )
 
 
