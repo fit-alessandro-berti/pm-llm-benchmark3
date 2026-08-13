@@ -559,6 +559,7 @@ _REASONING_MARKERS = (
     "marco",
     "mimo-v",
     "minimax-m",
+    "hy3",
     "muse-glimmer",
     "nemotron",
     "olmo-",

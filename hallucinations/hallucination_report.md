@@ -2,7 +2,9 @@
 
 | Model | Total | 1a_instruction_override | 1b_context_omission | 1c_prompt_contradiction | 2a_concept_fabrication | 2b_spurious_numeric | 2c_false_citation | 3a_unsupported_leap | 3b_self_contradiction | 3c_circular_reasoning | 4a_syntax_error | 4b_model_semantics_breach | 4c_visual_descr_mismatch |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| nvidianemotron-3.5-lightning | 12 | 0 | 0 | 0 | 0 | 1 | 0 | 9 | 1 | 0 | 1 | 0 | 0 |
 | deepseekdeepseek-v4-flash-0731 | 13 | 0 | 0 | 0 | 0 | 2 | 0 | 9 | 1 | 0 | 0 | 1 | 0 |
+| tencenthy3 | 14 | 0 | 0 | 0 | 0 | 3 | 0 | 7 | 3 | 0 | 0 | 1 | 0 |
 | grok-4.5 | 15 | 0 | 0 | 0 | 0 | 4 | 0 | 7 | 4 | 0 | 0 | 0 | 0 |
 | metamuse-glimmer-30b | 15 | 0 | 0 | 0 | 3 | 1 | 0 | 10 | 1 | 0 | 0 | 0 | 0 |
 | moonshotaikimi-k3 | 17 | 0 | 0 | 0 | 0 | 2 | 1 | 12 | 2 | 0 | 0 | 0 | 0 |
