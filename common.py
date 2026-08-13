@@ -523,10 +523,18 @@ _CLOSED_SOURCE_MODEL_MARKERS = (
     + _CLOSED_SOURCE_MODEL_ALIASES
 )
 
+_OPEN_SOURCE_MODEL_EXCEPTIONS = (
+    "muse-glimmer",
+)
+
 
 def is_open_source(m_name):
     model_name = _model_name_for_matching(m_name)
-    return bool(model_name) and not any(marker in model_name for marker in _CLOSED_SOURCE_MODEL_MARKERS)
+    if not model_name:
+        return False
+    if any(marker in model_name for marker in _OPEN_SOURCE_MODEL_EXCEPTIONS):
+        return True
+    return not any(marker in model_name for marker in _CLOSED_SOURCE_MODEL_MARKERS)
 
 
 _REASONING_DISABLED_MARKERS = (
