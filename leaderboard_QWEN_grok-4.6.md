@@ -5,7 +5,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | Model             | Score    | OS                 | LRM                | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
 | ----------------- | -------- | ------------------ | ------------------ | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
 | qwen3.8-max       | **37.3** | :x:                | :white_check_mark: | :mage_woman: **4.9** | :mage_woman: **4.4** | :mage_woman: **4.7** | :mage_woman: **4.8** | :mage_woman: **4.6** | **4.5**              | :mage_woman: **4.7** | :mage_woman: **4.7** |
-| qwen3.8-2.4t-a95b | **34.5** | :white_check_mark: | :white_check_mark: | **4.7**              | 3.1                  | :mage_woman: **4.7** | **4.6**              | 3.8                  | :mage_woman: **4.7** | 4.1                  | :mage_woman: **4.7** |
+| qwen3.8-2.4t-a95b | **36.3** | :white_check_mark: | :white_check_mark: | **4.7**              | 3.8                  | :mage_woman: **4.7** | **4.6**              | **4.5**              | :mage_woman: **4.7** | :mage_woman: **4.7** | :mage_woman: **4.7** |
 | qwen3.6-27b       | **29.8** | :white_check_mark: | :white_check_mark: | 3.8                  | 3.1                  | 4.0                  | 3.2                  | 3.7                  | 3.9                  | 4.1                  | 4.0                  |
 | qwen3.5-397b-a17b | **28.5** | :white_check_mark: | :white_check_mark: | 3.5                  | 3.0                  | 3.6                  | 3.2                  | 3.7                  | 3.7                  | 3.9                  | 3.9                  |
 | qwen3.6-35b-a3b   | **26.6** | :white_check_mark: | :white_check_mark: | 3.5                  | 2.6                  | 3.5                  | 2.4                  | 3.3                  | 3.5                  | 4.0                  | 3.8                  |
@@ -73,7 +73,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 6.4   |
 | cat08_07_contradictory_evidence_memo           | 6.8   |
 
-### qwenqwen3.8-2.4t-a95b   => 34.5 points
+### qwenqwen3.8-2.4t-a95b   => 36.3 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -90,6 +90,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat02_04_batching_vs_bulk_logging              | 6.9   |
 | cat02_05_nonstationary_queue_regimes           | 2.5   |
 | cat02_06_sla_survival_censoring                | 6.8   |
+| cat02_07_robust_multiskill_staffing            | 6.0   |
 | cat03_01_case_notion_tradeoffs                 | 7.1   |
 | cat03_02_relation_repair                       | 6.7   |
 | cat03_03_cross_instance_bottlenecks            | 6.4   |
@@ -106,6 +107,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat04_07_adversarial_model_review              | 6.9   |
 | cat05_01_norm_hierarchy_conflicts              | 6.0   |
 | cat05_02_compensating_controls                 | 7.3   |
+| cat05_03_data_aware_obligations                | 6.4   |
 | cat05_04_uncertain_temporal_conformance        | 4.8   |
 | cat05_05_delegation_resource_conformance       | 6.1   |
 | cat05_06_alignment_business_severity           | 6.9   |
@@ -122,6 +124,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat07_03_collusion_or_necessity                | 7.2   |
 | cat07_04_procedural_fairness_complexity        | 6.9   |
 | cat07_05_learning_fatigue_queue_pressure       | 6.4   |
+| cat07_06_dynamic_resource_assignment           | 6.1   |
 | cat07_07_restructuring_impact                  | 6.8   |
 | cat08_01_conflicting_evidence_redesign         | 6.8   |
 | cat08_02_demand_shock_robustness               | 6.7   |

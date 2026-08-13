@@ -7,7 +7,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | moonshotaikimi-k3             | **38.7** | :white_check_mark: | :white_check_mark: | :mage_woman: **5.0** | **4.2**              | :mage_woman: **4.9** | :mage_woman: **5.0** | :mage_woman: **5.0** | :mage_woman: **5.0** | :mage_woman: **4.9** | :mage_woman: **4.9** |
 | qwen3.8-max                   | **37.3** | :x:                | :white_check_mark: | **4.9**              | :mage_woman: **4.4** | **4.7**              | **4.8**              | 4.6                  | 4.5                  | **4.7**              | **4.7**              |
 | deepseek-v4-pro-0813          | **36.4** | :white_check_mark: | :white_check_mark: | 4.6                  | **4.3**              | 4.5                  | **4.7**              | 4.6                  | 4.6                  | 4.6                  | 4.4                  |
-| qwen3.8-2.4t-a95b             | **34.5** | :white_check_mark: | :white_check_mark: | **4.7**              | 3.1                  | **4.7**              | 4.6                  | 3.8                  | **4.7**              | 4.1                  | **4.7**              |
+| qwen3.8-2.4t-a95b             | **36.3** | :white_check_mark: | :white_check_mark: | **4.7**              | 3.8                  | **4.7**              | 4.6                  | 4.5                  | **4.7**              | **4.7**              | **4.7**              |
 | thinkingmachinesinkling       | **33.9** | :x:                | :white_check_mark: | 4.4                  | 3.7                  | 4.3                  | 4.1                  | 4.3                  | 4.4                  | 4.3                  | 4.4                  |
 | deepseek-v4-flash-0731        | **33.7** | :white_check_mark: | :white_check_mark: | 4.0                  | 3.7                  | 4.2                  | 4.3                  | 4.6                  | 4.2                  | 4.2                  | 4.4                  |
 | thinkingmachinesinkling-small | **33.0** | :x:                | :white_check_mark: | 4.2                  | 3.8                  | 4.1                  | 3.5                  | 4.3                  | 4.3                  | 4.4                  | 4.4                  |
@@ -204,7 +204,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 5.6   |
 | cat08_07_contradictory_evidence_memo           | 7.0   |
 
-### qwenqwen3.8-2.4t-a95b   => 34.5 points
+### qwenqwen3.8-2.4t-a95b   => 36.3 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -221,6 +221,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat02_04_batching_vs_bulk_logging              | 6.9   |
 | cat02_05_nonstationary_queue_regimes           | 2.5   |
 | cat02_06_sla_survival_censoring                | 6.8   |
+| cat02_07_robust_multiskill_staffing            | 6.0   |
 | cat03_01_case_notion_tradeoffs                 | 7.1   |
 | cat03_02_relation_repair                       | 6.7   |
 | cat03_03_cross_instance_bottlenecks            | 6.4   |
@@ -237,6 +238,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat04_07_adversarial_model_review              | 6.9   |
 | cat05_01_norm_hierarchy_conflicts              | 6.0   |
 | cat05_02_compensating_controls                 | 7.3   |
+| cat05_03_data_aware_obligations                | 6.4   |
 | cat05_04_uncertain_temporal_conformance        | 4.8   |
 | cat05_05_delegation_resource_conformance       | 6.1   |
 | cat05_06_alignment_business_severity           | 6.9   |
@@ -253,6 +255,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat07_03_collusion_or_necessity                | 7.2   |
 | cat07_04_procedural_fairness_complexity        | 6.9   |
 | cat07_05_learning_fatigue_queue_pressure       | 6.4   |
+| cat07_06_dynamic_resource_assignment           | 6.1   |
 | cat07_07_restructuring_impact                  | 6.8   |
 | cat08_01_conflicting_evidence_redesign         | 6.8   |
 | cat08_02_demand_shock_robustness               | 6.7   |
