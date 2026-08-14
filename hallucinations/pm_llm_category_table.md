@@ -11,9 +11,9 @@ Aggregated hallucination counts across all LLMs, organized by PM-LLM benchmark c
 | 2b. Spurious Numeric | 49 | 60 | 19 | 61 | 15 | 62 | 7 | 40 | 313 |
 | 2c. False Citation | 3 | 0 | 3 | 4 | 0 | 1 | 0 | 2 | 13 |
 | 3a. Unsupported Leap | 150 | 105 | 58 | 81 | 49 | 171 | 169 | 186 | 969 |
-| 3b. Self Contradiction | 19 | 39 | 23 | 38 | 20 | 22 | 18 | 27 | 206 |
+| 3b. Self Contradiction | 19 | 39 | 23 | 38 | 21 | 22 | 18 | 27 | 207 |
 | 3c. Circular Reasoning | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 1 | 2 |
 | 4a. Syntax Error | 6 | 5 | 0 | 2 | 1 | 8 | 0 | 1 | 23 |
 | 4b. Model Semantics Breach | 4 | 8 | 14 | 21 | 6 | 6 | 3 | 2 | 64 |
 | 4c. Visual Description Mismatch | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **256** | **246** | **131** | **229** | **117** | **287** | **238** | **285** | **1789** |
+| **Total** | **256** | **246** | **131** | **229** | **118** | **287** | **238** | **285** | **1790** |
