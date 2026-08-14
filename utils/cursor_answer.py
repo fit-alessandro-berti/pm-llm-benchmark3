@@ -28,7 +28,7 @@ from common import clean_model_name, is_completed_output
 # ---------------------------------------------------------------------------
 # Hard-coded run configuration — edit these before launching.
 # ---------------------------------------------------------------------------
-TARGET_MODEL_NAME = "claude-opus-5-thinking-high"  # prefix used in answers/
+TARGET_MODEL_NAME = "gemini-3.1-pro"  # prefix used in answers/
 # Currently available Cursor models (`agent --list-models`, 2026-08-14):
 #   auto
 #   gpt-5.3-codex-low, gpt-5.3-codex-low-fast, gpt-5.3-codex, gpt-5.3-codex-fast,
@@ -116,9 +116,10 @@ TARGET_MODEL_NAME = "claude-opus-5-thinking-high"  # prefix used in answers/
 # (e.g. claude-opus-5-thinking-high). Cursor does not accept [effort=...]
 # overrides. You may also paste a full effort-suffixed slug here and leave
 # TARGET_REASONING_EFFORT empty.
-TARGET_MODEL = "claude-opus-5-thinking"
+TARGET_MODEL = "gemini-3.1-pro"
 # none | low | medium | high | xhigh | extra-high | max | minimal; "" to omit
-TARGET_REASONING_EFFORT = "high"
+# Gemini 3.1 Pro has no effort-suffixed Cursor slugs (only gemini-3.1-pro).
+TARGET_REASONING_EFFORT = ""
 
 # Max concurrent Cursor CLI invocations. Each worker handles one question
 # end-to-end (including its own retries) independently of the others.
