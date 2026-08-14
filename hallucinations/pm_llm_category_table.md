@@ -7,13 +7,13 @@ Aggregated hallucination counts across all LLMs, organized by PM-LLM benchmark c
 | 1a. Instruction Override | 8 | 15 | 2 | 3 | 10 | 2 | 2 | 3 | 45 |
 | 1b. Context Omission | 8 | 7 | 2 | 6 | 10 | 6 | 15 | 14 | 68 |
 | 1c. Prompt Contradiction | 1 | 2 | 0 | 0 | 6 | 5 | 1 | 5 | 20 |
-| 2a. Concept Fabrication | 8 | 4 | 10 | 10 | 0 | 4 | 23 | 4 | 63 |
-| 2b. Spurious Numeric | 49 | 60 | 19 | 61 | 15 | 59 | 7 | 40 | 310 |
+| 2a. Concept Fabrication | 8 | 4 | 10 | 11 | 0 | 4 | 23 | 4 | 64 |
+| 2b. Spurious Numeric | 49 | 60 | 19 | 61 | 15 | 62 | 7 | 40 | 313 |
 | 2c. False Citation | 3 | 0 | 3 | 4 | 0 | 1 | 0 | 2 | 13 |
-| 3a. Unsupported Leap | 142 | 104 | 57 | 79 | 45 | 164 | 162 | 184 | 937 |
-| 3b. Self Contradiction | 19 | 37 | 23 | 37 | 20 | 21 | 17 | 27 | 201 |
+| 3a. Unsupported Leap | 150 | 105 | 58 | 81 | 49 | 171 | 169 | 186 | 969 |
+| 3b. Self Contradiction | 19 | 39 | 23 | 38 | 20 | 22 | 18 | 27 | 206 |
 | 3c. Circular Reasoning | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 1 | 2 |
 | 4a. Syntax Error | 6 | 5 | 0 | 2 | 1 | 8 | 0 | 1 | 23 |
 | 4b. Model Semantics Breach | 4 | 8 | 14 | 21 | 6 | 6 | 3 | 2 | 64 |
 | 4c. Visual Description Mismatch | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **248** | **243** | **130** | **225** | **113** | **276** | **230** | **283** | **1748** |
+| **Total** | **256** | **246** | **131** | **229** | **117** | **287** | **238** | **285** | **1789** |
