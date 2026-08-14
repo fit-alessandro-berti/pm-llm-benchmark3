@@ -28,7 +28,7 @@ from common import clean_model_name, is_completed_output
 # ---------------------------------------------------------------------------
 # Hard-coded run configuration — edit these before launching.
 # ---------------------------------------------------------------------------
-TARGET_MODEL_NAME = "claude-fable-5-high"  # prefix used in answers/
+TARGET_MODEL_NAME = "claude-fable-5-thinking-high"  # prefix used in answers/
 # Currently available Cursor models (`agent --list-models`, 2026-08-14):
 #   auto
 #   gpt-5.3-codex-low, gpt-5.3-codex-low-fast, gpt-5.3-codex, gpt-5.3-codex-fast,
@@ -112,10 +112,11 @@ TARGET_MODEL_NAME = "claude-fable-5-high"  # prefix used in answers/
 #   kimi-k3-low, kimi-k3-high, kimi-k3-max
 #   kimi-k2.7-code
 #   glm-5.2-high, glm-5.2-max
-# Base id passed to `agent --model`. Effort is applied as a parameterized
-# override (e.g. gemini-3.7-flash[effort=high]). You may also paste a full
-# effort-suffixed slug here and leave TARGET_REASONING_EFFORT empty.
-TARGET_MODEL = "claude-fable-5"
+# Base id passed to `agent --model`. Effort is appended as a hyphen suffix
+# (e.g. claude-fable-5-thinking-high). Cursor does not accept [effort=...]
+# overrides. You may also paste a full effort-suffixed slug here and leave
+# TARGET_REASONING_EFFORT empty.
+TARGET_MODEL = "claude-fable-5-thinking"
 # none | low | medium | high | xhigh | extra-high | max | minimal; "" to omit
 TARGET_REASONING_EFFORT = "high"
 
@@ -159,7 +160,7 @@ def answer_path_for(question_name: str, model_name: str) -> str:
 def cursor_model_spec() -> str:
     """Compose the value passed to `agent --model`."""
     if TARGET_REASONING_EFFORT:
-        return f"{TARGET_MODEL}[effort={TARGET_REASONING_EFFORT}]"
+        return f"{TARGET_MODEL}-{TARGET_REASONING_EFFORT}"
     return TARGET_MODEL
 
 
