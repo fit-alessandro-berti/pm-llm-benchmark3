@@ -1,0 +1,264 @@
+# 1. Objectives and constraints
+
+**Optimization objectives (soft, traded off against each other):**
+
+1. **SLA protection** — minimize the probability that urgent/high-priority cases breach their deadline, accounting for the *median 2.7 h waiting-time penalty* that an owner change adds to high-complexity cases.
+2. **Quality / error avoidance** — prefer skill-adequate executors, because keeping a weak-skilled owner adds a median 3.3 h of service time and raises rework, while >2 reassignments raises rework 1.8x and appeals 1.4x.
+3. **Continuity of ownership** — preserve current owners where handover cost is high, complexity is high, or reassignment count is already near the danger threshold of 2.
+4. **Workload fairness** — balance new assignments against current open cases, hours remaining today, and overtime risk.
+5. **Skill development** — route a share of low-risk work to documented training priorities so the skill matrix does not ossify into single points of failure.
+6. **Resilience / bottleneck avoidance** — do not funnel all scarce-skill work (Security, Approval) to the same one or two specialists; deliberately grow second-line capability.
+
+These objectives conflict: specialist routing maximizes (2) but hurts (4)–(6) and eventually (1) via queues; first-available routing helps (1) short-term but destroys (2), (3) and (5). The policy below makes the trade-off explicit and auditable rather than pretending an optimum exists.
+
+**Hard safety/compliance constraints (never violated, never traded):**
+
+- H1. Skill 0 = not allowed to execute the activity, ever — not even supervised. (Skill 1–2 may execute Security Review only under explicit supervision by R7_Gita or R8_Hugo; skill 1 may *prepare* but never *finalize* a Final Approval.)
+- H2. No high/urgent-priority case to a skill level below 2 unless supervised (rule 2).
+- H3. Final Approval finalized only by skill 2–3 (rule 7).
+- H4. Security Review only by skill 3, or skill 1–2 under Gita/Hugo supervision (rule 6).
+- H5. Max 4 new assignments per resource in this decision batch (rule 1).
+- H6. Quality Check batching only for normal/low priority with SLA remaining > 24 h (rule 8).
+
+**Soft preference constraints (violable with a logged justification):**
+
+- S1. Avoid new work for overtime-risk = high resources unless the case is urgent and no safer alternative exists (rule 4).
+- S2. Prefer continuity for high-complexity + high-handover-cost cases unless the owner has skill 0–1 and no supervision is feasible (rule 5).
+- S3. ≥ 20 % of normal/low-priority assignments should support documented training priorities, if SLA risk stays acceptable (rule 3).
+- S4. Avoid pushing any case past 2 reassignments.
+- S5. Keep at least one Security specialist (Gita/Hugo) with slack as an incident buffer.
+
+The distinction matters for explainability: workers must be able to see that H-constraints are non-negotiable rules of the process, while S-constraints are preferences the scheduler *weighs* and must justify overriding — and every override is written to `assignment_reason` in the log so it can be audited later.
+
+# 2. Assignment policy
+
+The policy is a two-stage **filter-then-score** procedure. Filtering enforces hard constraints; scoring makes the soft trade-offs explicit through a small number of named, human-readable terms. Weights shift with urgency, which is itself explainable ("for a case 3 hours from breach, we care about speed and safety, not training").
+
+```
+INPUT: queue Q (cases with next activity, skill, priority, sla_remaining,
+       complexity, owner, reassignment_count, handover_cost),
+       resources R (skills, team, open_cases, hours_remaining,
+       training_priority, overtime_risk)
+
+PHASE 0 — ORDER THE QUEUE
+  sort Q by urgency U(c) descending, where
+    U(c) = priority_weight(urgent=3, high=2, normal=1, low=0.5)
+           * max(0, 1 - sla_remaining / sla_reference)      # more urgent as slack shrinks
+  (urgent cases are decided first so capacity is reserved for them)
+
+PHASE 1 — ELIGIBILITY FILTER (hard constraints)
+  for case c, candidate set E(c) = { r in R such that:
+      skill(r, act(c)) >= 1                                  # H1: skill 0 excluded
+      AND NOT (priority(c) in {high,urgent} AND skill < 2
+               AND no supervisor available)                  # H2
+      AND (act(c) != FinalApproval OR skill >= 2
+           OR role == "preparer_only")                       # H3
+      AND (act(c) != SecurityReview OR skill == 3
+           OR (skill in {1,2} AND Gita_or_Hugo_can_supervise)) # H4
+      AND new_assignments(r) < 4                             # H5
+      AND hours_remaining(r) > est_effort(c) OR sla allows deferral }
+  if E(c) is empty -> EXCEPTION path (see below)
+
+PHASE 2 — SCORING (soft trade-offs; all terms normalized to [0,1])
+  score(r, c) =
+      w_skill(c)   * SKILL(r,c)        # skill match
+    + w_cont(c)    * CONT(r,c)         # continuity / handover cost
+    + w_fair(c)    * FAIR(r)           # workload + overtime fairness
+    + w_train(c)   * TRAIN(r,c)        # development value
+    + w_res(c)     * RESIL(r,c)        # bottleneck avoidance
+    - w_risk(c)    * SLARISK(r,c)      # executor-specific SLA risk
+
+  SKILL(r,c)  = skill(r, act(c)) / 3
+                minus 0.15 if skill == 1 (expected +3.3h service, more rework)
+
+  CONT(r,c)   = if r == current_owner(c):
+                    0.4 + 0.3*handover_cost_band(c) + 0.3*complexity(c)
+                else:
+                    -0.3*handover_cost_band(c)
+                    - 0.4 if reassignment_count(c) >= 2   # S4: 1.8x rework beyond 2
+                    - 0.27 * complexity_is_high(c)        # 2.7h median wait on owner change
+
+  FAIR(r)     = 1 - open_cases(r)/max_open
+                - 0.5 if overtime_risk(r) == high         # S1
+                - 0.2 if overtime_risk(r) == medium
+                + 0.2 * hours_remaining(r)/max_hours
+
+  TRAIN(r,c)  = only if priority(c) in {normal, low} AND sla_slack(c) large:
+                    1.0 if act(c) == training_priority(r) and skill in {1,2}
+                    0.4 if a shadowing slot can be attached for a trainee
+                else 0                                     # never train on urgent work
+
+  RESIL(r,c)  = penalty proportional to (share of this skill's queue already
+                routed to r) — keeps Security/Approval from piling on one
+                specialist; bonus for building a second capable resource
+
+  SLARISK(r,c)= estimated (queue_wait(r) + handover_delay + service_time
+                inflation from skill gap) / sla_remaining(c)
+
+  URGENCY-ADAPTIVE WEIGHTS:
+    urgent:  w_skill=.35 w_cont=.25 w_fair=.10 w_train=0   w_res=.05 w_risk=.25
+    high:    w_skill=.30 w_cont=.25 w_fair=.15 w_train=.05 w_res=.10 w_risk=.15
+    normal:  w_skill=.20 w_cont=.20 w_fair=.25 w_train=.20 w_res=.15 w_risk=0
+    low:     w_skill=.15 w_cont=.15 w_fair=.25 w_train=.30 w_res=.15 w_risk=0
+
+PHASE 3 — ASSIGN with running counters
+  assign argmax score; decrement hours_remaining, increment new_assignments;
+  log assignment_reason = top-2 scoring terms in plain language
+  after batch: check S3 (training share >= 20% of normal/low) — if violated
+  and slack exists, swap the lowest-regret normal/low case to a training pair
+
+TIE-BREAKING (in order):
+  1. lower SLARISK   2. lower open_cases   3. lower overtime_risk
+  4. fewer new assignments this batch      5. alphabetical (deterministic,
+     so the same inputs always give the same auditable output)
+
+EXCEPTIONS:
+  - E(c) empty and case urgent -> allow one soft-constraint override in fixed
+    order: (a) use overtime-risk=high resource, (b) break continuity, and
+    escalate to a human dispatcher; override reason logged.
+  - supervised pair: supervisor's capacity is also debited (supervision is
+    real work, not free).
+  - a "keep owner" decision still counts as an assignment for H5 and hours.
+```
+
+# 3. Recommended assignment for the current queue
+
+| Case | Assignment | Main reason | Trade-off accepted | Training? | Risk to monitor |
+|---|---|---|---|---|---|
+| C001 | **R3_Celine + R8_Hugo (supervised pair, Hugo leads execution)** | Rule 6 allows skill 1 only under Gita/Hugo supervision; a full owner change would add ~2.7 h median wait against a 3 h SLA, so Celine's context is kept while Hugo provides specialist execution | Two people on one case (expensive); Celine's other work compresses | Partially (Celine gains supervised security exposure) | Tightest SLA in the batch; if the pair cannot start immediately, Hugo takes it solo |
+| C002 | **R6_Farid (keep owner)** | Owner is Approval specialist (3), urgent 2 h SLA, zero handover cost | Farid is loaded with two urgent cases this morning | No | Farid must sequence C002 before C011 |
+| C003 | **R4_David (keep owner)** | Already 2 reassignments — a third crosses the 1.8x-rework threshold; David is Diagnosis 3; 18 h slack tolerates his short day | Keeps work with a high-overtime-risk, overloaded resource | No | If the diagnosis loop repeats again, escalate to R3_Celine rather than loop a 4th time |
+| C004 | **R1_Amal (keep owner)** | Eligibility specialist, routine case, low handover cost | None material | No | None significant |
+| C005 | **R5_Eva (keep owner)** | Negotiation specialist, customer actively waiting, high priority | Eva carries two high-priority cases today | No | Eva's sequencing vs C016; contingency = R6_Farid (Neg 3) if she saturates |
+| C006 | **R10_Jonas (batched with C012)** | Rule 8 batching (normal, 36 h > 24 h); relieves R9_Iris who is overtime-risk = high with 11 open cases | Low-cost handover away from the current owner | No | Batch must not silently slip past 24 h of remaining SLA |
+| C007 | **R3_Celine (keep owner)** | Rework 3, already 3 reassignments and high handover cost — the log explicitly says avoid another handover | Celine's day is heavy (C001 pair + C007 + coaching) | No | Celine's capacity; C007 starts right after the C001 pair session |
+| C008 | **R7_Gita (keep owner)** | Security 3, current owner, no handover cost, 9 h slack | Gita stays moderately loaded | No | Gita is also the security incident buffer; keep her slack ≥ 1 h |
+| C009 | **R1_Amal, coached by R3_Celine (async review)** | Explicit training opportunity matching Amal's documented diagnosis priority; normal priority + 22 h slack makes trainee execution safe (H2 applies only to high/urgent) | ~3.3 h expected service-time inflation from a skill-1 executor | **Yes (documented priority)** | Rework rate on trainee diagnoses; Celine reviews before close |
+| C010 | **R6_Farid** | Relieves R2_Bruno (overtime-risk = high, 12 open); Farid is Approval 3, low handover cost, 20 h slack lets him do it after his urgent work | Loses the "trainee approval" idea — both documented approval trainees (David, Hugo) have Approval = 0 and may not execute or finalize under H1/H3; they shadow instead | Indirect (R8_Hugo invited to shadow the approval) | Farid at 3 assignments — do not add more this batch |
+| C011 | **R6_Farid (keep owner)** | Negotiation 3, urgent 4 h, VIP, zero handover | Concentrates urgency on Farid | No | Farid's timeline: C002 (2 h) then C011 (4 h) — feasible but tight |
+| C012 | **R10_Jonas (keep owner, batched with C006)** | Quality 3, current owner, batching allowed (low, 48 h) | None material | No | None significant |
+| C013 | **R10_Jonas** | New case, no owner, low priority, 72 h slack; Jonas has the lowest open count (4), low overtime risk, Eligibility 2 | Jonas reaches 3 new assignments (all small: complexities 0.34/0.19/0.21) | No | Watch Jonas's batch total against the cap of 4 |
+| C014 | **R8_Hugo** | R4_David is overtime-risk = high with only 3 h left; Hugo is Rework 3, low overtime risk; 25 h slack absorbs the medium handover; reassignment goes 1→2, still at the threshold not past it | Medium handover cost accepted; consumes Hugo capacity alongside C001/C015 | No | This case must not be reassigned again (would exceed 2) |
+| C015 | **R8_Hugo (keep owner), R10_Jonas + R5_Eva shadow** | Security 3 owner, 27 h slack; the log names Eva/Jonas as training candidates, but both have Security = 0, so under H1/H4 they may *observe only*, not execute even supervised | Supervised-execution training deferred until they certify to skill 1 | **Yes (structured shadowing toward documented security priorities)** | Shadowing must not delay Hugo's urgent work; schedule it late in the day |
+| C016 | **R5_Eva (keep owner)** | Rule 5: high complexity (0.79) + high handover cost → continuity preferred; Eva is skill 2, which satisfies H2 for a high-priority case | A Diagnosis-3 specialist (Celine/David) might be faster, but the 2.7 h handover penalty against a 7 h SLA outweighs that | No | Eva sequences C016 (7 h SLA) before C005 (8 h); if she slips, Celine assists rather than takes over |
+
+**Batch checks:** no resource exceeds 4 new assignments (max is Farid and Jonas at 3). The three overtime-risk = high resources receive: Bruno 0, Iris 0, David 1 (continuity-only, justified by S4). Training share: of 9 normal/low assignments, C009 and C015 are development assignments = 22 % ≥ 20 % (S3 satisfied). Gita retains slack as the security buffer (S5).
+
+# 4. Comparison with baseline policies
+
+| Dimension | First-available | Specialist-only | Proposed dynamic policy |
+|---|---|---|---|
+| **Expected throughput** | Highest *initial* start rate — every case starts fast — but the log shows this inflates reassignments and skill mismatch, so effective throughput decays (3.3 h service inflation per mismatch, 1.8x rework beyond 2 reassignments) | Good per-case service times, but Security (Gita/Hugo) and Approval (Farid) queues grow; cases wait for the specialist, so system throughput is capped by 2–3 people | Slightly slower to start than first-available, but avoids most rework and most specialist queuing; best *sustained* throughput, not best instantaneous |
+| **SLA risk** | Low waiting time but high breach risk on complex cases handed to weak executors (C001 to a low-load generalist would likely breach via rework) | Urgent security/approval cases fine; everything behind them in the specialist queue accumulates risk | Urgency-first ordering plus executor-specific SLA-risk term; the one deliberate gamble (supervised pair on C001) is chosen precisely to dodge the 2.7 h handover penalty |
+| **Error/rework risk** | Highest — ignores specialization except skill 0 | Lowest per case | Near-specialist on urgent/high work; accepts bounded extra rework risk on C009 (trainee, supervised review) in exchange for development |
+| **Fairness of workload** | Mechanically fair on case counts, blind to overtime risk and hours remaining (would load Bruno/David/Iris because count ≠ burden) | Very unfair — Gita, Hugo, Farid, Celine absorb everything scarce | Explicit fairness term + hard cap; the three high-overtime-risk resources get almost nothing new this batch |
+| **Skill development** | Accidental at best — mismatches are not training, they are unsupported struggle | None; trainees never touch specialist work, the skill matrix freezes | Guaranteed floor (≥ 20 % of normal/low work), matched to *documented* priorities, only where SLA slack exists; shadowing used where hard rules forbid execution |
+| **Continuity of ownership** | Poor — lowest-load routing changes owners constantly, driving reassignment counts past 2 | Moderate — continuity kept only when the owner happens to be the top specialist | Explicit continuity term calibrated to the measured handover evidence; C003, C007, C016 kept with owners specifically to respect it |
+| **Resilience to absence/bottlenecks** | Superficially resilient (anyone does anything) but fragile in quality terms | Very fragile — if Gita or Hugo is absent, Security stops | Actively builds second-line capability (Celine supervised on Security, Eva/Jonas shadowing, Amal growing in Diagnosis) and keeps a specialist buffer |
+
+**Honest caveat:** there is no dominant policy. If tomorrow's queue were 90 % urgent security work, specialist-only behaviour is correct and the dynamic policy converges to it (training weight goes to zero). If the shop were drowning in trivial routine cases, first-available is nearly optimal and the dynamic policy's overhead buys little. The dynamic policy's value is that it *degrades gracefully toward whichever baseline the situation demands*, and it writes down why.
+
+# 5. Explanation to workers
+
+> **How today's work was assigned**
+>
+> Every case in the queue was matched to a person using the same six questions, in this order of importance for urgent work:
+>
+> 1. **Is it safe and allowed?** Some activities have hard rules — security reviews need a certified specialist or direct supervision by Gita or Hugo, and final approvals are only signed off by people certified at competent level or above. These rules protect customers and protect *you*: nobody is ever left alone with work they haven't been certified for.
+> 2. **How close is the deadline?** Cases near their SLA go to the person who can finish them reliably, right now. That is why Farid has both urgent approvals and the VIP negotiation today — he is the strongest fit and had the hours.
+> 3. **Who already knows the case?** Handing a case to someone new costs real time — our own data shows a complex case loses almost three hours when it changes hands. So we keep cases with their current owner whenever that is safe. Celine keeping the rework case she knows, and Eva keeping her complex diagnosis, are examples.
+> 4. **Is the workload fair?** We look at open cases, hours left today, and overtime risk — not just case counts. Bruno, David and Iris have been carrying a lot, so they received little or no new work today. That is not a comment on performance; it is the system protecting people from overload.
+> 5. **Does it help someone grow?** When a case has plenty of deadline slack, we use it for development: Amal is taking a diagnosis case with Celine reviewing, and Jonas and Eva will sit in on Hugo's security review as a step toward their security goals. Growth assignments only happen on low-risk work — never at a customer's expense, and never as extra load on top of a full day.
+> 6. **Are we spreading knowledge?** We deliberately avoid sending every specialist task to the same one or two people, so the team keeps functioning when someone is away.
+>
+> Every assignment carries a short written reason you can see. If an assignment looks wrong to you — the estimate is off, you know context we don't, your day changed — flag it to the dispatcher. Human judgment overrides the recommendation, and the override is recorded so the system learns from it.
+
+# 6. Process-mining audit indicators
+
+All indicators are computed from the event log per week and per team, with control limits; the point is to detect *drift between the declared policy and observed behaviour*.
+
+1. **Handover frequency** — edges and weights of the handover-of-work social network (`discover_handover_of_work_network`); trend of handovers per case, split by `handover_cost_band` and `case_complexity`. Alert if high-cost/high-complexity handovers rise.
+2. **Reassignment count** — distribution of `reassignment_count` at case completion; share of cases exceeding 2 (target: shrinking); correlation with subsequent rework events.
+3. **Skill mismatch** — share of activity instances where the executing resource's skill for `required_skill` is < 2 (and, separately, executed unsupervised); cross-check observed executor clusters against `discover_organizational_roles` and `discover_activity_based_resource_similarity` to see whether real roles drift from the skill matrix.
+4. **Workload distribution** — Gini coefficient over new assignments per resource per batch, and over `workload_snapshot`; per-resource events per day vs team median.
+5. **Overtime-risk exposure** — volume and priority mix of new assignments to overtime-risk = high resources; each such assignment must carry an `assignment_reason` justifying rule-4 override — count unjustified ones.
+6. **SLA misses** — breach rate by priority using `time:timestamp` vs `sla_deadline`; waiting-time decomposition via `insert_case_service_waiting_time` to attribute misses to queueing vs service vs handover delay.
+7. **Rework/appeal after assignment** — probability of a Rework Correction (or appeal event) following an assignment, conditioned on skill level, supervision flag, and reassignment count — this directly re-estimates the 1.8x/3.3 h evidence the policy is calibrated on.
+8. **Training assignment share** — fraction of normal/low-priority assignments whose `assignment_reason` = training and whose activity matches the resource's documented `training_priority` (target ≥ 20 %); plus skill-progression of trainees over time.
+9. **Specialist bottleneck indicators** — waiting time before Security Review and Final Approval from the performance DFG (`discover_performance_dfg`); concentration ratio (share of these activities done by the top-1/top-2 resources); queue length dynamics; batching behaviour via `discover_batches` to verify rule 8 (no batched Quality Check with < 24 h SLA remaining or priority above normal).
+10. **Deviations from assignment policy** — replay each historical decision through the policy engine and compare recommended vs actual resource; deviation rate, deviation reasons (from `assignment_reason`), and outcome delta (did human overrides beat the policy?). Persistent beneficial overrides mean the weights should change, not the people.
+
+# 7. PM4Py implementation sketch
+
+```python
+import pandas as pd
+import pm4py
+
+# ---------- 0. Load and format ----------
+df = pd.read_csv("service_log.csv")
+log = pm4py.format_dataframe(
+    df, case_id="case:concept:name",
+    activity_key="concept:name", timestamp_key="time:timestamp")
+
+# ---------- 1. Resource-network evidence (continuity & resilience) ----------
+# Who hands work to whom, and how often -> continuity/handover audit
+how = pm4py.discover_handover_of_work_network(log)
+pm4py.save_vis_sna(how, "handover_network.html")          # or pm4py.view_sna(how)
+
+# Who co-works on cases -> candidate supervision pairs
+wt = pm4py.discover_working_together_network(log)
+
+# Which resources are interchangeable -> resilience / second-line capability
+sim = pm4py.discover_activity_based_resource_similarity(log)
+
+# Empirical roles vs the declared skill matrix -> skill-mismatch drift
+roles = pm4py.discover_organizational_roles(log)
+
+# ---------- 2. Performance evidence (SLA & bottlenecks) ----------
+# Waiting vs service decomposition per case
+kpi = pm4py.insert_case_service_waiting_time(log)
+
+# Service time per activity/resource -> calibrate skill-gap service inflation
+svc = pm4py.get_service_time(log, aggregation_measure="median")
+
+# Where queues form (Security Review / Final Approval bottlenecks)
+dfg, sa, ea = pm4py.discover_performance_dfg(log)
+
+# Batching compliance for Quality Check (rule 8)
+batches = pm4py.discover_batches(log)
+
+# ---------- 3. Slicing for calibration of policy terms ----------
+# High-complexity cases whose owner changed -> re-measure the 2.7h penalty
+hc = pm4py.filter_event_attribute_values(
+    log, "case_complexity_band", ["high"], level="case")
+
+# Slow cases (e.g., > 48h throughput) -> inspect their reassignment counts
+slow = pm4py.filter_case_performance(log, 48 * 3600, 10**12)
+variants = pm4py.get_variants(slow)   # do rework loops dominate slow variants?
+
+# Rework-rate lift by reassignment count (re-estimates the 1.8x figure)
+rew = (df.assign(had_rework=df.groupby("case:concept:name")["concept:name"]
+                 .transform(lambda a: (a == "Rework Correction").any()))
+         .groupby("reassignment_count")["had_rework"].mean())
+
+# ---------- 4. Policy audit: recommended vs actual ----------
+def recommend(case_row, resources):
+    """Re-run the Section-2 filter+score policy on historical state."""
+    eligible = hard_filter(case_row, resources)       # H1..H6
+    return max(eligible, key=lambda r: score(r, case_row))  # Section-2 weights
+
+decisions = extract_assignment_decisions(df)          # one row per assignment
+decisions["recommended"] = decisions.apply(
+    lambda x: recommend(x, resource_state_at(x["time:timestamp"])), axis=1)
+decisions["deviation"] = decisions["org:resource"] != decisions["recommended"]
+
+audit = decisions.groupby("team").agg(
+    deviation_rate=("deviation", "mean"),
+    high_ot_load=("overtime_flag", "mean"),
+    training_share=("assignment_reason",
+                    lambda s: (s == "training").mean()))
+# Deviations whose outcomes beat the recommendation feed weight re-tuning;
+# deviations that violate H-constraints are compliance findings.
+```
+
+The learning loop: the resource networks and role discovery reveal how work *actually* flows (continuity, supervision pairs, interchangeability); service/waiting-time analysis and the performance DFG re-estimate the handover, mismatch, and bottleneck penalties that parametrize the scoring terms; attribute and performance filtering isolates the segments (high complexity, many reassignments) where the trade-offs bite; and the recommended-vs-actual replay closes the loop by measuring policy adherence and telling us whether to retune weights — keeping the policy explainable, evidence-based, and honest about the fact that its trade-offs must evolve with the log.

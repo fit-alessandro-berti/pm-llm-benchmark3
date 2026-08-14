@@ -1,0 +1,183 @@
+## 1. Equivalence design space
+
+I define four equivalence relations over Order-centered executions E = (events, E2O, O2O): events totally ordered by timestamp, E2O mapping each event to a set of (type, object-id) pairs, O2O a set of qualified object-to-object relations. An id beginning with `EXT` is flagged external.
+
+**R1 — Activity-sequence equivalence.**
+*Definition.* E ≡₁ E′ iff the sequences of activity labels, read in timestamp order, are identical strings: seq(E) = seq(E′). All object information is deleted before comparison.
+*Invariants preserved:* number of events, activity labels, their total order, repetitions of labels.
+*Discarded:* every object, every multiplicity, externality, all E2O incidence beyond the label, all O2O relations and qualifiers.
+*Properties:* reflexive, symmetric, transitive (string equality), hence a true equivalence relation.
+*Concurrency:* same-timestamp events make the string ill-defined; I sort simultaneous labels lexicographically (a deterministic tie-break). This keeps R1 an equivalence relation; the policy must be fixed and documented.
+
+**R2 — Typed structural equivalence under identifier renaming (typed isomorphism).**
+*Definition.* E ≡₂ E′ iff there is a bijection φ from the local objects of E to the local objects of E′ such that (i) φ preserves object type, (ii) φ maps external-flagged objects only to external-flagged objects, (iii) the i-th event of E and the i-th event of E′ have the same activity label and φ maps the E2O object set of one exactly onto the other, and (iv) φ maps the O2O relation set of E onto that of E′, preserving qualifiers.
+*Invariants:* event order, labels, per-event typed multiplicities, complete E2O incidence, complete qualified O2O graph, externality flags.
+*Discarded:* concrete identifier strings, attribute values (amounts, SKUs), absolute timestamps.
+*Properties:* reflexive (identity), symmetric (inverse bijection), transitive (composition) — a genuine equivalence relation.
+*Concurrency:* replace the total order by the timestamp-induced partial order and require φ to extend to an order-isomorphism; simultaneous events may then be matched in any order-respecting way.
+
+**R3 — Business-semantic equivalence (preferred).**
+*Definition.* E ≡₃ E′ iff they agree on a fixed feature vector of business motifs, computed from types, multiplicities, externality flags, and O2O qualifiers:
+1. *Fulfilment shape:* number of packages, number of deliveries, and whether any Return/Inspect/repack loop occurs (values: consolidated / split-delivery / rework-loop).
+2. *Logistics isolation:* does any Pack or Dispatch event, or any packs/carries relation, involve an external Order or external Item? (isolated / shared).
+3. *Financial isolation:* does any Issue Invoice or Record Payment event, or bills/settles relation, involve an external Order? (isolated / shared).
+4. *Settlement pattern:* one payment fully settling vs. multiple payments with partially_settles qualifiers (single / installments).
+5. *Item integrity:* any replaces or removed_before_dispatch qualifier on items (intact / substituted), and any Return Item event (kept / returned).
+*Invariants:* the five motif values, hence the operationally meaningful shape of the case.
+*Discarded:* package-to-item assignment when delivery count is unchanged (X1's one package vs. X3's two inside one delivery are deliberately merged), exact interleavings, identifiers, item counts beyond the motifs.
+*Properties:* reflexive, symmetric, transitive — the kernel of a function into feature vectors. A "similarity-threshold" variant would lose transitivity; I avoid that.
+*Concurrency:* motifs come from counts and qualifier presence, so they are order-insensitive except rework detection, which only needs Return before a second Dispatch — a robust partial-order test.
+
+**R4 — Lead-lifecycle projection equivalence (auxiliary).**
+*Definition.* Project each event onto (activity label, multiset of object types with local/EXT flag and count), ignoring which particular object recurs across events; E ≡₄ E′ iff the projected sequences are equal. This sits strictly between R1 and R2: it sees typed multiplicities per event but not cross-event object identity (it cannot see that D41 carries only P41). Reflexive, symmetric, transitive; concurrency as in R1. R4 is what a cheap per-event canonicalization gives you, and it already separates X5, X6, X7 from X1.
+
+## 2. Canonical signatures
+
+Preferred relation: R3, backed by an R2-grade canonical form so results are reproducible. The signature has two layers: a semantic key (defines the cluster) and a structural certificate (for audit and tie-breaking).
+
+```python
+def event_token(ev):
+    # per-event typed multiplicity token, identifier-free
+    parts = []
+    for otype in sorted({t for (t, _) in ev.objects}):
+        loc = sum(1 for (t, o) in ev.objects if t == otype and not o.startswith("EXT"))
+        ext = sum(1 for (t, o) in ev.objects if t == otype and o.startswith("EXT"))
+        parts.append(f"{otype}:{loc}L{'+'+str(ext)+'E' if ext else ''}")
+    return ev.activity + "{" + ";".join(parts) + "}"
+
+def o2o_token(o2o):
+    # qualified O2O edges with ids replaced by (type, EXT-flag)
+    def cls(o): return (o.type, o.id.startswith("EXT"))
+    return sorted((r.qualifier, cls(r.src), cls(r.tgt)) for r in o2o)
+
+def semantic_key(E):
+    packs      = len([e for e in E.events if e.activity == "Pack Package"])
+    deliveries = len({d for e in E.events if e.activity == "Dispatch"
+                        for (t, d) in e.objects if t == "Delivery"})
+    rework     = any(e.activity in ("Return Item", "Inspect Return") for e in E.events)
+    log_shared = any(o.startswith("EXT") for e in E.events
+                     if e.activity in ("Pack Package", "Dispatch")
+                     for (_, o) in e.objects)
+    fin_shared = any(o.startswith("EXT") for e in E.events
+                     if e.activity in ("Issue Invoice", "Record Payment")
+                     for (_, o) in e.objects)
+    installments = sum(1 for e in E.events if e.activity == "Record Payment") > 1 \
+                   or any(r.qualifier == "partially_settles" for r in E.o2o)
+    substituted  = any(r.qualifier in ("replaces", "removed_before_dispatch")
+                       for r in E.o2o if r.src.type == "Item" or r.tgt.type == "Item")
+    shape = ("rework-loop" if rework else
+             "split-delivery" if deliveries > 1 else "consolidated")
+    return (shape, log_shared, fin_shared,
+            "installments" if installments else "single",
+            "substituted" if substituted else "intact")
+
+def structural_certificate(E):
+    # full R2 canonical form: invariant to renaming, preserves everything else
+    return (tuple(event_token(e) for e in E.events), tuple(o2o_token(E.o2o)))
+
+def signature(E):
+    return (semantic_key(E), structural_certificate(E))
+```
+
+Executions share a preferred cluster iff their `semantic_key` values are equal; the `structural_certificate` is stored alongside for audit. Both layers are invariant to local renaming (only type, count, EXT flag, order, and qualifier survive) and preserve repeated activities. For a partial-order variant, replace the event tuple by a sorted multiset of (token, predecessor-token-set) pairs.
+
+## 3. Cluster assignments
+
+| Execution | Activity-sequence cluster | Typed-structural cluster | Preferred semantic cluster | Defining signature | Main reason |
+|---|---|---|---|---|---|
+| X1 | A1 | T1 | S-CLEAN | (consolidated, iso, iso, single, intact) | Isolated one-shot fulfilment and settlement |
+| X2 | A1 | T1 | S-CLEAN | (consolidated, iso, iso, single, intact) | Identical to X1 up to renaming; Add-Item id order is noise |
+| X3 | A2 | T2 | S-CLEAN | (consolidated, iso, iso, single, intact) | Two packages but one delivery; customer-visible outcome equals X1 |
+| X4 | A3 | T3 | S-FRAG | (split-delivery, iso, iso, installments, intact) | Two deliveries plus staged payment |
+| X5 | A1 | T4 | S-LOGSHARE | (consolidated, shared, iso, single, intact) | Package and dispatch shared with external order |
+| X6 | A1 | T5 | S-FINSHARE | (consolidated, iso, shared, single, intact) | Invoice and payment shared with external order |
+| X7 | A1 | T6 | S-SUBST | (consolidated, iso, iso, single, substituted) | replaces / removed_before_dispatch on items |
+| X8 | A4 | T7 | S-REWORK | (rework-loop, iso, iso, single, intact-returned) | Post-delivery return, inspection, repack, reship |
+
+Note the deliberate divergence: R1 lumps {X1, X2, X5, X6, X7} into A1 because their label strings are identical; R2 splits everything except {X1, X2}; R3 sits in between and additionally merges X3 into the clean cluster while keeping X5–X8 apart.
+
+## 4. Cluster interpretations
+
+**S-CLEAN (X1, X2, X3).** Signature: consolidated single delivery, no external objects, one full payment, no item qualifiers. Business behavior: the happy path — order, pick, ship once, invoice, collect. This is the cost and cycle-time benchmark; X3's internal double-pack is a minor packing-labor lever invisible to the customer. Flattening: an Order-flattened log represents this cluster fine; an Item-flattened log would spuriously duplicate X3's events across items. Stability: high — no repair choice (qualifier deletion, EXT relabeling, tie-breaking) moves these cases.
+
+**S-FRAG (X4).** Signature: split deliveries plus installment settlement. Behavior: partial shipment with staged cash collection. Risks: longer cash-conversion cycle, double shipping cost, higher contact rate; opportunity: find why the second item was not ready. Flattening: Order-flattening keeps the repeated labels but loses which delivery carried which package and that M41 only partially settled V41 — classic divergence errors. Stability: moderate — collapsing repeated labels or treating payment count as an attribute pulls X4 toward S-CLEAN; the delivery split alone still keeps it out.
+
+**S-LOGSHARE (X5).** Signature: external Order/Item in Pack and Dispatch; finance isolated. Behavior: multi-order shipment consolidation (one box, two orders). Risks: mis-ship and returns ambiguity across orders, liability if the external order is canceled after packing; opportunity: freight savings. Flattening on Order silently drops EXT-OA/EXT-IA, making X5 look exactly like X1 — the most dangerous representation failure in this dataset. Stability: low under "ignore external objects" (collapses into S-CLEAN); otherwise stable.
+
+**S-FINSHARE (X6).** Signature: invoice bills two orders; payment settles without order-level allocation. Behavior: consolidated billing (one customer, multiple orders). Risks: revenue allocation and audit problems — no per-order settlement fact exists; opportunity: fewer invoices, lower AR cost. Flattening on Order duplicates V61/M61 under both orders, double-counting revenue (convergence). Stability: low under "ignore external objects"; stable otherwise.
+
+**S-SUBST (X7).** Signature: consolidated shape with replaces / removed_before_dispatch item qualifiers. Behavior: a pre-dispatch substitution — an item swapped in the package before it left. Risks: pick-error or stock-out signal, mislabeled contents if the removal was not physical. Any flattening that keeps only events loses the qualifiers entirely — X7 is only distinguishable through O2O; even the E2O anomaly (an Item on Dispatch) is easy to discard as noise. Stability: very low under "ignore qualifiers": X7 then drifts toward S-CLEAN.
+
+**S-REWORK (X8).** Signature: Return Item, Inspect Return, second Pack/Dispatch; P82 replaces P81 for I82. Behavior: post-delivery return with reship. Risks: doubled logistics cost, satisfaction hit, reverse-logistics load; opportunity: quality root-cause on I82's product family. Order-flattening keeps the loop visible but conflates the two deliveries' lifecycles; a Delivery-flattened view would split the case into disconnected fragments. Stability: high — the Return/Inspect labels alone keep X8 separate under every perturbation considered.
+
+## 5. Borderline cases
+
+**X1 vs X2.** Every relation defined here merges them; the only relation that separates them is raw-identifier equality or one that treats the Add Item id order (I22 before I21) as meaningful, which the "ids carry no semantics" constraint rules out. But if events shared a timestamp, a tool sorting by id could produce different strings for X1 and X2, so tie-breaking policy is where a disagreement could still creep in.
+
+**X1 vs X5.** R1 says equivalent (identical label string); R2 and R3 say different, since X5's Pack event has two Orders and three Items, one of each external. Both views are defensible: a control-flow auditor checking "packed, shipped, invoiced, paid in order?" accepts X5; a logistics analyst allocating shipping cost per order must not. The disagreement is precisely the information flattening destroys.
+
+**X1 vs X6.** Same structure of disagreement, on the financial side: R1 merges, R2/R3 split because Issue Invoice and Record Payment carry EXT-OB. A cash-application team cares (V61 has no per-order allocation); a fulfilment team legitimately does not. One could even defend a hybrid relation that is R2 on logistics objects and R1 on financial objects, which would merge X1 and X6 but split X1 and X5.
+
+**X1 vs X7.** R1 merges them. R2 splits on two grounds: the Dispatch event's E2O includes an Item, and the O2O contains replaces / removed_before_dispatch. A definition that consults only E2O incidence still splits them (weakly, via one extra incidence); a definition that also ignores "unusual" E2O entries as recording noise merges them — and is defensible if one believes the Item-on-Dispatch is a logging artifact. The qualifiers are the tiebreaker: with qualifiers trusted, X7 is a substitution case; with qualifiers discarded, X7 is nearly X1.
+
+**X3 vs X4.** Both split items across two packages; they differ in delivery count (one vs two) and settlement (one vs two payments). R2 and my R3 split them, but a coarser relation keyed only on "packages > 1" would merge them — defensible if packing labor is the analysis target. Conversely, a customer-experience relation keyed only on delivery count merges X3 with X1 and isolates X4, which is what my R3 does. "Split fulfilment" is thus two motifs (pack split vs delivery split), and the clustering must pick which one is load-bearing.
+
+**X4 vs X8.** Both produce two deliveries and look "fragmented", but by different mechanisms: X4 splits forward (never all items in one shipment); X8 ships everything, then takes a return loop. R1 and R2 split them (X8 has extra labels). A relation keyed only on final logistics footprint (two deliveries, two packages) would merge them — defensible for cost accounting, since both incur double freight. My R3 splits them because the rework loop is a quality signal while the forward split is an inventory/policy signal, and conflating them would poison root-cause analysis.
+
+## 6. Relation to `pm4py.cluster_equivalent_ocel`
+
+PM4Py's execution extraction builds, per lead object, the set of events and objects reachable through E2O/O2O, and `cluster_equivalent_ocel` groups executions whose key structure is exactly equal. The key preserves the events' activity labels, the objects with their types, and the incidence relations between them — essentially my R2, except that where the implementation keys on raw object identifiers rather than a canonical renaming, perfectly isomorphic executions (X1 and X2) land in different clusters because O1 ≠ O2 and I11 ≠ I21. Exact clusters then become too fine in the worst way: almost every real execution is a singleton and the clustering degenerates into the identity partition.
+
+Post-processing: map each returned execution through a canonicalization like `structural_certificate` in Section 2 (identifier-free tokens, externality flags, sorted O2O qualifier triples), then merge PM4Py clusters whose certificates are equal; optionally merge further by `semantic_key`. Exact equivalence is preferable for deduplication, caching expensive per-execution computations, or conformance verdict reuse — where any structural difference may change the result; coarser business clustering is preferable for segmentation and reporting. Practically, `max_objs` bounds the objects pulled into one execution: cross-order chains like X5/X6 can transitively connect many orders into one giant component, so a low `max_objs` truncates executions (making some falsely equivalent), while an unbounded setting yields mega-executions spanning several lead orders — check both effects before trusting cluster counts.
+
+```python
+import pm4py
+from collections import defaultdict
+
+# 1) exact equivalence clustering on Order-centered executions
+clusters = pm4py.cluster_equivalent_ocel(ocel, "Order", max_objs=50)
+
+# 2) canonicalize each execution and re-aggregate
+def canon(execution_ocel):
+    toks = []
+    rel = execution_ocel.relations  # E2O table
+    for eid, grp in rel.groupby("ocel:eid", sort=False):
+        act = grp["ocel:activity"].iloc[0]
+        typed = sorted(
+            (t, sum(~grp.loc[grp["ocel:type"] == t, "ocel:oid"].str.startswith("EXT")),
+                sum(grp.loc[grp["ocel:type"] == t, "ocel:oid"].str.startswith("EXT")))
+            for t in grp["ocel:type"].unique())
+        toks.append((act, tuple(typed)))
+    o2o = getattr(execution_ocel, "o2o", None)
+    qual = tuple(sorted(map(tuple, o2o[["ocel:qualifier"]].value_counts().items()))) \
+           if o2o is not None and len(o2o) else ()
+    return (tuple(toks), qual)
+
+merged = defaultdict(list)
+for key, execs in clusters.items():
+    for ex in execs:
+        merged[canon(ex)].append(ex)
+
+# 3) optional: coarsen to business clusters via a semantic_key as in Section 2
+```
+
+## 7. Robustness analysis
+
+**Ignore all O2O qualifiers.** X7 loses replaces / removed_before_dispatch and, unless the Item-on-Dispatch E2O anomaly is kept as a feature, migrates into S-CLEAN. X4 loses partially_settles but retains installments via payment count; X8 loses "P82 replaces P81" but keeps its Return/Inspect labels. Net effect: one migration (X7) — the S-SUBST cluster exists only because qualifiers are trusted.
+
+**Ignore external objects.** X5 and X6 collapse into S-CLEAN, and the T4/T5 structural clusters merge into T1. The remaining partition {S-CLEAN, S-FRAG, S-SUBST, S-REWORK} is exactly what a naive Order-flattened analysis would report — two of six semantic clusters destroyed.
+
+**Collapse repeated same-label events.** X3's two Packs become one, making X3 structurally identical to X1/X2 — harmless for R3, which already merged them. X4 drifts into S-CLEAN unless delivery multiplicity is recomputed from object counts rather than event counts; my signature counts distinct Delivery objects, so X4 survives in S-FRAG. X8 keeps Return/Inspect and survives. Lesson: derive multiplicity motifs from objects, not from event repetition.
+
+**Pack/Dispatch as partial order.** X4's interleaving Pack–Dispatch–Pack–Dispatch versus a hypothetical Pack–Pack–Dispatch–Dispatch stops mattering; X3 vs X4 still differ via delivery count. X1/X2's Add Item order ambiguity disappears, removing the tie-breaking caveat from Section 5. No R3 assignment changes; R1's A2/A3 boundaries soften. This perturbation mostly adds robustness.
+
+**Payment multiplicity as amount attribute.** If M41+M42 become one payment fact with amounts, the installment component of X4's signature disappears; X4 stays in S-FRAG through the delivery split alone. Had X4 been single-delivery with two payments, it would have merged into S-CLEAN — the settlement motif is the fragile half of S-FRAG's definition.
+
+## 8. Limitations and recommendation
+
+**Compliance monitoring:** use R2 (typed structural, with qualifiers). Compliance questions ("was every invoice settled, was anything removed after packing?") live exactly in the incidences and qualifiers R2 preserves; R3 would hide X7-style substitutions inside benign-looking clusters, and R1 is provably blind to X5/X6/X7.
+**Operational segmentation:** use R3. Six business clusters over eight cases is interpretable; R2's seven near-singletons segment nothing, and R1's four clusters mix shared-logistics with clean cases.
+**Root-cause analysis:** start from R3 clusters, then drill into R2 certificates within a cluster: the motif names the symptom (rework, split, sharing); the certificate localizes the mechanism (which relation or event carried the external object).
+**Descriptive reporting:** use R1 or R4. Management reporting needs stable, explainable buckets ("standard flow, split shipment, returns flow"); label-sequence clusters are cheap and stable across data repairs, provided the report states that object sharing is invisible at this level.
+
+No single notion serves all four purposes because they weight the same differences oppositely: compliance must preserve exactly the qualifier- and externality-level detail (X5, X6, X7) that makes segmentation unreadably fine, while segmentation must discard exactly the detail (X3's second package, id renamings) whose preservation makes compliance sound. Equivalence choice is not a data question but a question of which differences the downstream decision may ignore — the honest deliverable is a lattice of relations (R1 ⊐ R4 ⊐ R3-certificate ⊐ R2) with the analysis pinned to a named level, not one partition presented as "the" clustering.
