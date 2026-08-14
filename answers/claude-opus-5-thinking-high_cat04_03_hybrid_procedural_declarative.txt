@@ -1,0 +1,844 @@
+# 1. Policy Interpretation and Conflict Resolution
+
+## 1.1 Material assumptions
+
+**Scope and case notion**
+
+- A1. One case = one onboarding request for one vendor. `Receive Onboarding Request` is the unique start event and `Close Onboarding` the unique terminal event of every complete case.
+- A2. "The three checks" means exactly `Capture Master Data`, `Run Sanctions Screening`, `Verify Bank Account`. `Classify Risk` requires all three to have completed.
+- A3. The log is activity-and-timestamp based with one lifecycle transition per event (no start/complete pairs). Hour granularity; all offsets are relative to case start.
+- A4. `org:resource` is present on every event. It carries a human/system actor identity, except for `Receive Clarification`, whose resource (`Vendor`) is an external party and is therefore excluded from all segregation-of-duty tests.
+- A5. Risk class (low/high) is **not** an attribute in the log. The route is only observable through which activities occurred (`Manager Approval` vs. `Enhanced Due Diligence` + `Compliance Approval`). Consequently no layer can verify that the *correct* route was chosen for the *actual* risk class; it can only verify that a route is internally consistent. This is a blind spot, not a modeled constraint.
+- A6. "Applicable approval" (R9) = `Manager Approval` on the low-risk route, `Compliance Approval` on the high-risk route. If both occur (already an R2/R8 breach), the segregation check is run against *both* and the case is reported as structurally invalid first.
+
+**Requirement reading**
+
+- A7. R2's "should" is read as a hard constraint (`exactly one` approval in an accepted case, `none` in a rejected case), because it is a control statement, not a statistical expectation. Only R12 is read as soft.
+- A8. R3 is read as *alternate succession* on the pair (`Request Clarification`, `Receive Clarification`): no second request before the pending one is answered, no unsolicited or duplicated response, and every request answered before the terminal outcome (`Reject Vendor` / `Activate Vendor`).
+- A9. R4 is an unconditional eventual obligation triggered by `Sanctions Escalation`; it does **not** imply that `Obtain Legal Opinion` requires a prior escalation (an opinion may be obtained for other reasons). Therefore I do not encode `Obtain Legal Opinion ⇒ Sanctions Escalation`.
+- A10. R7 is a precondition, not an obligation: escalation is optional, but if it occurs it occurs after `Run Sanctions Screening`. Evidence from T6/T7 shows escalation occurring *after* `Classify Risk`, so the backbone must admit escalation in the post-classification region as well.
+- A11. R10's "at most once" is scoped to the onboarding case. `Release First Payment` is the *first* payment; subsequent payment runs belong to a different process.
+- A12. **R10 vs. R11 is a genuine inconsistency.** R11 speaks of "any later `Release First Payment`", which presupposes a second payment in the same case, while R10 caps it at one. Resolution adopted: R10 wins inside onboarding; R11's re-verification clause is implemented as a *payment-run gate* in the data layer, which also protects payments raised after onboarding closes. Consequence: post-activation maintenance (`Change Bank Details`, `Suspend Vendor`, re-`Verify Bank Account`) is deliberately **excluded** from the procedural backbone and enforced declaratively plus in the data layer.
+- A13. R12 thresholds are two-sided z-tests with `zeta = 2.0`, i.e. flag when `|observed − mean| > 2 · sd`. They are warnings only.
+- A14. Absence of an attribute is never treated as compliance. A check whose required attribute is missing returns `unverifiable` and is routed to manual review.
+
+## 1.2 The R5/R6 conflict
+
+R5 (Legal): *after `Sanctions Escalation`, `Obtain Legal Opinion` must precede `Activate Vendor` under all circumstances.*
+R6 (Operations): *activation may precede the opinion under joint out-of-band authorization, with the opinion due within 24 hours.*
+
+These are logically incompatible on the activity dimension: R5 forbids exactly the trace shape R6 permits. The distinguishing evidence (emergency flag, joint authorization) is by stipulation **not in the log**, so the conflict cannot be resolved by looking at data — only by policy choice. Any model that quietly permits both orders is silently adopting R6 while claiming to enforce R5.
+
+**Resolution A — Legal supremacy (strict).** R5 is absolute. `Obtain Legal Opinion` must complete before `Activate Vendor` whenever escalation occurred. R6 is not a modeled behavior: every emergency activation is a violation that generates an incident record, which may later be waived by a human on the basis of out-of-band evidence.
+*Compliance risk:* false positives. Genuinely authorized emergencies are indistinguishable from real breaches, so the violation queue mixes both, producing alert fatigue and pressure to keep emergency activations out of the system entirely (a shadow process, which is worse than a logged violation).
+
+**Resolution B — Sanctioned exception with mandatory evidence.** Extend the case schema with `emergency_activation`, `emergency_authorizers` (≥2 distinct actors, both different from the activating resource), and `emergency_authorization_time` (< activation time). Activation before the opinion is conformant **iff** all attributes are present and valid and the opinion arrives within 24 hours of activation. Without the attributes the trace is `unverifiable`, never `pass`.
+*Compliance risk:* sanctions exposure. The vendor is live in the master-data system before legal clearance, and the exculpating attributes are self-declared and can be back-filled after the fact. The control degrades to an attestation control.
+
+**Resolution C — Compensating payment gate (relaxation of the *obligation point*).** Keep the emergency activation permitted, but move the hard barrier from `Activate Vendor` to `Release First Payment`: no money leaves before the legal opinion exists. Activation without payment carries far less sanctions risk than payment without an opinion.
+*Compliance risk:* it changes the legal department's stated rule rather than enforcing it; it must be signed off by Legal, not chosen by a modeler. It also leaves the vendor visible/active (able to receive POs) without clearance.
+
+**Choice for the implemented model: Resolution A.** It is the only option that requires no unavailable attribute and no reinterpretation of a legal control, and it keeps the procedural model as the strictest layer, which is the right place for a hard barrier. Resolution B is delivered as an explicitly named model variant (`procedural_model_variant_b`, plus a DECLARE key swap) so the two policies can be evaluated side by side and never merged. Resolution C is my recommendation for policy evolution, because it is the only version of the rule that Operations can actually live with; §10 states how it would be deployed. Under Resolution A the compliance risk I accept is that T6-shaped traces are reported as hard control-flow violations even when the authorization genuinely existed; §7 therefore attaches an `unverifiable` emergency sub-verdict to every such finding so the reviewer sees *why* the case is contested rather than just "unfit".
+
+---
+
+# 2. Requirement-to-Formalism Mapping
+
+Authoritative layer is marked **bold** in the "Primary formalism" column.
+
+| Requirement | Primary formalism | Exact encoding | Why this formalism | Redundancy or limitation |
+|---|---|---|---|---|
+| R1 — `Reject Vendor` and `Activate Vendor` never in the same case | **Procedural (process tree XOR)**; DECLARE; log skeleton | Tree: the two outcomes live in disjoint XOR branches. DECLARE: `noncoexistence: (Reject Vendor, Activate Vendor)`. Skeleton: `never_together: (Reject Vendor, Activate Vendor)` | Mutual exclusion of terminal outcomes is a structural choice; the XOR makes it unsatisfiable rather than merely detectable | Triple redundancy is intentional (highest-severity rule, cheapest checks first). Skeleton/DECLARE are symmetric and cannot say *which* outcome was legitimate |
+| R2 — exactly one of `Manager Approval` / `Compliance Approval` in an accepted case; neither in a rejected case | **Procedural**; DECLARE (partial); log skeleton (partial) | Tree: low branch contains `Manager Approval`, high branch `Enhanced Due Diligence → Compliance Approval`, reject branch contains neither; `Activate Vendor` is reachable only through an approval. DECLARE: `noncoexistence: (Manager Approval, Compliance Approval)`, `(Reject Vendor, Manager Approval)`, `(Reject Vendor, Compliance Approval)`; `precedence: (Classify Risk, Manager Approval)`, `(Classify Risk, Enhanced Due Diligence)` | The "at least one of two" half is a **disjunctive** obligation; binary DECLARE and log skeletons have no disjunction, block structure does | DECLARE covers only the "at most one" and "none if rejected" halves. `precedence(X, Activate Vendor)` cannot be written for a disjunction without over-constraining one route |
+| R3 — every `Request Clarification` answered before the next request and before any final outcome; cycles allowed | **DECLARE** `altsuccession`; procedural loop; log skeleton | DECLARE: `altsuccession: (Request Clarification, Receive Clarification)`. Tree: `*( τ, →(Request Clarification, Receive Clarification) )` inside the intake block. Skeleton: `equivalence: (Request Clarification, Receive Clarification)`, `always_after: (Request Clarification, Receive Clarification)`, `always_before: (Receive Clarification, Request Clarification)` | Alternate succession is the exact formal reading of "answered before the next one is raised, and never answered spuriously"; it is unbounded in cycle count, which a tree loop matches but a cardinality set does not | The "before any final outcome" clause is only enforced *structurally* (the loop sits before `Classify Risk`, which precedes all outcomes). DECLARE alone would allow `Request Clarification → Activate Vendor → Receive Clarification`. Skeleton `activ_freq` needs a finite cap (chosen {0,1,2,3}), which disagrees with the tree for a 4th cycle |
+| R4 — `Sanctions Escalation` ⇒ eventually `Obtain Legal Opinion` | **DECLARE** `response`; procedural; log skeleton | DECLARE: `response: (Sanctions Escalation, Obtain Legal Opinion)`. Tree: the escalation block is `X( τ, →(Sanctions Escalation, Obtain Legal Opinion) )`, so choosing escalation commits to the opinion. Skeleton: `always_after: (Sanctions Escalation, Obtain Legal Opinion)` | A conditional eventual obligation is the textbook `response` template; it is naturally vacuous when no escalation occurs | The tree encodes R4 *and* R5 jointly, which is stronger than R4 alone. Response is satisfied vacuously in 6 of 8 test cases — vacuity must be reported (§9) |
+| R5 — after escalation, `Obtain Legal Opinion` before `Activate Vendor` (strict reading) | **Procedural**; DECLARE (via composition) | Tree: escalation block is `PARALLEL` with the approval sub-branch and both must complete before `Activate Vendor`, so the opinion is a hard predecessor of activation only when escalation was chosen. DECLARE: `nonsuccession: (Activate Vendor, Obtain Legal Opinion)` — no opinion after any activation — which together with `response(Sanctions Escalation, Obtain Legal Opinion)` yields the conditional precedence | Conditional precedence is a 3-activity constraint. The tree expresses it exactly through block scoping; DECLARE can only reach it by conjunction | `precedence(Obtain Legal Opinion, Activate Vendor)` would be wrong (it would demand an opinion in every accepted case, failing T1/T2). The `nonsuccession` surrogate slightly over-restricts: it also forbids an unsolicited post-activation opinion in non-escalated cases. Accepted and disclosed |
+| R6 — emergency activation before the opinion, jointly authorized off-log, opinion within 24 h | **Resource/data layer** (`check_emergency_activation`); temporal (partial); procedural variant B | Data layer: requires `emergency_activation`, `emergency_authorizers`, `emergency_authorization_time`, and `opinion_time − activation_time ≤ 24 h`. Under Resolution A the check only *classifies* an already-failed trace; under Resolution B it decides conformance | The condition is data-, resource- and deadline-based. No activity-only formalism can see an attribute that does not exist in the log | **Hard limitation:** with the log as specified, R6 is unverifiable by construction. Every emergency-shaped trace returns `unverifiable`. A temporal profile cannot express the 24 h *deadline* either, because it is a two-sided z-test around a mean, not a one-sided bound |
+| R7 — `Sanctions Escalation` only after `Run Sanctions Screening` | **DECLARE** `precedence`; procedural; log skeleton | DECLARE: `precedence: (Run Sanctions Screening, Sanctions Escalation)`. Tree: the escalation block is downstream of the intake block, hence of the screening. Skeleton: `always_before: (Sanctions Escalation, Run Sanctions Screening)` | Unconditional precondition on an optional activity = `precedence`, which is vacuous when the target never occurs | The tree is stricter than R7: it forbids escalation *concurrently with* screening (before `Classify Risk`), which R7 would permit. Deliberate approximation, disclosed in §3 |
+| R8 — `Enhanced Due Diligence` ∦ `Manager Approval`; `Compliance Approval` ∦ `Manager Approval` | **DECLARE** `noncoexistence`; procedural; log skeleton | DECLARE: `noncoexistence: (Manager Approval, Enhanced Due Diligence)`, `(Manager Approval, Compliance Approval)`. Tree: separate XOR branches. Skeleton: same two pairs in `never_together` | Route separation is symmetric co-occurrence, not ordering — `noncoexistence` (not `nonsuccession`) is the correct template | If a case legitimately starts low-risk and is re-classified upward, R8 makes the whole case non-conformant. There is no re-classification construct in the backbone; that is a real modeling gap, not a detection success |
+| R9 — four-eyes: `Verify Bank Account` ≠ applicable approval; `Capture Master Data` ≠ `Activate Vendor` | **Resource/data layer** | `pm4py.filter_four_eyes_principle(log, "Verify Bank Account", "Manager Approval", keep_violations=True)` and the same for `(Verify Bank Account, Compliance Approval)` and `(Capture Master Data, Activate Vendor)`, plus an explicit pandas equivalent | Resource identity is an event attribute; process trees, DECLARE and log skeletons quantify over activity labels only | No redundancy anywhere — this rule is invisible to the other four layers. If `org:resource` is missing the answer is `unverifiable`, not `pass`. Actor identity ≠ natural person (shared/service accounts defeat the check) |
+| R10 — `Activate Vendor`, `Reject Vendor`, `Release First Payment` at most once | **Log skeleton** `activ_freq`; procedural | Skeleton: `activ_freq[Activate Vendor] = {0,1}`, `[Reject Vendor] = {0,1}`, `[Release First Payment] = {0,1}`. Tree: each label occurs once per branch with no enclosing loop | `activ_freq` is exactly a per-case cardinality set; DECLARE's available unary templates (`existence`, `absence`, `exactly_one`) cannot say "0 or 1" for an optional activity | Conflicts with R11's presumption of a later payment (A12). Duplicate labels across tree branches mean the tree bounds occurrences per branch, not globally — the skeleton is the authoritative cap |
+| R11 — post-activation `Change Bank Details` ⇒ `Suspend Vendor` follows; a new `Verify Bank Account` before any later payment | **Resource/data layer**; DECLARE (over-approximation); log skeleton | Data layer: `check_r11_bank_change` (see §7) — locates activation, finds subsequent `Change Bank Details`, requires a later `Suspend Vendor` and a `Verify Bank Account` after the change and before any payment. DECLARE: `response: (Change Bank Details, Suspend Vendor)`, `precedence: (Verify Bank Account, Release First Payment)`. Skeleton: `always_after: (Change Bank Details, Suspend Vendor)` | The rule is conditioned on *relative position* ("after activation") and on a *later* occurrence of an already-occurring activity — both beyond binary activity templates | DECLARE's `response(Change Bank Details, Suspend Vendor)` is unconditional, hence stricter than R11 (it also applies to pre-activation corrections). `precedence(Verify Bank Account, Release First Payment)` is much weaker than R11: it is satisfied by the *original* verification, not a fresh one. The procedural backbone excludes this behavior entirely (A12), so a real maintenance trace fails the procedural layer while passing DECLARE — a known cross-layer disagreement (§9) |
+| R12 — temporal expectations, flag not reject | **Temporal profile** (`zeta = 2.0`) | `{(Request Clarification, Receive Clarification): (172800, 86400), (Sanctions Escalation, Obtain Legal Opinion): (43200, 21600), (Activate Vendor, Release First Payment): (259200, 129600)}` | A profile is the only layer that carries a distribution and produces a graded z-score instead of a boolean | No redundancy. Cannot see a *missing* second event (T5), cannot express one-sided deadlines (R6), symmetric flagging means implausibly fast execution is flagged only if it exceeds `zeta·sd` — with sd = 36 h a 2-hour payment escapes (T7) |
+
+---
+
+# 3. Procedural Backbone
+
+## 3.1 Compact formal description
+
+Using `→` sequence, `×` exclusive choice, `∧` parallel (interleaving), `↺(A,B)` loop (execute `A`, then optionally repeat `B → A`), `τ` silent:
+
+```
+ESC   := × ( τ , → ( Sanctions Escalation , Obtain Legal Opinion ) )
+CLAR  := ↺ ( τ , → ( Request Clarification , Receive Clarification ) )
+INTK  := ∧ ( Capture Master Data , Run Sanctions Screening , Verify Bank Account , CLAR )
+REJB  := ∧ ( ESC , Reject Vendor )
+LOWB  := → ( ∧ ( ESC , Manager Approval ) , Activate Vendor , Release First Payment )
+HIGHB := → ( ∧ ( ESC , → ( Enhanced Due Diligence , Compliance Approval ) ) , Activate Vendor , Release First Payment )
+ROOT  := → ( Receive Onboarding Request , INTK , Classify Risk ,
+             × ( REJB , LOWB , HIGHB ) ,
+             Close Onboarding )
+```
+
+This is the **Resolution A** model. The Resolution B variant differs in exactly one respect: in `LOWB`/`HIGHB` the `Activate Vendor` leaf moves *inside* the parallel block (`∧(ESC, →(Manager Approval, Activate Vendor))` and `∧(ESC, →(Enhanced Due Diligence, Compliance Approval, Activate Vendor))`), so the legal opinion may arrive after activation but must still precede `Release First Payment`. Both are provided; they are never combined.
+
+## 3.2 PM4Py code
+
+```python
+"""Controlled vendor onboarding - procedural backbone (Resolution A).
+
+Self-contained: builds a ProcessTree, exposes it as `procedural_model`, and
+converts it to an accepting Petri net for alignment-based conformance checking.
+Verified with pm4py 2.7.23 / pandas 3.0.
+"""
+
+import pm4py
+from pm4py.objects.process_tree.obj import ProcessTree, Operator
+
+ROR = "Receive Onboarding Request"
+CMD = "Capture Master Data"
+RSS = "Run Sanctions Screening"
+VBA = "Verify Bank Account"
+CLR = "Classify Risk"
+REQ = "Request Clarification"
+REC = "Receive Clarification"
+SES = "Sanctions Escalation"
+OLO = "Obtain Legal Opinion"
+EDD = "Enhanced Due Diligence"
+MAP = "Manager Approval"
+CAP = "Compliance Approval"
+REJ = "Reject Vendor"
+ACT = "Activate Vendor"
+CBD = "Change Bank Details"
+SUS = "Suspend Vendor"
+RFP = "Release First Payment"
+CLO = "Close Onboarding"
+
+
+def _node(operator=None, label=None):
+    return ProcessTree(operator=operator, label=label)
+
+
+def _children(parent, *nodes):
+    for n in nodes:
+        n.parent = parent
+        parent.children.append(n)
+    return parent
+
+
+def _escalation_block():
+    """X(tau, ->(Sanctions Escalation, Obtain Legal Opinion)).
+
+    Escalation is optional; choosing it commits the case to a legal opinion
+    inside the same block (R4). Because the block must complete before
+    `Activate Vendor`, the opinion precedes activation whenever escalation
+    happened, without demanding an opinion in non-escalated cases (R5).
+    """
+    choice = _node(operator=Operator.XOR)
+    pair = _node(operator=Operator.SEQUENCE)
+    _children(pair, _node(label=SES), _node(label=OLO))
+    return _children(choice, _node(), pair)          # bare ProcessTree() == tau
+
+
+def _clarification_loop():
+    """*(tau, ->(Request Clarification, Receive Clarification)) - zero or more
+    complete request/response cycles; an unanswered request cannot close (R3)."""
+    loop = _node(operator=Operator.LOOP)
+    cycle = _node(operator=Operator.SEQUENCE)
+    _children(cycle, _node(label=REQ), _node(label=REC))
+    return _children(loop, _node(), cycle)
+
+
+def build_procedural_model():
+    root = _node(operator=Operator.SEQUENCE)
+
+    intake = _node(operator=Operator.PARALLEL)
+    _children(intake, _node(label=CMD), _node(label=RSS), _node(label=VBA),
+              _clarification_loop())
+
+    reject_branch = _node(operator=Operator.PARALLEL)
+    _children(reject_branch, _escalation_block(), _node(label=REJ))
+
+    low_branch = _node(operator=Operator.SEQUENCE)
+    low_par = _node(operator=Operator.PARALLEL)
+    _children(low_par, _escalation_block(), _node(label=MAP))
+    _children(low_branch, low_par, _node(label=ACT), _node(label=RFP))
+
+    high_branch = _node(operator=Operator.SEQUENCE)
+    high_par = _node(operator=Operator.PARALLEL)
+    high_seq = _node(operator=Operator.SEQUENCE)
+    _children(high_seq, _node(label=EDD), _node(label=CAP))
+    _children(high_par, _escalation_block(), high_seq)
+    _children(high_branch, high_par, _node(label=ACT), _node(label=RFP))
+
+    outcome = _node(operator=Operator.XOR)
+    _children(outcome, reject_branch, low_branch, high_branch)
+
+    _children(root, _node(label=ROR), intake, _node(label=CLR), outcome,
+              _node(label=CLO))
+    return root
+
+
+def build_procedural_model_variant_b():
+    """Resolution B / C shape: the legal opinion may arrive after activation but
+    must precede Release First Payment. Use ONLY together with the Resolution B
+    DECLARE variant and the emergency-authorization data check."""
+    root = _node(operator=Operator.SEQUENCE)
+
+    intake = _node(operator=Operator.PARALLEL)
+    _children(intake, _node(label=CMD), _node(label=RSS), _node(label=VBA),
+              _clarification_loop())
+
+    reject_branch = _node(operator=Operator.PARALLEL)
+    _children(reject_branch, _escalation_block(), _node(label=REJ))
+
+    low_branch = _node(operator=Operator.SEQUENCE)
+    low_par = _node(operator=Operator.PARALLEL)
+    low_inner = _node(operator=Operator.SEQUENCE)
+    _children(low_inner, _node(label=MAP), _node(label=ACT))
+    _children(low_par, _escalation_block(), low_inner)
+    _children(low_branch, low_par, _node(label=RFP))
+
+    high_branch = _node(operator=Operator.SEQUENCE)
+    high_par = _node(operator=Operator.PARALLEL)
+    high_inner = _node(operator=Operator.SEQUENCE)
+    _children(high_inner, _node(label=EDD), _node(label=CAP), _node(label=ACT))
+    _children(high_par, _escalation_block(), high_inner)
+    _children(high_branch, high_par, _node(label=RFP))
+
+    outcome = _node(operator=Operator.XOR)
+    _children(outcome, reject_branch, low_branch, high_branch)
+
+    _children(root, _node(label=ROR), intake, _node(label=CLR), outcome,
+              _node(label=CLO))
+    return root
+
+
+procedural_model = build_procedural_model()
+procedural_model_variant_b = build_procedural_model_variant_b()
+
+# Canonical executable representation for conformance checking.
+net, initial_marking, final_marking = pm4py.convert_to_petri_net(procedural_model)
+
+if __name__ == "__main__":
+    print(procedural_model)
+    # pm4py.view_process_tree(procedural_model)
+    # diagnostics = pm4py.conformance_diagnostics_alignments(
+    #     log, net, initial_marking, final_marking)
+```
+
+Printed form of `procedural_model`:
+
+```
+->( 'Receive Onboarding Request',
+    +( 'Capture Master Data', 'Run Sanctions Screening', 'Verify Bank Account',
+       *( tau, ->( 'Request Clarification', 'Receive Clarification' ) ) ),
+    'Classify Risk',
+    X( +( X( tau, ->( 'Sanctions Escalation', 'Obtain Legal Opinion' ) ), 'Reject Vendor' ),
+       ->( +( X( tau, ->( 'Sanctions Escalation', 'Obtain Legal Opinion' ) ), 'Manager Approval' ),
+           'Activate Vendor', 'Release First Payment' ),
+       ->( +( X( tau, ->( 'Sanctions Escalation', 'Obtain Legal Opinion' ) ),
+              ->( 'Enhanced Due Diligence', 'Compliance Approval' ) ),
+           'Activate Vendor', 'Release First Payment' ) ),
+    'Close Onboarding' )
+```
+
+## 3.3 What the backbone expresses, and what it approximates
+
+**Concurrency.** `Capture Master Data`, `Run Sanctions Screening` and `Verify Bank Account` sit under one `PARALLEL` node, so any interleaving is accepted (T1's CMD/RSS/VBA order and T2's RSS/VBA/CMD order both fit) while `Classify Risk` is a hard synchronization point (backbone rule 3). Since the log holds one timestamp per event, "parallel" here means *unordered*, not genuinely simultaneous; true overlap cannot be confirmed or refuted.
+
+**Choices.** The post-classification `XOR` implements the three primary outcomes and thereby makes R1, R2 and R8 structurally unsatisfiable rather than merely detectable. The price is a **non-local choice approximation**: because the risk class is not in the log (A5), the branch selection is not conditioned on data, and `Activate Vendor` / `Release First Payment` appear as **duplicate labels** in two branches. Alignments will therefore sometimes have a choice of equally cheap explanations for a deviating trace, and diagnostics must be read at branch level, not leaf level.
+
+**Clarification loops.** The loop `*(τ, →(Request Clarification, Receive Clarification))` is placed *inside* the intake `PARALLEL` block. Two consequences: (i) an arbitrary number of complete cycles is allowed, and an unanswered request leaves the loop's redo child mid-execution, so the case cannot reach `Close Onboarding` — T5 is caught procedurally, not just declaratively; (ii) because it is a sibling under `PARALLEL`, clarification may interleave with the three checks (`Request Clarification`, `Capture Master Data`, `Receive Clarification` is accepted). That is intentional permissiveness; it also means the pair is not *chain*-constrained, consistent with the `altsuccession` (not `chainsuccession`) choice in §4. **Excluded by approximation:** clarification requested *after* `Classify Risk` (e.g. during approval). This is plausible in reality and is accepted by the DECLARE layer but rejected by the tree — a disclosed cross-layer disagreement.
+
+**Terminal outcomes.** `Close Onboarding` is factored out after the `XOR` so it terminates rejected and paid cases alike (backbone rule 5) without duplicating it in three branches. In the accepted branches `Release First Payment` is mandatory, which is stricter than reality (an accepted vendor may never be paid inside the onboarding case) and is the strongest simplification in the model besides A12.
+
+**Escalation placement (approximation).** Escalation appears as an optional block *after* `Classify Risk`, in parallel with the approval activities. This admits the observed T6/T7 shape (`Sanctions Escalation`, `Enhanced Due Diligence`, `Obtain Legal Opinion`, `Compliance Approval`) and enforces R4 + R5 + (transitively) R7 by construction. It is stricter than R7, which would also allow escalation during the intake block; if that occurs in practice, the escalation block should be added as a second optional sibling under `INTK` and the R5 barrier kept where it is.
+
+**Deliberately excluded post-activation behavior.** `Change Bank Details`, `Suspend Vendor` and post-activation re-`Verify Bank Account` are not in the tree (A12). Adding them would require either a second `Activate Vendor` (breaking R10) or a re-activation activity that does not exist in the label set, and R11's "later `Release First Payment`" directly contradicts R10. They are enforced by DECLARE + log skeleton + the data layer, and the procedural layer is knowingly incomplete for maintenance traces: such a trace will show a procedural `fail` that must be interpreted as "out of backbone scope", not "control breach". None of T1–T8 exercises this path.
+
+**Why a process tree rather than POWL.** POWL would let me state the intake partial order with explicit edges and avoid overloading `PARALLEL` with the clarification loop, but it would not remove the two genuine obstacles — the non-local choice on risk class and the duplicated activation labels. The process tree is block-structured by construction (soundness for free), converts to an accepting Petri net for alignments in one call, and is the artifact a business audience can review. All approximations above are consequences of block structure and are listed rather than hidden.
+
+---
+
+# 4. DECLARE Model
+
+```python
+HARD = {"support": 1.0, "confidence": 1.0}   # signed-off policy rule
+SOFT = {"support": 1.0, "confidence": 0.90}  # expected-practice rule, reviewed as a warning
+
+declare_model = {
+    "init": {
+        "Receive Onboarding Request": dict(HARD),
+    },
+    "exactly_one": {
+        "Receive Onboarding Request": dict(HARD),
+        "Capture Master Data": dict(HARD),
+        "Run Sanctions Screening": dict(HARD),
+        "Classify Risk": dict(HARD),
+        "Close Onboarding": dict(HARD),
+    },
+    "existence": {
+        # not exactly_one: R11 allows a second verification after a bank change
+        "Verify Bank Account": dict(HARD),
+    },
+    "response": {
+        ("Sanctions Escalation", "Obtain Legal Opinion"): dict(HARD),   # R4
+        ("Change Bank Details", "Suspend Vendor"): dict(HARD),          # R11 (over-approx.)
+        ("Reject Vendor", "Close Onboarding"): dict(HARD),
+        ("Activate Vendor", "Release First Payment"): dict(SOFT),
+    },
+    "altsuccession": {
+        ("Request Clarification", "Receive Clarification"): dict(HARD),  # R3
+    },
+    "precedence": {
+        ("Run Sanctions Screening", "Sanctions Escalation"): dict(HARD),  # R7
+        ("Classify Risk", "Manager Approval"): dict(HARD),
+        ("Classify Risk", "Enhanced Due Diligence"): dict(HARD),
+        ("Classify Risk", "Reject Vendor"): dict(HARD),
+        ("Enhanced Due Diligence", "Compliance Approval"): dict(HARD),
+        ("Activate Vendor", "Release First Payment"): dict(HARD),
+        ("Verify Bank Account", "Release First Payment"): dict(HARD),     # weak R11 proxy
+    },
+    "chainresponse": {
+        ("Release First Payment", "Close Onboarding"): dict(SOFT),
+    },
+    "noncoexistence": {
+        ("Reject Vendor", "Activate Vendor"): dict(HARD),        # R1
+        ("Manager Approval", "Compliance Approval"): dict(HARD),  # R2 + R8
+        ("Manager Approval", "Enhanced Due Diligence"): dict(HARD),  # R8
+        ("Reject Vendor", "Manager Approval"): dict(HARD),        # R2
+        ("Reject Vendor", "Compliance Approval"): dict(HARD),     # R2
+        ("Reject Vendor", "Release First Payment"): dict(HARD),
+    },
+    "nonsuccession": {
+        # Resolution A only: with response(SES, OLO) this yields
+        # "escalation => opinion strictly before activation" (R5).
+        ("Activate Vendor", "Obtain Legal Opinion"): dict(HARD),
+    },
+}
+
+# ---- Resolution B / C variant: swap exactly this one key, never keep both. ----
+# declare_model_variant_b = copy.deepcopy(declare_model)
+# declare_model_variant_b["nonsuccession"] = {
+#     ("Release First Payment", "Obtain Legal Opinion"): dict(HARD),
+# }
+```
+
+## 4.1 Semantics of every encoded rule
+
+| Template | Key | Reading (direction and semantics) | Requirement / purpose |
+|---|---|---|---|
+| `init` | `Receive Onboarding Request` | The first event of every case is this activity | Backbone 1 |
+| `exactly_one` | `Receive Onboarding Request`, `Capture Master Data`, `Run Sanctions Screening`, `Classify Risk`, `Close Onboarding` | The activity occurs exactly once per case (cardinality, no ordering) | Backbone 1–3, 5; A1 |
+| `existence` | `Verify Bank Account` | Occurs at least once per case; a second occurrence is allowed | R11 needs re-verification, so `exactly_one` would be wrong here |
+| `response` | (`Sanctions Escalation`, `Obtain Legal Opinion`) | **If the source occurs, the target must occur at some later point.** Nothing is required if the source never occurs (vacuous satisfaction) | R4 |
+| `response` | (`Change Bank Details`, `Suspend Vendor`) | Same direction; every bank change is eventually followed by a suspension | R11, deliberately unconditional (stricter than "after activation") |
+| `response` | (`Reject Vendor`, `Close Onboarding`) | A rejection is eventually followed by closure | Backbone 5 |
+| `response` | (`Activate Vendor`, `Release First Payment`) | An activation is eventually followed by the first payment | Expectation, not law → `confidence 0.90` |
+| `altsuccession` | (`Request Clarification`, `Receive Clarification`) | Conjunction of **alternate response** (after each source, the target occurs before the source can occur again) and **alternate precedence** (each target is preceded by a source with no other target in between). Intervening unrelated events are allowed | R3 exactly: balanced, non-overlapping cycles |
+| `precedence` | (`Run Sanctions Screening`, `Sanctions Escalation`) | **If the target occurs, the source must have occurred earlier.** No obligation to escalate | R7 |
+| `precedence` | (`Classify Risk`, `Manager Approval` / `Enhanced Due Diligence` / `Reject Vendor`) | Each outcome-route activity presupposes a completed classification | Backbone 4 |
+| `precedence` | (`Enhanced Due Diligence`, `Compliance Approval`) | Compliance approval only after EDD | Backbone 4, high-risk route |
+| `precedence` | (`Activate Vendor`, `Release First Payment`) | No payment without a prior activation | Backbone 5, R1 support |
+| `precedence` | (`Verify Bank Account`, `Release First Payment`) | No payment without *some* prior bank verification | Weak R11 proxy; does **not** require a *fresh* verification |
+| `chainresponse` | (`Release First Payment`, `Close Onboarding`) | **Immediate** succession: the very next event after payment is closure. Contrast `response`, which allows arbitrary events in between | Terminal handoff; soft (`0.90`) because a real log may interleave notifications |
+| `noncoexistence` | 6 pairs listed above | **Symmetric:** the two activities never both appear in the same case, in any order | R1, R2, R8 — these are co-occurrence prohibitions, so `noncoexistence` is correct and `nonsuccession` would be too weak (it would permit `Activate Vendor` … `Reject Vendor` in the forbidden direction only) |
+| `nonsuccession` | (`Activate Vendor`, `Obtain Legal Opinion`) | **Directed:** an occurrence of the source is never followed, anywhere later, by the target. The reverse order stays legal | R5 (Resolution A). `noncoexistence` here would be wrong — it would forbid the compliant order too |
+| `nonsuccession` (variant B) | (`Release First Payment`, `Obtain Legal Opinion`) | No opinion after the first payment; with `response(SES, OLO)` this makes the opinion precede the payment while allowing emergency activation | R5 relocated to the payment gate (Resolution B/C) |
+
+**Templates deliberately not used.** `absence` (no activity is globally forbidden), `succession`/`altresponse` alone (subsumed by the pairs above), `chainsuccession`/`nonchainsuccession` and `chainprecedence` (the process allows intervening events almost everywhere; chain constraints on `Close Onboarding` would need a disjunction of predecessors `Reject Vendor | Release First Payment`, which DECLARE cannot express), `coexistence`/`responded_existence` (wherever co-occurrence matters, ordering matters too, so `response`/`precedence` are more informative). `confidence` values are documentation for humans: `pm4py.conformance_declare` treats every listed constraint as binding regardless of the number (see §9).
+
+---
+
+# 5. Log-Skeleton Model
+
+```python
+log_skeleton = {
+    # #A == #B in every case
+    "equivalence": {
+        ("Request Clarification", "Receive Clarification"),
+    },
+    # (A, B): if A occurs, B occurs BEFORE A
+    "always_before": {
+        ("Classify Risk", "Receive Onboarding Request"),
+        ("Close Onboarding", "Receive Onboarding Request"),
+        ("Manager Approval", "Classify Risk"),
+        ("Enhanced Due Diligence", "Classify Risk"),
+        ("Reject Vendor", "Classify Risk"),
+        ("Compliance Approval", "Enhanced Due Diligence"),
+        ("Activate Vendor", "Classify Risk"),
+        ("Release First Payment", "Activate Vendor"),
+        ("Receive Clarification", "Request Clarification"),
+        ("Sanctions Escalation", "Run Sanctions Screening"),
+    },
+    # (A, B): if A occurs, B occurs AFTER A
+    "always_after": {
+        ("Receive Onboarding Request", "Close Onboarding"),
+        ("Classify Risk", "Close Onboarding"),
+        ("Activate Vendor", "Close Onboarding"),
+        ("Reject Vendor", "Close Onboarding"),
+        ("Request Clarification", "Receive Clarification"),
+        ("Sanctions Escalation", "Obtain Legal Opinion"),
+        ("Change Bank Details", "Suspend Vendor"),
+        ("Activate Vendor", "Release First Payment"),
+    },
+    # symmetric: never both in the same case
+    "never_together": {
+        ("Reject Vendor", "Activate Vendor"),
+        ("Reject Vendor", "Manager Approval"),
+        ("Reject Vendor", "Compliance Approval"),
+        ("Reject Vendor", "Release First Payment"),
+        ("Manager Approval", "Compliance Approval"),
+        ("Manager Approval", "Enhanced Due Diligence"),
+    },
+    # allowed per-case occurrence counts
+    "activ_freq": {
+        "Receive Onboarding Request": {1},
+        "Capture Master Data": {1},
+        "Run Sanctions Screening": {1},
+        "Verify Bank Account": {1, 2},
+        "Classify Risk": {1},
+        "Request Clarification": {0, 1, 2, 3},
+        "Receive Clarification": {0, 1, 2, 3},
+        "Sanctions Escalation": {0, 1},
+        "Obtain Legal Opinion": {0, 1},
+        "Enhanced Due Diligence": {0, 1},
+        "Manager Approval": {0, 1},
+        "Compliance Approval": {0, 1},
+        "Reject Vendor": {0, 1},
+        "Activate Vendor": {0, 1},
+        "Change Bank Details": {0, 1, 2},
+        "Suspend Vendor": {0, 1, 2},
+        "Release First Payment": {0, 1},
+        "Close Onboarding": {1},
+    },
+    # (A, B): every occurrence of A is IMMEDIATELY followed by B
+    "directly_follows": {
+        ("Release First Payment", "Close Onboarding"),
+        ("Reject Vendor", "Close Onboarding"),
+    },
+}
+```
+
+## 5.1 Orientation of every pair
+
+| Key | Pair | Read as | Basis |
+|---|---|---|---|
+| `equivalence` | (`Request Clarification`, `Receive Clarification`) | equal counts per case (symmetric) | R3 — the sharpest cheap test for a dangling request |
+| `always_before` | (`Classify Risk`, `Receive Onboarding Request`) | classification presupposes receipt | Backbone 1 |
+| `always_before` | (`Close Onboarding`, `Receive Onboarding Request`) | closure presupposes receipt | A1 |
+| `always_before` | (`Manager Approval` / `Enhanced Due Diligence` / `Reject Vendor` / `Activate Vendor`, `Classify Risk`) | each presupposes classification | Backbone 4–5 |
+| `always_before` | (`Compliance Approval`, `Enhanced Due Diligence`) | compliance approval presupposes EDD | Backbone 4 |
+| `always_before` | (`Release First Payment`, `Activate Vendor`) | payment presupposes activation | Backbone 5 |
+| `always_before` | (`Receive Clarification`, `Request Clarification`) | no unsolicited response | R3 |
+| `always_before` | (`Sanctions Escalation`, `Run Sanctions Screening`) | escalation presupposes screening | R7 |
+| `always_after` | (`Receive Onboarding Request` / `Classify Risk` / `Activate Vendor` / `Reject Vendor`, `Close Onboarding`) | every case that reaches these must close | A1, Backbone 5 |
+| `always_after` | (`Request Clarification`, `Receive Clarification`) | every request is answered later | R3 |
+| `always_after` | (`Sanctions Escalation`, `Obtain Legal Opinion`) | every escalation yields an opinion later | R4 |
+| `always_after` | (`Change Bank Details`, `Suspend Vendor`) | a bank change is followed by suspension | R11 |
+| `always_after` | (`Activate Vendor`, `Release First Payment`) | activation is followed by payment | Backbone 5 — **fragile**, see below |
+| `never_together` | 6 pairs | symmetric mutual exclusion | R1, R2, R8 |
+| `directly_follows` | (`Release First Payment`, `Close Onboarding`), (`Reject Vendor`, `Close Onboarding`) | closure is the immediate successor of the terminal business event | Consistent with the tree, where nothing may occur between them |
+
+## 5.2 Overlap and disagreement with the other layers
+
+- **Intentional triple coverage.** R1/R2/R8 are in the tree, DECLARE and the skeleton. The skeleton is the cheapest of the three (a single pass over case-level sets and counts), so it runs first and short-circuits gross violations such as T8 without paying for alignments.
+- **Skeleton stricter than DECLARE.** `equivalence(Request Clarification, Receive Clarification)` rejects the case where two requests are answered by one response; `altsuccession` also rejects it, but `equivalence` catches the pure-counting version even when order information is degenerate. Conversely `activ_freq` caps clarification cycles at 3 while the tree loop and `altsuccession` are unbounded — a fourth legitimate cycle fails the skeleton only. The cap is an operational SLA choice and should be reported as `warning`-grade, not `fail`-grade, if the business confirms unbounded cycles.
+- **Skeleton weaker than the tree.** The skeleton cannot see the R5 barrier: `always_after(Sanctions Escalation, Obtain Legal Opinion)` is satisfied by T6, where the opinion arrives after activation. Encoding `always_before(Activate Vendor, Obtain Legal Opinion)` would be unconditional and would wrongly fail T1/T2, so I do not encode R5 here at all. The skeleton is explicitly *not* authoritative for R5.
+- **Deliberate omissions.** No `always_before(Obtain Legal Opinion, Sanctions Escalation)` (A9 — an opinion need not be triggered by an escalation). No `never_together(Reject Vendor, Enhanced Due Diligence)`, because rejecting a vendor *after* enhanced due diligence is business-plausible even though the current tree has no such branch; here the skeleton is intentionally more permissive than the procedural model, and the tree — not the skeleton — is what would have to be extended. No `directly_follows` on (`Manager Approval`, `Activate Vendor`) or (`Request Clarification`, `Receive Clarification`), because the tree permits escalation events and the intake checks respectively to interleave.
+- **Known fragile constraint.** `always_after(Activate Vendor, Release First Payment)` mirrors the tree but breaks the moment R11's maintenance path is in scope (activate → change bank details → suspend, never paid). It is kept for coherence with the procedural layer and is the first constraint to drop when maintenance behavior is modeled. It also produces a *second*, non-decisive deviation on T8 (activation without payment), which must be reported as a consequence of the primary contradiction rather than as an independent finding.
+- **`activ_freq` is authoritative for R10** because it is global per case, whereas the tree bounds occurrences only within a branch and DECLARE's unary templates cannot express "0 or 1".
+
+---
+
+# 6. Temporal Profile
+
+```python
+HOUR = 3600
+
+temporal_profile = {
+    ("Request Clarification", "Receive Clarification"): (48 * HOUR, 24 * HOUR),   # (172800, 86400)
+    ("Sanctions Escalation", "Obtain Legal Opinion"):   (12 * HOUR,  6 * HOUR),   # ( 43200, 21600)
+    ("Activate Vendor", "Release First Payment"):       (72 * HOUR, 36 * HOUR),   # (259200, 129600)
+}
+
+zeta = 2.0
+
+# pm4py.conformance_temporal_profile(log, temporal_profile, zeta=zeta)
+```
+
+Acceptance band for a pair `(A, B)` is `|Δt − mean| ≤ zeta · sd`:
+
+| Pair | Mean | sd | Accepted band at `zeta = 2.0` |
+|---|---:|---:|---|
+| `Request Clarification` → `Receive Clarification` | 48 h | 24 h | 0 h – 96 h |
+| `Sanctions Escalation` → `Obtain Legal Opinion` | 12 h | 6 h | 0 h – 24 h |
+| `Activate Vendor` → `Release First Payment` | 72 h | 36 h | 0 h – 144 h |
+
+Measured on the test cases: T2 clarification 26 h (z = 0.92, ok); T6 escalation→opinion 17 h (z = 0.83, ok); **T7 escalation→opinion 34 h (z = 3.67, flagged)**; activation→payment 71 h/84 h/61 h/71 h/77 h/**2 h** for T1/T2/T4/T5/T6/T7 — the 2-hour payment in T7 has z = 1.94 and is therefore *not* flagged, which is the clearest illustration of a wide standard deviation hiding an implausible value.
+
+**Why deviations are warnings, not control-flow violations.**
+
+1. **Different epistemic status.** R12 is explicitly "normative enough to flag but not automatically reject". The mean and sd are empirical parameters estimated from historical behavior, and that history includes non-compliant cases; a threshold derived from observed behavior cannot carry the same authority as a written control such as R1 or R9.
+2. **The statistic is two-sided and unbounded below.** A z-test around a mean flags *unusual*, not *illegal*. With sd = 36 h the lower bound of the payment band is 0 h, so no fast payment can ever be flagged; a real "payment too soon after activation" control would need a one-sided minimum, which this formalism cannot express. Treating the same instrument as a hard gate would enforce the rule asymmetrically.
+3. **Legitimate business variance.** A vendor answering a clarification in 4 hours or a legal opinion taking 34 hours over a weekend are operationally normal. Blocking on them would produce far more false positives than genuine findings.
+4. **Confounded with control flow.** The profile measures elapsed time between events that *both occurred*. If the second event never occurs (T5's unanswered clarification), the pair is simply never evaluated, so a missing obligation looks like silence rather than a violation. That obligation belongs to DECLARE and the skeleton; the profile only qualifies *how late* a fulfilled obligation was.
+5. **Deadlines are not distributions.** R6's 24-hour requirement is a contractual deadline with a fixed bound and a defined breach consequence. Encoding it as `(24 h, small sd)` would both permit >24 h within the band and flag a fast 1-hour opinion. It therefore lives in §7 as an explicit one-sided check, not here.
+
+Consequently a temporal finding never changes a case's control-flow verdict; it raises a severity-2 flag with the z-score attached, and repeated flags on the same pair are escalated as a process-performance issue rather than a compliance issue.
+
+---
+
+# 7. Resource- and Data-Aware Checks
+
+These checks cover what activity-only models cannot see: actor identity (R9), the off-log emergency authorization and its deadline (R6), the positional/refresh condition of R11, and the outcome-consistency question behind R2 when the control flow is already broken.
+
+```python
+"""Resource- and data-aware validation layer.
+
+Verdict vocabulary per case and per check:
+    "pass" | "fail" | "warning" | "unverifiable" | "not_applicable"
+`unverifiable` is NEVER collapsed into `pass`: a missing attribute is a data
+quality finding that must reach a human.
+"""
+
+import pandas as pd
+import pm4py
+
+CASE = "case:concept:name"
+ACT_KEY = "concept:name"
+TS = "time:timestamp"
+RES = "org:resource"
+
+VBA, CMD = "Verify Bank Account", "Capture Master Data"
+MAP, CAP = "Manager Approval", "Compliance Approval"
+ACT, REJ = "Activate Vendor", "Reject Vendor"
+SES, OLO = "Sanctions Escalation", "Obtain Legal Opinion"
+CBD, SUS, RFP = "Change Bank Details", "Suspend Vendor", "Release First Payment"
+
+# External parties are not internal actors and are exempt from four-eyes tests.
+EXTERNAL_RESOURCES = {"Vendor"}
+
+
+# ---------------------------------------------------------------- utilities --
+def attribute_gate(df, required=(CASE, ACT_KEY, TS, RES)):
+    """Report missing/empty required columns before any check runs."""
+    missing = [c for c in required if c not in df.columns]
+    empty = [c for c in required if c in df.columns and df[c].isna().any()]
+    return {"missing_columns": missing, "columns_with_nulls": empty}
+
+
+def _events(df, case_id, activity):
+    sub = df[(df[CASE] == case_id) & (df[ACT_KEY] == activity)]
+    return sub.sort_values(TS)
+
+
+# --------------------------------------------------- R9: segregation of duty --
+SOD_RULES = [
+    (VBA, MAP),   # bank verifier != low-risk approver
+    (VBA, CAP),   # bank verifier != high-risk approver
+    (CMD, ACT),   # master-data capturer != activator
+]
+
+
+def check_segregation_of_duties_pm4py(df):
+    """R9 via pm4py. Returns {(a1, a2): [violating case ids]}.
+
+    Required attributes: concept:name, org:resource, time:timestamp,
+    case:concept:name. Missing org:resource -> 'unverifiable' for all rules.
+    """
+    if RES not in df.columns:
+        return {pair: "unverifiable" for pair in SOD_RULES}
+    out = {}
+    for a1, a2 in SOD_RULES:
+        violators = pm4py.filter_four_eyes_principle(
+            df, a1, a2,
+            activity_key=ACT_KEY, timestamp_key=TS,
+            case_id_key=CASE, resource_key=RES,
+            keep_violations=True,
+        )
+        out[(a1, a2)] = sorted(set(violators[CASE])) if len(violators) else []
+    return out
+
+
+def check_segregation_of_duties_explicit(df):
+    """Version-independent equivalent, and the one that yields per-case
+    verdicts including 'not_applicable' when one activity is absent."""
+    verdicts = {}
+    for case_id, case_df in df.groupby(CASE):
+        case_verdict, details = "pass", []
+        for a1, a2 in SOD_RULES:
+            r1 = set(case_df.loc[case_df[ACT_KEY] == a1, RES]) - EXTERNAL_RESOURCES
+            r2 = set(case_df.loc[case_df[ACT_KEY] == a2, RES]) - EXTERNAL_RESOURCES
+            if not r1 or not r2:
+                details.append((a1, a2, "not_applicable"))
+                continue
+            shared = r1 & r2
+            if shared:
+                case_verdict = "fail"
+                details.append((a1, a2, f"fail: shared resource(s) {sorted(shared)}"))
+            else:
+                details.append((a1, a2, "pass"))
+        verdicts[case_id] = {"verdict": case_verdict, "details": details}
+    return verdicts
+
+
+# ------------------------------------- R6: emergency-activation authorization --
+EMERGENCY_ATTRS = (
+    "case:emergency_activation",      # bool  - emergency invoked?
+    "case:emergency_authorizers",     # list  - >= 2 distinct actor ids
+    "case:emergency_authorization_time",  # timestamp - must precede activation
+)
+OPINION_DEADLINE = pd.Timedelta(hours=24)
+
+
+def check_emergency_activation(df, resolution="A"):
+    """R5/R6. Classifies every case in which an escalation occurred and the
+    legal opinion did NOT precede activation.
+
+    resolution="A" (strict, implemented): such a case is a control-flow
+        violation; this check only enriches it with 'authorized_claim' /
+        'unverifiable' so reviewers see whether an exception was asserted.
+    resolution="B": the case is conformant iff the emergency attributes are
+        present and valid AND the opinion arrives within 24h of activation.
+
+    Missing attributes -> 'unverifiable' (never 'pass').
+    """
+    results = {}
+    for case_id, case_df in df.groupby(CASE):
+        case_df = case_df.sort_values(TS)
+        esc = _events(case_df, case_id, SES)
+        act = _events(case_df, case_id, ACT)
+        opn = _events(case_df, case_id, OLO)
+
+        if esc.empty or act.empty:
+            results[case_id] = {"verdict": "not_applicable",
+                               "reason": "no escalation and/or no activation"}
+            continue
+
+        t_act = act[TS].iloc[0]
+        t_opn = opn[TS].iloc[0] if not opn.empty else None
+
+        if t_opn is not None and t_opn <= t_act:
+            results[case_id] = {"verdict": "pass",
+                               "reason": "legal opinion preceded activation (R5 satisfied)"}
+            continue
+
+        # Activation happened before the opinion: the contested shape.
+        have_attrs = [a for a in EMERGENCY_ATTRS if a in case_df.columns
+                      and case_df[a].notna().any()]
+        if len(have_attrs) < len(EMERGENCY_ATTRS):
+            results[case_id] = {
+                "verdict": "fail" if resolution == "A" else "unverifiable",
+                "reason": "activation before legal opinion; emergency evidence "
+                          f"absent (missing {set(EMERGENCY_ATTRS) - set(have_attrs)})",
+                "emergency_claim": "unverifiable",
+                "deadline_met": (t_opn is not None
+                                 and t_opn - t_act <= OPINION_DEADLINE),
+            }
+            continue
+
+        flag = bool(case_df[EMERGENCY_ATTRS[0]].iloc[0])
+        authorizers = set(case_df[EMERGENCY_ATTRS[1]].iloc[0] or [])
+        t_auth = pd.to_datetime(case_df[EMERGENCY_ATTRS[2]].iloc[0])
+        activator = set(act[RES]) if RES in act.columns else set()
+
+        joint_ok = (flag and len(authorizers) >= 2
+                    and not (authorizers & activator) and t_auth <= t_act)
+        deadline_ok = t_opn is not None and (t_opn - t_act) <= OPINION_DEADLINE
+
+        if resolution == "A":
+            results[case_id] = {"verdict": "fail",
+                               "reason": "R5 is absolute under Resolution A",
+                               "emergency_claim": "valid" if joint_ok else "invalid",
+                               "deadline_met": deadline_ok}
+        else:
+            results[case_id] = {
+                "verdict": "pass" if (joint_ok and deadline_ok) else "fail",
+                "reason": f"joint_authorization={joint_ok}, "
+                          f"opinion_within_24h={deadline_ok}",
+            }
+    return results
+
+
+# ------------------------------------ R11: post-activation bank-detail change --
+def check_post_activation_bank_change(df, iban_attr="case:bank_iban"):
+    """R11. Required attributes: activity, timestamp, case id. Optional
+    `iban_attr` to confirm the details really changed; if absent, the activity
+    label alone is used and the finding is reported as label-based only.
+    """
+    results = {}
+    for case_id, case_df in df.groupby(CASE):
+        case_df = case_df.sort_values(TS)
+        act = _events(case_df, case_id, ACT)
+        if act.empty:
+            results[case_id] = {"verdict": "not_applicable", "reason": "never activated"}
+            continue
+        t_act = act[TS].iloc[0]
+        changes = case_df[(case_df[ACT_KEY] == CBD) & (case_df[TS] > t_act)]
+        if changes.empty:
+            results[case_id] = {"verdict": "not_applicable",
+                               "reason": "no post-activation bank change"}
+            continue
+
+        findings = []
+        for t_chg in changes[TS]:
+            suspended = case_df[(case_df[ACT_KEY] == SUS) & (case_df[TS] > t_chg)]
+            if suspended.empty:
+                findings.append(f"fail: no Suspend Vendor after change at {t_chg}")
+            payments = case_df[(case_df[ACT_KEY] == RFP) & (case_df[TS] > t_chg)]
+            for t_pay in payments[TS]:
+                reverified = case_df[(case_df[ACT_KEY] == VBA)
+                                     & (case_df[TS] > t_chg) & (case_df[TS] < t_pay)]
+                if reverified.empty:
+                    findings.append(
+                        f"fail: payment at {t_pay} without re-verification after {t_chg}")
+        evidence = ("iban-confirmed" if iban_attr in case_df.columns
+                    else "label-based only (no IBAN attribute)")
+        results[case_id] = {"verdict": "fail" if findings else "pass",
+                           "findings": findings, "evidence": evidence}
+    return results
+
+
+# --------------------------- R2/R10: outcome consistency and applicable approval --
+def check_outcome_consistency(df):
+    """Determines the applicable approval for R9 and reports contradictory
+    terminal outcomes (needed because the four-eyes rule is undefined when a
+    case contains both approvals or both terminal outcomes)."""
+    results = {}
+    for case_id, case_df in df.groupby(CASE):
+        acts = list(case_df.sort_values(TS)[ACT_KEY])
+        n_map, n_cap = acts.count(MAP), acts.count(CAP)
+        has_act, has_rej = ACT in acts, REJ in acts
+        if has_act and has_rej:
+            verdict, applicable = "fail", "undefined (both outcomes present)"
+        elif has_rej and (n_map or n_cap):
+            verdict, applicable = "fail", "approval in a rejected case"
+        elif has_act and (n_map + n_cap) != 1:
+            verdict, applicable = "fail", f"{n_map + n_cap} approvals in accepted case"
+        elif has_act:
+            verdict, applicable = "pass", MAP if n_map else CAP
+        else:
+            verdict, applicable = "pass", "none (rejected case)"
+        results[case_id] = {"verdict": verdict, "applicable_approval": applicable,
+                           "counts": {ACT: acts.count(ACT), REJ: acts.count(REJ),
+                                      RFP: acts.count(RFP)}}
+    return results
+
+
+def run_data_layer(df, resolution="A"):
+    return {
+        "attribute_gate": attribute_gate(df),
+        "R9_segregation": check_segregation_of_duties_explicit(df),
+        "R9_segregation_pm4py": check_segregation_of_duties_pm4py(df),
+        "R6_emergency": check_emergency_activation(df, resolution=resolution),
+        "R11_bank_change": check_post_activation_bank_change(df),
+        "R2_outcome": check_outcome_consistency(df),
+    }
+```
+
+## 7.1 Required attributes and missing-attribute policy
+
+| Check | Requirement | Required attributes | If an attribute is missing |
+|---|---|---|---|
+| `check_segregation_of_duties_*` | R9 | `concept:name`, `org:resource`, `time:timestamp`, `case:concept:name` | Return `unverifiable` for the affected rule and raise a data-quality incident against the source system. Do not pass. If `org:resource` holds a shared/technical account, downgrade to `warning` ("actor identity not attributable") |
+| `check_emergency_activation` | R5/R6 | above + `case:emergency_activation`, `case:emergency_authorizers`, `case:emergency_authorization_time` | Under Resolution A the control-flow verdict is already `fail`; the emergency claim is reported as `unverifiable` so the reviewer knows the finding is contested. Under Resolution B the case becomes `unverifiable` and is queued for manual attestation with a deadline; it is never auto-approved |
+| `check_post_activation_bank_change` | R11 | activity, timestamp, case id; optionally `case:bank_iban` (or before/after account attributes) | Without IBAN attributes the check is label-based: it cannot tell a real bank change from a no-op re-save, so a `pass` is genuine but a `fail` is annotated "label-based only" and may be a false positive |
+| `check_outcome_consistency` | R2, R10 | activity, timestamp, case id | No optional attributes; if the risk class attribute existed it would additionally verify that the *right* route was taken. Absent that (A5), route correctness is a permanent blind spot and is reported as `not evaluated` |
+
+Applied to T1–T8, this layer returns: `fail` for T4 (`Verify Bank Account`@3 and `Manager Approval`@8 both by Cora — `pm4py.filter_four_eyes_principle(df, "Verify Bank Account", "Manager Approval", keep_violations=True)` retains exactly T4); `unverifiable`/contested for T6 (activation at h13 precedes the opinion at h23; the 24-hour deadline *is* met, at 10 h, but no authorization evidence exists); `fail` from `check_outcome_consistency` for T8 (both terminal outcomes); `pass` elsewhere. Note that T3's four-eyes rules are `not_applicable` (no approval, no activation) — vacuous, not verified.
+
+---
+
+# 8. Test-Case Verdict Matrix
+
+All layer results below were produced by running the artifacts of §3–§7 (alignment fitness against the Petri net from `procedural_model`, `pm4py.conformance_declare`, `pm4py.conformance_log_skeleton`, `pm4py.conformance_temporal_profile(..., zeta=2.0)`, and the §7 checks).
+
+| Test | Procedural | DECLARE | Log Skeleton | Temporal | Resource/data layer | Overall verdict | Explanation |
+|---|---|---|---|---|---|---|---|
+| T1 low-risk accepted | pass | pass | pass | pass | pass | **pass** | Fits the low-risk branch (fitness 1.0). Payment 71 h after activation (z = 0.03). Cora verifies, Elena approves, Ana captures, Faris activates — both R9 rules hold. Escalation and clarification rules are satisfied **vacuously** and are reported as such |
+| T2 high-risk, one clarification | pass | pass | pass | pass | pass | **pass** | The clarification cycle completes inside the intake block before `Classify Risk`; `Enhanced Due Diligence → Compliance Approval → Activate Vendor → Release First Payment` fits the high-risk branch. Clarification 26 h (z = 0.92), payment 84 h (z = 0.33). Cora ≠ Ivo, Ana ≠ Faris |
+| T3 rejected | pass | pass | pass | not evaluated | pass | **pass** | Reject branch, closure follows directly. No monitored activity pair occurs, so the temporal layer has nothing to evaluate. R9 is `not_applicable` (no approval, no activation) — vacuous compliance, not evidence of control effectiveness |
+| T4 four-eyes violation | pass | pass | pass | pass | fail | **fail** | Control flow is indistinguishable from T1; every activity-only layer passes. **Earliest decisive violation: `Manager Approval`@8 performed by Cora, who also performed `Verify Bank Account`@3** (R9). This is the case that proves resource conditions cannot be recovered from activity sequences |
+| T5 unanswered clarification | fail | fail | fail | pass | pass | **fail** | **Earliest decisive violation: `Classify Risk`@5**, the first event that advances the case while the request from h4 is still open. Procedural: the clarification loop cannot close, so the trace cannot reach the final marking (fitness 0.941). DECLARE: `altsuccession(Request Clarification, Receive Clarification)`. Skeleton: `equivalence` (1 vs. 0) and `always_after` on the same pair. The temporal layer passes only because the second event never happens — the pair is never measured, which is precisely its blind spot. Later consequence: activation and payment occur on unverified data |
+| T6 emergency-policy conflict | **Resolution A: fail** / **Resolution B: pass** | **A: fail** / **B: pass** | pass | pass | policy-dependent | **A: fail / B: policy-dependent** | See detailed treatment below |
+| T7 opinion precedes activation but late | pass | pass | pass | warning | pass | **warning** | Order is compliant: `Sanctions Escalation`@6, `Obtain Legal Opinion`@40 before `Activate Vendor`@43, so R4/R5 hold and the trace fits the high-risk branch exactly (fitness 1.0). Temporal flag: escalation→opinion 34 h vs. 12 ± 6 h, z = 3.67 > 2.0 (deviation 122 400 s). Second, *undetected* anomaly: payment 2 h after activation has z = 1.94, just inside the band — a genuinely suspicious 2-hour payment escapes because sd = 36 h. Verdict is a flag, not a rejection, per §6 |
+| T8 contradictory terminal outcomes | fail | fail | fail | not evaluated | pass | **fail** | **Earliest decisive violation: `Reject Vendor`@10** after `Activate Vendor`@9. Procedural: no branch contains both outcomes (fitness 0.875). DECLARE: `noncoexistence(Reject Vendor, Activate Vendor)` and `noncoexistence(Reject Vendor, Manager Approval)`; additionally the soft `response(Activate Vendor, Release First Payment)` fails because no payment follows. Skeleton: both `never_together` pairs plus `always_after(Activate Vendor, Release First Payment)`. The last two are **downstream consequences** of the contradiction, not independent findings, and should be grouped under it in the report. Temporal: no monitored pair completes. R9 holds (Cora ≠ Elena, Ana ≠ Faris), which shows a case can be resource-clean and still structurally invalid |
+
+## 8.1 T6 under both resolutions
+
+Trace: `… Classify Risk@5, Sanctions Escalation@6, Enhanced Due Diligence@8, Compliance Approval@12, Activate Vendor@13, Obtain Legal Opinion@23, Release First Payment@90, Close Onboarding@91`.
+
+| Layer | Resolution A (strict R5, implemented) | Resolution B (sanctioned emergency) |
+|---|---|---|
+| Procedural | **fail** — `procedural_model` requires the escalation block to complete before `Activate Vendor`; alignment fitness 0.894 with the deviation localized at `Activate Vendor`@13 | **pass** — `procedural_model_variant_b` places activation inside the parallel block, so `Sanctions Escalation, Enhanced Due Diligence, Compliance Approval, Activate Vendor, Obtain Legal Opinion` is a legal interleaving (fitness 1.0) and the opinion still precedes `Release First Payment` |
+| DECLARE | **fail** — `nonsuccession(Activate Vendor, Obtain Legal Opinion)` is violated | **pass** — that key is replaced by `nonsuccession(Release First Payment, Obtain Legal Opinion)`, which holds (opinion h23 < payment h90); `response(Sanctions Escalation, Obtain Legal Opinion)` holds in both |
+| Log skeleton | pass (both) — `always_after(Sanctions Escalation, Obtain Legal Opinion)` is satisfied; the skeleton is structurally blind to where activation sits | pass |
+| Temporal | pass (both) — escalation→opinion 17 h (z = 0.83); activation→payment 77 h (z = 0.14) | pass |
+| Resource/data | **policy-dependent** — R9 holds (Cora ≠ Ivo, Ana ≠ Faris); `check_emergency_activation` reports "activation before opinion, emergency evidence absent", `emergency_claim = unverifiable`, `deadline_met = True` (10 h ≤ 24 h) | **policy-dependent** — conformance *depends entirely* on attributes the log does not contain; without them the case is `unverifiable`, not `pass` |
+| Overall | **fail** (R5 breach at `Activate Vendor`@13), annotated "emergency claim unverifiable; 24 h opinion deadline was met" | **policy-dependent**: conditionally conformant, pending joint-authorization evidence. If the evidence is produced → `pass`; if not → `fail` |
+
+The decisive point is that **no layer can settle T6 from the log**. The activity sequence is identical in both policies; only the policy choice differs. Reporting T6 as a plain `pass` would silently adopt Resolution B, and reporting it as a plain `fail` without the deadline/authorization annotation would hide the fact that the operational control may well have been honored.
+
+---
+
+# 9. Contradictions, Redundancies, and Blind Spots
+
+**Duplicated enforcement across layers.** R1, R2 (partially) and R8 are enforced three times (tree, DECLARE, skeleton); R3 three times (loop, `altsuccession`, `equivalence` + `always_after`/`always_before`); R4 and R7 twice each. This is deliberate — cheap layers pre-filter and provide human-readable reasons, alignments provide localized diagnostics — but it has costs. T5 produces four findings for one root cause and T8 produces five, so the report must de-duplicate to a single "primary finding + corroborating layers" entry, or reviewers will over-count violations and per-layer fitness scores will look artificially different across cases. Duplication also creates a maintenance hazard: relaxing R8 in the tree while leaving `noncoexistence` in DECLARE would produce a model that accepts a trace and a constraint set that rejects it. §10 fixes a single authoritative layer per requirement for exactly this reason.
+
+**Constraints that become inconsistent under loops or post-activation change.**
+
+- **R10 vs. R11** is a direct textual contradiction (A12): "at most one `Release First Payment`" against "any later `Release First Payment`". I resolved it by scoping R10 to onboarding, which means the model cannot check R11's most important clause — that the *next* payment after a bank change is re-verified — because that payment does not exist in this case. The control was moved to the payment process, where it must actually be implemented; on paper it looks enforced, in this model it is not.
+- `always_after(Activate Vendor, Release First Payment)` and `response(Activate Vendor, Release First Payment)` both break for a legitimate activate → change bank details → suspend case, which never pays. Both must be dropped the moment maintenance behavior enters scope.
+- The `activ_freq` cap of `{0,1,2,3}` on clarification pairs contradicts the unbounded tree loop and the unbounded `altsuccession`: a fourth cycle is conformant in two layers and non-conformant in the third.
+- The procedural exclusion of maintenance means a real `Change Bank Details` trace fails the procedural layer while satisfying DECLARE and the skeleton. That is a *model scope* failure, and reporting it as a compliance violation would be wrong.
+- `Verify Bank Account` has `activ_freq {1,2}` and DECLARE `existence` (not `exactly_one`) to accommodate re-verification, yet the tree admits only one occurrence. Same disagreement, opposite direction.
+- R8's flat prohibition on `Manager Approval` co-occurring with `Enhanced Due Diligence`/`Compliance Approval` makes any legitimate mid-case risk re-classification permanently non-conformant. The label set has no re-classification activity, so this cannot be modeled at all.
+
+**Vacuity in declarative rules.** Most constraints are satisfied vacuously in most cases: `response(Sanctions Escalation, Obtain Legal Opinion)` and `precedence(Run Sanctions Screening, Sanctions Escalation)` are vacuous in T1–T5 and T8; `altsuccession` on clarifications is vacuous in six of eight cases; every `noncoexistence` pair is trivially satisfied when neither activity occurs; `response(Change Bank Details, Suspend Vendor)` is vacuous in all eight. pm4py's `dev_fitness` counts vacuously satisfied constraints as satisfied, so a case can score 1.0 while exercising almost none of the controls — T3 satisfies 18 skeleton constraints largely by not doing anything. Reporting must therefore separate *vacuous* from *activated* satisfaction, and control-effectiveness reporting should count only activated instances. Conversely, a rule that is *never* activated across a whole log is not evidence of compliance; it is evidence that the rule is untested (or that the triggering activity is not being logged).
+
+**Missing case attributes.** The decisive gaps are: risk class (so route correctness is unverifiable — A5), `emergency_activation` and the joint-authorization identities and timestamp (so R6 is unverifiable by construction), bank account identifiers (so `Change Bank Details` cannot be confirmed as a real change), payment amount and currency (so no risk-proportionate control), rejection reason, and any link to the subsequent payment process (needed for R11's real clause). Actor attributes are equally thin: `org:resource` gives an account, not a natural person or an org unit, so a shared service account, a delegation, or two accounts belonging to one person all defeat R9 while returning `pass`. The four-eyes checks are therefore sound only up to the identity resolution quality of the source system.
+
+**Timestamp-only limitations.** Events carry a single hour-granularity timestamp, so: parallelism is inferred from absence of ordering, not observed (the intake `PARALLEL` block is an assumption); durations of activities are unknown, only inter-event gaps; two events in the same hour have an arbitrary tie order, which can flip a `precedence` verdict — T8's `Activate Vendor`@9 vs. `Reject Vendor`@10 would be indeterminate at coarser granularity; time zones and business-calendar effects are invisible, so T7's 34-hour opinion may simply be a weekend; and the temporal layer can only measure pairs where both events occurred, so a missing obligation (T5) or an infinitely late one is temporally invisible. There is also no lifecycle information, so "`Classify Risk` requires *completion* of all three checks" is approximated by "requires their single recorded events".
+
+**The risk of treating support/confidence as normative truth.** Every rule in `declare_model` carries `support = 1.0`, which here is an *assertion* that the rule is meant to hold in all cases, not a measurement — it was set by hand, not discovered from a log. `confidence` is likewise my annotation of policy strength (1.0 = signed-off control, 0.90 = expected practice). Two dangers follow. First, `pm4py.conformance_declare` evaluates every listed constraint as binding and ignores these numbers entirely: the `confidence 0.90` rules `response(Activate Vendor, Release First Payment)` and `chainresponse(Release First Payment, Close Onboarding)` fail T8-like traces exactly as hard as R1 does, so the softness exists only in my documentation and must be re-applied when severities are assigned. Second, if these numbers had come from discovery, a `confidence` of 0.9 would mean "10% of historical cases violated this", which is a statement about the past, not a control objective — and mining thresholds tuned to make discovered rules look strong would encode existing non-compliance as the norm. Metadata should never be the reason a control is or is not enforced; the mapping in §2, signed off by Legal/Compliance/Operations, is.
+
+---
+
+# 10. Deployment Recommendation
+
+**Canonical procedural representation.** The `ProcessTree` from §3 is the *editable source of truth*: block structure guarantees soundness, it is reviewable by business stakeholders, and both policy variants are one function apart. The `pm4py.convert_to_petri_net(procedural_model)` accepting Petri net is the *executable* representation used for alignment-based conformance, because it yields per-event diagnostics (which event could not be replayed) that a tree does not. Both are versioned together, and the variant flag (`A` strict / `B` emergency) is stored with the model version, never inferred at runtime. Exactly one variant is active in production at a time; running both is a reporting mode, not a policy.
+
+**Authoritative layer per requirement.** One layer decides, the others corroborate:
+
+- Procedural (accepting Petri net): R1, R2, R5 (Resolution A), backbone ordering and synchronization.
+- DECLARE: R3, R4, R7, R8, and R11's ordering approximation.
+- Log skeleton: R10 cardinality, plus cheap corroboration of R1/R2/R8/R3.
+- Temporal profile: R12 only, warning-grade, never control-flow-decisive.
+- Resource/data layer: **R6 and R9 exclusively** (nothing else can see them), plus the authoritative refinement of R11 and the applicable-approval determination for R2.
+
+The resource/data layer is the *authoritative policy layer* for everything that depends on identity, off-log authorization, or attribute values; the procedural model is authoritative for control flow. Where the two overlap (R5/R6), the procedural model decides conformance and the data layer supplies the exculpating annotation.
+
+**Order in which checks run.**
+
+0. **Attribute gate** — `attribute_gate(df)`. If `org:resource` or timestamps are missing, mark the affected checks `unverifiable` up front so that later `pass` results are never read as full assurance.
+1. **Log skeleton** — cheapest (counts and case-level sets); catches T5 and T8 immediately.
+2. **DECLARE** — still linear in the log; adds precise rule-level reasons and catches T5, T6 (Resolution A) and T8.
+3. **Procedural alignment** — most expensive, run last among the activity layers, and run always (not only on skeleton/DECLARE failures) because it detects shape violations no constraint set covers and localizes them to an event.
+4. **Temporal profile** — only on traces that reached the layers above, producing z-scored flags (T7).
+5. **Resource/data layer** — always, and independently of the outcome of 1–4, because it is the only detector for R9 and R6. T4 is the standing proof: skipping this layer on control-flow-clean traces would let a real segregation-of-duties breach through.
+
+Note that check *order* is an efficiency and reporting concern only; the **earliest decisive violation** reported to the user is determined by event position in the trace (T4 at `Manager Approval`@8, T5 at `Classify Risk`@5, T6 at `Activate Vendor`@13, T8 at `Reject Vendor`@10), not by which layer ran first.
+
+**How to surface findings.** One verdict per case with a severity ladder, plus the full per-layer detail:
+
+- `violation` (hard control breach — R1, R2, R9, R10, R5 under the active resolution) → blocks the case, routes to the control owner.
+- `flag` (temporal deviation, soft DECLARE rule, `activ_freq` cap exceeded) → monitored, does not block.
+- `unverifiable` (required attribute absent — R6 always, R9 without resources, R11 without account data) → separate queue with a data-quality owner and an SLA, and explicitly *not* counted as compliant in control-effectiveness reporting.
+- `out of scope` (behavior outside the backbone, e.g. post-activation maintenance) → model-change request, not a compliance finding.
+
+The report shows the earliest decisive violation first, then corroborating layers collapsed under it (T8: one primary contradiction, with the missing payment shown as a consequence), then independent secondary findings, then vacuously satisfied controls listed separately so that "18 constraints satisfied" cannot be mistaken for 18 controls tested.
+
+**Contradictory findings are never auto-merged.** When layers disagree, the UI shows both verdicts side by side with the governing requirement and the reason for the disagreement — as in §8.1, where T6 is presented under both resolutions with the active policy marked and the annotation "emergency authorization unverifiable; 24-hour opinion deadline met (10 h)". Any case matching the emergency shape (escalation present, activation before opinion) is tagged `policy-conflict: R5/R6` regardless of the active variant, so Legal and Operations see the same population and can measure how often the exception is actually used. That measurement is the input to the decision I recommend: adopt **Resolution C**, moving the hard barrier from `Activate Vendor` to `Release First Payment` (`nonsuccession(Release First Payment, Obtain Legal Opinion)` plus `procedural_model_variant_b`) *and* extending the log schema with the emergency attributes from §7 so the exception becomes auditable rather than merely asserted. Until Legal signs that off, the strict model stays in force and the exception stays visible as a contested finding.
