@@ -17,8 +17,8 @@ from typing import Dict, Any, Optional
 
 from file_utils import read_file_with_fallback
 
-# HTTP timeout for provider API requests (60 minutes)
-REQUEST_TIMEOUT = 60 * 60
+# HTTP timeout for provider API requests (90 minutes)
+REQUEST_TIMEOUT = 90 * 60
 
 PROVIDER_API_KEY_ENVS = {
     "openrouter": "OPENROUTER_API_KEY",
@@ -161,7 +161,7 @@ class RateLimiter:
                             self.token_usage[idx] = (ts, actual_tokens, req_id)
                         break
     
-    def wait_for_slot(self, estimated_tokens=4000, filepath=None, max_wait=300):
+    def wait_for_slot(self, estimated_tokens=4000, filepath=None, max_wait=90 * 60):
         """Wait until a slot becomes available or timeout."""
         start_time = time.time()
         wait_interval = 1  # Start with 1 second wait

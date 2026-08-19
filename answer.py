@@ -136,7 +136,7 @@ def _collect_retry_questions(futures, model_name, alias_model_name, failure_coun
     retry_questions = []
     for q, future in futures:
         try:
-            result = future.result(timeout=3600)  # 60 minute timeout per question
+            result = future.result(timeout=90 * 60)  # 90 minute timeout per question
             if result:
                 print(f"Successfully processed {q} for {alias_model_name}")
             elif result is None:
