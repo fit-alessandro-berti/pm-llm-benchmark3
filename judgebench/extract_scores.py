@@ -14,7 +14,7 @@ from benchlib import (
 
 
 def _default_evaluation_dir(script_dir: Path) -> Path:
-    return script_dir.parent / "evaluation-grok-4.5"
+    return script_dir.parent / "evaluation-grok-4.6"
 
 
 def main() -> None:
