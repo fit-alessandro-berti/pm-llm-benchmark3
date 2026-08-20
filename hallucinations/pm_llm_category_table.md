@@ -6,14 +6,14 @@ Aggregated hallucination counts across all LLMs, organized by PM-LLM benchmark c
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1a. Instruction Override | 8 | 15 | 2 | 3 | 10 | 2 | 2 | 3 | 45 |
 | 1b. Context Omission | 8 | 7 | 2 | 6 | 10 | 6 | 15 | 14 | 68 |
-| 1c. Prompt Contradiction | 1 | 2 | 0 | 0 | 6 | 5 | 1 | 5 | 20 |
-| 2a. Concept Fabrication | 9 | 4 | 10 | 13 | 0 | 4 | 24 | 4 | 68 |
-| 2b. Spurious Numeric | 50 | 60 | 19 | 61 | 15 | 62 | 7 | 40 | 314 |
-| 2c. False Citation | 3 | 0 | 3 | 4 | 0 | 1 | 0 | 2 | 13 |
-| 3a. Unsupported Leap | 152 | 106 | 58 | 82 | 49 | 174 | 172 | 186 | 979 |
-| 3b. Self Contradiction | 20 | 41 | 23 | 38 | 21 | 23 | 18 | 27 | 211 |
+| 1c. Prompt Contradiction | 1 | 2 | 0 | 0 | 6 | 5 | 1 | 6 | 21 |
+| 2a. Concept Fabrication | 9 | 4 | 11 | 13 | 0 | 4 | 25 | 4 | 70 |
+| 2b. Spurious Numeric | 50 | 61 | 19 | 61 | 16 | 63 | 8 | 40 | 318 |
+| 2c. False Citation | 3 | 0 | 3 | 6 | 0 | 1 | 0 | 2 | 15 |
+| 3a. Unsupported Leap | 164 | 110 | 60 | 86 | 49 | 187 | 179 | 192 | 1027 |
+| 3b. Self Contradiction | 21 | 41 | 26 | 38 | 21 | 23 | 18 | 28 | 216 |
 | 3c. Circular Reasoning | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 1 | 2 |
 | 4a. Syntax Error | 6 | 5 | 0 | 2 | 1 | 8 | 0 | 1 | 23 |
-| 4b. Model Semantics Breach | 4 | 8 | 14 | 21 | 6 | 6 | 3 | 2 | 64 |
+| 4b. Model Semantics Breach | 4 | 8 | 15 | 21 | 6 | 6 | 3 | 2 | 65 |
 | 4c. Visual Description Mismatch | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **261** | **249** | **131** | **232** | **118** | **291** | **242** | **285** | **1809** |
+| **Total** | **274** | **254** | **138** | **238** | **119** | **305** | **251** | **293** | **1872** |
