@@ -29,93 +29,10 @@ from common import clean_model_name, is_completed_output
 # Hard-coded run configuration — edit these before launching.
 # ---------------------------------------------------------------------------
 TARGET_MODEL_NAME = "gpt-5.2-xhigh"  # prefix used in answers/
-# Currently available Cursor models (`agent --list-models`, 2026-08-14):
-#   auto
-#   gpt-5.3-codex-low, gpt-5.3-codex-low-fast, gpt-5.3-codex, gpt-5.3-codex-fast,
-#   gpt-5.3-codex-high, gpt-5.3-codex-high-fast, gpt-5.3-codex-xhigh,
-#   gpt-5.3-codex-xhigh-fast
-#   gpt-5.2, gpt-5.2-low, gpt-5.2-low-fast, gpt-5.2-fast, gpt-5.2-high,
-#   gpt-5.2-high-fast, gpt-5.2-xhigh, gpt-5.2-xhigh-fast
-#   cursor-grok-4.6-low, cursor-grok-4.6-low-fast, cursor-grok-4.6-medium,
-#   cursor-grok-4.6-medium-fast, cursor-grok-4.6-high, cursor-grok-4.6-high-fast,
-#   cursor-grok-4.6-xhigh, cursor-grok-4.6-xhigh-fast
-#   composer-2.5, composer-2.5-fast
-#   claude-opus-5-low, claude-opus-5-low-fast, claude-opus-5-medium,
-#   claude-opus-5-medium-fast, claude-opus-5-high, claude-opus-5-high-fast,
-#   claude-opus-5-thinking-low, claude-opus-5-thinking-low-fast,
-#   claude-opus-5-thinking-medium, claude-opus-5-thinking-medium-fast,
-#   claude-opus-5-thinking-high, claude-opus-5-thinking-high-fast,
-#   claude-opus-5-thinking-xhigh, claude-opus-5-thinking-xhigh-fast,
-#   claude-opus-5-thinking-max, claude-opus-5-thinking-max-fast
-#   gpt-5.6-sol-none, gpt-5.6-sol-none-fast, gpt-5.6-sol-low, gpt-5.6-sol-low-fast,
-#   gpt-5.6-sol-medium, gpt-5.6-sol-medium-fast, gpt-5.6-sol-high,
-#   gpt-5.6-sol-high-fast, gpt-5.6-sol-xhigh, gpt-5.6-sol-xhigh-fast,
-#   gpt-5.6-sol-max, gpt-5.6-sol-max-fast
-#   claude-fable-5-low, claude-fable-5-medium, claude-fable-5-high,
-#   claude-fable-5-xhigh, claude-fable-5-max, claude-fable-5-thinking-low,
-#   claude-fable-5-thinking-medium, claude-fable-5-thinking-high,
-#   claude-fable-5-thinking-xhigh, claude-fable-5-thinking-max
-#   cursor-grok-4.5-low, cursor-grok-4.5-low-fast, cursor-grok-4.5-medium,
-#   cursor-grok-4.5-medium-fast, cursor-grok-4.5-high, cursor-grok-4.5-high-fast
-#   gemini-3.7-flash-low, gemini-3.7-flash-medium, gemini-3.7-flash-high
-#   claude-sonnet-5-low, claude-sonnet-5-medium, claude-sonnet-5-high,
-#   claude-sonnet-5-xhigh, claude-sonnet-5-max, claude-sonnet-5-thinking-low,
-#   claude-sonnet-5-thinking-medium, claude-sonnet-5-thinking-high,
-#   claude-sonnet-5-thinking-xhigh, claude-sonnet-5-thinking-max
-#   gpt-5.6-luna-none, gpt-5.6-luna-none-fast, gpt-5.6-luna-low,
-#   gpt-5.6-luna-low-fast, gpt-5.6-luna-medium, gpt-5.6-luna-medium-fast,
-#   gpt-5.6-luna-high, gpt-5.6-luna-high-fast, gpt-5.6-luna-xhigh,
-#   gpt-5.6-luna-xhigh-fast, gpt-5.6-luna-max, gpt-5.6-luna-max-fast
-#   claude-opus-4-8-low, claude-opus-4-8-low-fast, claude-opus-4-8-medium,
-#   claude-opus-4-8-medium-fast, claude-opus-4-8-high, claude-opus-4-8-high-fast,
-#   claude-opus-4-8-xhigh, claude-opus-4-8-xhigh-fast, claude-opus-4-8-max,
-#   claude-opus-4-8-max-fast, claude-opus-4-8-thinking-low,
-#   claude-opus-4-8-thinking-low-fast, claude-opus-4-8-thinking-medium,
-#   claude-opus-4-8-thinking-medium-fast, claude-opus-4-8-thinking-high,
-#   claude-opus-4-8-thinking-high-fast, claude-opus-4-8-thinking-xhigh,
-#   claude-opus-4-8-thinking-xhigh-fast, claude-opus-4-8-thinking-max,
-#   claude-opus-4-8-thinking-max-fast
-#   gpt-5.5-none, gpt-5.5-none-fast, gpt-5.5-low, gpt-5.5-low-fast,
-#   gpt-5.5-medium, gpt-5.5-medium-fast, gpt-5.5-high, gpt-5.5-high-fast,
-#   gpt-5.5-extra-high, gpt-5.5-extra-high-fast
-#   gpt-5.6-terra-none, gpt-5.6-terra-none-fast, gpt-5.6-terra-low,
-#   gpt-5.6-terra-low-fast, gpt-5.6-terra-medium, gpt-5.6-terra-medium-fast,
-#   gpt-5.6-terra-high, gpt-5.6-terra-high-fast, gpt-5.6-terra-xhigh,
-#   gpt-5.6-terra-xhigh-fast, gpt-5.6-terra-max, gpt-5.6-terra-max-fast
-#   claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
-#   claude-opus-4-7-low, claude-opus-4-7-low-fast, claude-opus-4-7-medium,
-#   claude-opus-4-7-medium-fast, claude-opus-4-7-high, claude-opus-4-7-high-fast,
-#   claude-opus-4-7-xhigh, claude-opus-4-7-xhigh-fast, claude-opus-4-7-max,
-#   claude-opus-4-7-max-fast, claude-opus-4-7-thinking-low,
-#   claude-opus-4-7-thinking-low-fast, claude-opus-4-7-thinking-medium,
-#   claude-opus-4-7-thinking-medium-fast, claude-opus-4-7-thinking-high,
-#   claude-opus-4-7-thinking-high-fast, claude-opus-4-7-thinking-xhigh,
-#   claude-opus-4-7-thinking-xhigh-fast, claude-opus-4-7-thinking-max,
-#   claude-opus-4-7-thinking-max-fast
-#   gpt-5.4-low, gpt-5.4-medium, gpt-5.4-medium-fast, gpt-5.4-high,
-#   gpt-5.4-high-fast, gpt-5.4-xhigh, gpt-5.4-xhigh-fast
-#   claude-4.6-opus-high, claude-4.6-opus-max, claude-4.6-opus-high-thinking,
-#   claude-4.6-opus-max-thinking
-#   claude-4.5-opus-high, claude-4.5-opus-high-thinking
-#   gemini-3.6-flash-minimal, gemini-3.6-flash-low, gemini-3.6-flash-medium,
-#   gemini-3.6-flash-high
-#   gemini-3.1-pro
-#   gpt-5.4-mini-none, gpt-5.4-mini-low, gpt-5.4-mini-medium, gpt-5.4-mini-high,
-#   gpt-5.4-mini-xhigh
-#   gpt-5.4-nano-none, gpt-5.4-nano-low, gpt-5.4-nano-medium, gpt-5.4-nano-high,
-#   gpt-5.4-nano-xhigh
-#   claude-4.5-sonnet, claude-4.5-sonnet-thinking
-#   gpt-5.1-low, gpt-5.1, gpt-5.1-high
-#   gemini-3-flash, gemini-3.5-flash
-#   claude-4-sonnet, claude-4-sonnet-thinking
-#   gpt-5-mini
-#   kimi-k3-low, kimi-k3-high, kimi-k3-max
-#   kimi-k2.7-code
-#   glm-5.2-high, glm-5.2-max
 # Base id passed to `agent --model`. Effort is appended as a hyphen suffix
 # (e.g. claude-opus-5-thinking-high). Cursor does not accept [effort=...]
 # overrides. You may also paste a full effort-suffixed slug here and leave
-# TARGET_REASONING_EFFORT empty.
+# TARGET_REASONING_EFFORT empty. Run `agent --list-models` for current slugs.
 TARGET_MODEL = "gpt-5.2"
 # none | low | medium | high | xhigh | extra-high | max | minimal; "" to omit
 TARGET_REASONING_EFFORT = "xhigh"
