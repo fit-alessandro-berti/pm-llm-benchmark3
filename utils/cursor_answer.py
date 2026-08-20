@@ -28,7 +28,7 @@ from common import clean_model_name, is_completed_output
 # ---------------------------------------------------------------------------
 # Hard-coded run configuration — edit these before launching.
 # ---------------------------------------------------------------------------
-TARGET_MODEL_NAME = "claude-opus-4-8-high"  # prefix used in answers/
+TARGET_MODEL_NAME = "gpt-5.2-xhigh"  # prefix used in answers/
 # Currently available Cursor models (`agent --list-models`, 2026-08-14):
 #   auto
 #   gpt-5.3-codex-low, gpt-5.3-codex-low-fast, gpt-5.3-codex, gpt-5.3-codex-fast,
@@ -116,9 +116,9 @@ TARGET_MODEL_NAME = "claude-opus-4-8-high"  # prefix used in answers/
 # (e.g. claude-opus-5-thinking-high). Cursor does not accept [effort=...]
 # overrides. You may also paste a full effort-suffixed slug here and leave
 # TARGET_REASONING_EFFORT empty.
-TARGET_MODEL = "claude-opus-4-8"
+TARGET_MODEL = "gpt-5.2"
 # none | low | medium | high | xhigh | extra-high | max | minimal; "" to omit
-TARGET_REASONING_EFFORT = "high"
+TARGET_REASONING_EFFORT = "xhigh"
 
 # Max concurrent Cursor CLI invocations. Each worker handles one question
 # end-to-end (including its own retries) independently of the others.

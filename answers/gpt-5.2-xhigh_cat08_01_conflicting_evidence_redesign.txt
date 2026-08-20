@@ -1,0 +1,188 @@
+## 1. Current-process diagnosis
+
+- **The dominant “fast path” is genuinely fast/cheap up front, but leaks quality and compliance downstream**: The most frequent route is `Intake claim -> Auto eligibility screen (3600) -> Fast approval (2550) -> Dispatch replacement (2300) -> Quality/compliance close (2320)`. Its step times are short (e.g., `Intake -> Auto` mean 0.8h; `Auto -> Fast approval` mean 1.0h; `Fast approval -> Dispatch` mean 3.0h; `Dispatch -> Close` mean 5.0h), which makes it attractive if you measure “time-to-first-close”. Yet it drives disproportionate downstream rework: `Customer complaint/reopen` is **14.1%** for fast-approval cases vs **3.3%** for the repair path, and complaints occur with long lags (`Fast approval -> Complaint` mean 72h; `Dispatch -> Complaint` mean 96h). This is the core contradiction: **the most frequent behavior optimizes local speed/cost but worsens total outcome when you include reopens, reshipments, and credits** (fast cases are 31% cheaper pre-rework but only 9% cheaper after downstream costs).
+
+- **Evidence handling is the largest cycle-time amplifier and abandonment driver**: `Request missing evidence` is entered often (650 from Auto screen; 780 from Manual review) and is “sticky”: **26%** of cases that enter it see it at least twice. The biggest time sink is the return edge `Request missing evidence -> Manual eligibility review` (mean 34h, p90 88h), which helps explain why the “Unclear defect / missing evidence” segment (22% share) has a median cycle time of **140h** and the highest abandonment (`Request missing evidence -> Claim abandoned` count 320).
+
+- **Manual eligibility review is both slow and queue-sensitive; it becomes the system’s throttle**: Even getting into manual review is slower (`Intake -> Manual` mean 7.5h, p90 18h), and manual review then routes into slower work (`Manual -> Request evidence` mean 14h; `Manual -> Fraud` mean 18h; `Manual -> Repair quote` mean 22h). Capacity is limited (7 reviewers, 36 productive hours/week each) and the prompt states the queue grows sharply above **82% utilization**—so any policy tightening that increases manual inflow (estimated +15–35% if auto rules are updated) can quickly flip the process from “fast most of the time” to “slow for everyone”.
+
+- **Fraud/risk review is small in volume but high in delay variability and creates burst bottlenecks**: It is reached frequently enough (`Auto -> Fraud` 400; `Manual -> Fraud` 360; `Evidence -> Fraud` 220), takes time (`Auto -> Fraud` mean 11h, `Manual -> Fraud` mean 18h), and is staffed by only 2 specialists with known Monday/campaign spikes. This makes it a likely displaced bottleneck if routing rules are tightened.
+
+- **Compliance deviations align with the fast path’s weaknesses (not just “noise”)**: Policy requires R1 (claims > EUR 400 need Manual or Fraud before Fast approval) and R2 (no dispatch before evidence completeness except Premium low-risk accessory), plus R3 (reopens must go through Manual before final close/denial). Conformance evidence shows a mismatch between “what should happen” and “what happens”: token-based replay fitness is 0.91 but only **68%** of traces fit; alignment diagnostics cite frequent deviations of **Fast approval before evidence completeness** and **Dispatch replacement without risk review for high-value devices**, plus **reopens after close**. Low precision in the discovered model reinforces that “rare” but policy-breaking combinations exist and contaminate outcomes.
+
+- **Customer outcomes diverge sharply by segment and risk, and the current process fails to differentiate**:
+  - Premium low-risk accessories (18%): fast median 8h vs manual 46h; service-credit exposure rises if >24h—so you must protect speed here, but complaints are still lower on manual (6% vs 3%).
+  - High-value devices are where the fast path is most dangerous: Premium high-value fast-path complaints are **22%** (vs 5% reviewed/repair), and Standard high-value fast-path complaints are **18%** (vs 6% reviewed/repair); wrong replacement cost is high (expected **EUR 410**), making “fast-but-wrong” expensive.
+  - Standard low-risk accessories tolerate longer times if visibility is good (tolerate 72h), implying that **status transparency and fewer reopens may matter more than shaving hours**.
+
+In short, the process is currently optimized for a frequent, locally efficient route, while the mining artifacts show that **downstream rework, compliance exceptions, and segment-specific expectations** are the real drivers of total cost and customer outcomes.
+
+## 2. Redesign A: Guardrailed straight-through processing (STP) with risk/segment-aware routing
+
+- **Redesigned process flow**
+  - `Intake claim -> Auto eligibility screen (updated rules, segment-aware)`
+  - Decision split (hard gates + routing):
+    - **Low-risk accessory + evidence complete**:
+      - `Fast approval -> Dispatch replacement -> Quality/compliance close`
+      - Premium low-risk accessory retains the R2 exception (dispatch can proceed even with minimal evidence, but still logs “evidence completeness status” explicitly).
+    - **Claims > EUR 400 and/or high-value devices** (enforce R1):
+      - `Fraud/risk review OR Manual eligibility review (fast-lane for Premium) -> Technical decision`
+      - Then either:
+        - `Fast approval (reviewed) -> Dispatch replacement -> Quality/compliance close`, or
+        - `Repair quote -> Customer approval -> Repair device -> Quality check -> Quality/compliance close`
+    - **Evidence incomplete** (enforce R2 for everyone except Premium low-risk accessory):
+      - `Evidence completion task bundle (single consolidated request) -> Auto re-screen (lightweight) -> route as above`
+  - Explicit control points:
+    - **“Evidence completeness confirmed” milestone** must exist before dispatch (R2).
+    - **“R1 satisfied” flag** required before any fast approval on > EUR 400.
+    - **Reopen handling**: `Customer complaint/reopen -> Manual eligibility review -> (then) close/deny` (R3).
+
+- **Targets (segments/paths/activities)**
+  - **High-value devices and all claims > EUR 400** where R1/R2 violations are most damaging.
+  - The dominant `Auto -> Fast approval -> Dispatch` path (2550/2300 cases) to prevent misrouting.
+  - Premium high-value cases where the current reviewed/repair path is slow (temporal deviation: `Manual -> Repair quote` too slow for Premium).
+
+- **Mechanism of improvement**
+  - **Reduce “fast-but-noncompliant” throughput** by turning R1/R2 into enforceable routing constraints in the automation layer.
+  - **Shift effort upstream**: a small increase in upfront review prevents the large downstream loops (`Dispatch -> Complaint` mean 96h; `Complaint -> Manual` mean 40h; `Complaint -> Escalation` mean 54h).
+  - **Segment-aware SLAs**: create a Premium “fast-lane manual review” focused on eligibility/decision within a short window, preventing Premium cases from waiting behind Standard work (protects the Premium experience without defaulting to risky auto-approval).
+
+- **What it deliberately sacrifices or leaves unresolved**
+  - **Sacrifices some first-pass speed for high-value claims** (more cases routed to Manual/Fraud) to reduce reopens and compliance exposure.
+  - **Increases pressure on Manual eligibility and Fraud/risk** (and risks breaching the 82% utilization threshold) unless paired with queue/WIP management and targeted staffing.
+  - Does **not fully solve** the repeated-evidence loop; it mainly prevents dispatch/approval from skipping evidence rather than redesigning evidence capture.
+
+## 3. Redesign B: Evidence-first case building with multi-channel capture and status transparency
+
+- **Redesigned process flow**
+  - `Intake claim -> Evidence & defect clarification stage (portal + assisted channel)`
+    - Portal provides a **single consolidated evidence checklist** by device risk + defect type + segment, with guided capture (photos, serial, purchase proof) and “what happens next” status.
+    - Assisted alternatives for low digital literacy (agent-assisted upload, store/kiosk capture, call-back scheduling) to avoid abandonment.
+  - **Evidence completeness checkpoint**:
+    - If complete: `Auto eligibility screen -> route (Fast approval / Manual / Fraud / Repair quote)`.
+    - If incomplete: **remain in evidence stage** with reminders/deadlines; do not bounce between Manual and Evidence.
+  - `Request missing evidence` becomes an **internal state**, not a repeated activity:
+    - Manual eligibility review can request *additional* evidence only via the same consolidated bundle, preventing “ping-pong” loops.
+  - Segment-specific experience:
+    - Premium: proactive outreach if evidence incomplete for >X hours; tighter SLA for first decision.
+    - Standard: longer tolerance but strong visibility (fits the “72h is OK if status is good” insight).
+
+- **Targets (segments/paths/activities)**
+  - The **22% “Unclear defect / missing evidence”** segment (median 140h) and the high-frequency evidence loop (`Request missing evidence` entered via Auto 650 and Manual 780, with mean 34h return to Manual).
+  - The **26% repeated evidence requests** and associated abandonment (`Request missing evidence -> Claim abandoned` 320).
+  - Indirectly improves compliance with R2 by making “evidence completeness confirmed” explicit before dispatch.
+
+- **Mechanism of improvement**
+  - **Remove the biggest time sink** by collapsing multiple evidence touches into one structured stage, reducing the `Request -> Manual` waiting and the need to re-enter manual queues.
+  - **Reduce rework created by incomplete context**: better evidence at the decision point reduces both incorrect approvals and unnecessary fraud escalation.
+  - **Improve customer experience without over-optimizing mean cycle time**: status visibility and fewer back-and-forths reduce perceived delay, which is especially valuable for Standard customers.
+
+- **What it deliberately sacrifices or leaves unresolved**
+  - **Up-front investment and change-management burden** (new portal, integrations, training).
+  - **Risk of increased abandonment** for low digital literacy customers if the assisted channel is underfunded (explicitly noted in the prompt).
+  - Does not, by itself, fix wrong replacement selection; it mainly improves decision quality and reduces evidence-driven loops.
+
+## 4. Redesign C: Right-first-time fulfillment—pre-dispatch validation + scalable reopen triage
+
+- **Redesigned process flow**
+  - For replacement outcomes:
+    - `Fast approval -> Replacement selection validation (risk-based) -> Dispatch replacement -> Quality/compliance close`
+    - Validation design:
+      - Automated compatibility checks (device model/serial vs part number).
+      - Lightweight human verification for **high-value devices** (use underused `Quality check` resources; inspectors are EUR 38/h and currently underused except campaigns).
+      - Skip or sample-check for low-risk accessories; keep the Premium low-risk accessory exception focused on speed.
+  - For repairs:
+    - Keep `Repair device -> Quality check -> close`, but add a **high-value repair focus**: prioritize inspector attention on high-value repairs given higher rework repair (12.5% vs 4.0%).
+  - For reopens:
+    - `Customer complaint/reopen -> Rapid triage (same day) -> Manual eligibility review (required before final close/deny) -> resolution`
+    - Triage classifies: wrong part / fulfillment error vs eligibility/policy vs suspected fraud; only the ambiguous/high-impact subset goes to the constrained `Escalation board` (one daily 45-minute slot), reducing wasted escalation capacity.
+
+- **Targets (segments/paths/activities)**
+  - The `Dispatch replacement -> Customer complaint/reopen` problem (260 occurrences; mean 96h lag) tied to **incorrect replacement part selection**.
+  - High-value segments where the fast path has very high complaints (Premium high-value 22%, Standard high-value 18%) and where wrong replacement cost is **EUR 410** expected.
+  - The long-tail reopen cycle that drags total resolution time (`Complaint -> Manual` mean 40h; `Complaint -> Escalation` mean 54h).
+
+- **Mechanism of improvement**
+  - **Prevent the dominant downstream failure** (wrong replacement) before shipping, cutting reshipments, credits, and repeat contacts.
+  - **Convert a long-lag quality signal into a short-lag control**: instead of discovering errors 3–7 days later via complaints, catch them within the 6–18h gate window (as anticipated by the prompt).
+  - **Scale satisfaction effects without scaling meetings**: triage protects the “strong CSAT effect” of escalation while reserving the board for true exceptions.
+
+- **What it deliberately sacrifices or leaves unresolved**
+  - **Adds delay (6–18h) and operational work** to targeted replacement cases; if mis-scoped, this can degrade Premium expectations.
+  - Creates a new potential choke point at validation/inspection and requires reliable compatibility/master-data.
+  - Does not directly address the root causes of evidence incompleteness or initial eligibility misrouting.
+
+## 5. Pareto-style comparison table
+
+| option | cycle-time effect | cost effect | quality/rework effect | compliance risk | customer-experience effect | resource pressure | implementation complexity | best-fit segment | dominated? yes/no/conditional |
+|---|---|---|---|---|---|---|---|---|---|
+| current process | baseline fast for many; long-tail via reopens (72–96h lags) and evidence loops (median 140h for missing-evidence segment) | baseline; “fast” looks cheap but only ~9% cheaper after downstream costs | higher complaints on fast path (14.1%) and wrong replacements; repeated evidence requests (26% of evidence cases) | material: R1/R2/R3 deviations; only 68% fitting traces | mixed: fast first close but many reopens; Premium high-value fast path has 22% complaints | manual/fraud queues unstable; escalation not scalable | baseline | none (one-size-fits-all) | yes (by at least one redesign for most segments) |
+| Redesign A (guardrailed STP) | mixed: ↑ first-pass time for high-value; ↓ time-to-final-close via fewer reopens | mixed/↓ total: ↑ upfront review cost; ↓ reshipments/credits/reopen labor | ↑ quality for high-value by preventing risky fast approvals; fewer compliance-driven rework loops | ↓↓: enforces R1/R2 gates; R3 standardized on reopens | ↑ for high-value (fewer wrong outcomes); neutral/slight ↓ for some due to extra checks | ↑ manual + fraud load; risk of >82% manual utilization if not managed | medium (rules + routing + operating model) | high-value devices, >EUR 400, Premium high-value | conditional (if capacity cannot support, B may dominate on cycle time for evidence-heavy work) |
+| Redesign B (evidence-first) | ↓↓ for missing-evidence/unclear-defect cases; slight ↑ for some low-risk that previously skipped evidence | mixed: ↑ fixed build cost; ↓ variable rework cost and manual “ping-pong” | ↑ by reducing repeated evidence requests and decision errors; indirect complaint reduction | ↓: makes evidence completeness explicit (supports R2); does not fully address R1 unless paired with A | ↑ for Standard (visibility) and for evidence-heavy cases; risk ↓ if low digital literacy not supported | shifts load from reviewers to customer support/evidence verification | high (portal + UX + integration + change mgmt) | unclear defect / missing evidence (22%); Standard segments | no (distinct advantage on evidence-loop performance) |
+| Redesign C (right-first-time fulfillment) | mixed: ↑ 6–18h on targeted replacements; ↓ long-tail reopens (96h complaint lag) | ↓ for high-value replacements (avoids EUR 410 wrong-ship expectation); slight ↑ inspection cost | ↑↑ for replacement accuracy; reduces complaint/reopen especially on fast path | ↓ for R2 if gate includes evidence check; partial on R1 (not primary) | ↑ (fewer reopens, fewer “second contacts”); Premium impact depends on gating scope | ↑ quality inspectors/dispatch coordination; potential new gate bottleneck | medium (process + data + staffing/triage) | high-value replacement cases; defect types prone to wrong part selection | conditional (if gate delays harm Premium more than it helps, A may dominate for Premium) |
+
+## 6. Failure modes and displaced bottlenecks
+
+- **Redesign A (guardrailed STP)**
+  - **Failure modes**
+    - If updated auto-screen rules push +15–35% more work into Manual eligibility, utilization can exceed the ~82% tipping point, causing broad cycle-time inflation (and potential service credits for Premium low-risk accessories when they get stuck behind work they shouldn’t).
+    - Fraud/risk review becomes the new choke point (2 specialists; Monday/campaign spikes), leading to “compliance-safe but slow” outcomes that drive dissatisfaction.
+    - Reviewers bypass controls (e.g., fast-approve with “pending evidence”), reintroducing R2 violations under pressure.
+  - **Likely bottleneck migration**
+    - From downstream complaints/escalations to **Manual eligibility queues** and **Fraud/risk review** waiting time.
+
+- **Redesign B (evidence-first)**
+  - **Failure modes**
+    - The portal reduces repeated requests but increases abandonment among low digital literacy customers if assisted channels are weak (the prompt explicitly warns this may happen).
+    - “Evidence completeness” becomes a false sense of security: evidence may be complete but misleading or fraudulent, driving more risk cases into later disputes unless fraud signals are upgraded.
+    - Status transparency increases inbound contact volume (“where is my claim?”) if updates are delayed or inaccurate, shifting cost into customer support.
+  - **Likely bottleneck migration**
+    - From reviewer rework and evidence ping-pong to **frontline support/assisted capture** and **evidence verification**, with a secondary risk of higher **fraud review** demand if better evidence triggers more flags.
+
+- **Redesign C (right-first-time fulfillment)**
+  - **Failure modes**
+    - Pre-dispatch validation becomes a hard gate with insufficient staffing, creating a new queue that adds >18h (breaking the intended “lightweight” design and potentially hurting Premium expectations).
+    - Master-data/compatibility logic is wrong or incomplete, causing either missed wrong-part shipments (no benefit) or excessive false alarms (unnecessary delays and reroutes to repair).
+    - Triage misclassifies reopens, sending cases to escalation unnecessarily and consuming the already scarce daily board slot.
+  - **Likely bottleneck migration**
+    - From downstream complaints to **quality inspectors / dispatch coordination**, and potentially to **inventory/parts data management** if validation requires frequent corrections.
+
+## 7. Recommended experiment sequence
+
+- **First pilot (fastest learning, lowest build time): enforce R1/R2 gates via auto-screen rule update (subset of Redesign A)**
+  - **Design**: Canary rollout on **high-value devices and >EUR 400 claims** only. Enforce: “no Fast approval unless R1 satisfied” and “no Dispatch unless evidence completeness confirmed (except Premium low-risk accessory)”.
+  - **Metrics to monitor**
+    - Compliance: rate of R1/R2 violations; % fitting traces (baseline 68%); alignment “move-on-log” deviations for fast approval before evidence/dispatch without risk review.
+    - Ops: Manual and Fraud queue times; utilization signals relative to the ~82% manual threshold; Monday backlog for fraud specialists.
+    - Outcomes: complaint/reopen rate for targeted segments; time-to-final-resolution (include a window long enough to capture 72–96h complaint lags).
+  - **Stop/go thresholds (qualitative/ranges)**
+    - **Go** if R1/R2 exceptions fall to “rare/near-zero” and complaint/reopen in high-value segments drops meaningfully (e.g., from ~18–22% fast-path toward the single digits/low teens) without pushing manual utilization into chronic overload.
+    - **Stop/adjust** if manual queues explode (sustained utilization clearly above the tipping point) or Premium low-risk accessory median cycle time starts breaching the 24h service-credit exposure window.
+
+- **Second pilot (downstream cost reducer): pre-dispatch validation for high-value replacements (subset of Redesign C)**
+  - **Design**: Start with **Standard high-value replacements** to avoid unintentionally degrading Premium expectations while calibrating the 6–18h gate and staffing. Use a randomized holdout among eligible cases to estimate causal impact.
+  - **Metrics to monitor**
+    - Wrong-part indicators (returns/reshipments), `Dispatch -> Complaint` frequency and lag, total reshipment/service-credit cost proxies.
+    - Added waiting time at the new gate and inspector utilization (ensure it stays “lightweight”).
+  - **Stop/go thresholds**
+    - **Go** if complaint/reopen after dispatch drops materially and gate delay remains within the intended 6–18h band for most cases.
+    - **Stop/resize** if the gate becomes a queue (delays consistently above design intent) or shifts too many cases into repair unnecessarily.
+
+- **Third pilot (largest cycle-time unlock for a big segment): evidence portal + assisted capture (Redesign B)**
+  - **Design**: Target the **unclear defect / missing evidence** segment (22% share). Compare portal vs current approach for new intakes; ensure assisted channel capacity is available.
+  - **Metrics to monitor**
+    - Repeated evidence requests (baseline: 26% of evidence-entering cases have ≥2 requests), abandonment rate (baseline: 320 abandonments from evidence state), cycle time for this segment (baseline median 140h), and inbound contact volume.
+    - Downstream: complaint/reopen rate and manual-review rework rate (to verify evidence improvements aren’t merely shifting work later).
+  - **Stop/go thresholds**
+    - **Go** if repeated evidence requests drop in the expected 30–45% range and abandonment does not worsen materially (ideally decreases), with a clear reduction in segment cycle time.
+    - **Stop/iterate** if abandonment increases among low digital literacy customers or if reviewer behavior reintroduces “extra evidence requests” outside the consolidated bundle.
+
+- **Sequencing logic (why this order)**
+  - Start with **policy gates** (fast deploy in ~2 weeks) to stop the highest-risk noncompliance and learn capacity impacts early.
+  - Then add **pre-dispatch validation** to attack the most expensive downstream failure (wrong replacement on high-value).
+  - Finally, invest in the **evidence portal**, which has the biggest structural payoff but also the highest build and adoption risk.
+
+- **How to verify improvements are real (not just shifted downstream)**
+  - Measure **time-to-final-resolution**, not just first close, using an observation window that captures the long-lag complaint edges (72–96h mean; p90 up to 150–180h).
+  - Track **total cost per claim** qualitatively (labor touches + reshipments + service credits), not just pre-rework processing cost (to avoid repeating the “31% cheaper pre-rework but only 9% cheaper after” trap).
+  - Re-run conformance/alignment regularly: improvements should reduce the specific deviation patterns called out (fast approval before evidence completeness; dispatch without risk review; improper reopen handling) while not creating new “workarounds” that lower precision further.
