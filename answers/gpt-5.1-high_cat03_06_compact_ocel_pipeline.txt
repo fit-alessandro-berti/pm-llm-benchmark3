@@ -1,0 +1,528 @@
+## 1. Modeling assumptions
+
+- **Object types and capitalization**:  
+  I use six object types, all in lower case as OCEL types, with business IDs preserved as given:  
+  - `order`: `O100`, `O200`  
+  - `item`: `I1`, `I2`, `I3`  
+  - `package`: `P1`, `P2`  
+  - `delivery`: `D1`, `D2`  
+  - `invoice`: `V1`  
+  - `payment`: `M1`, `M2`
+
+- **E2O qualifier vocabulary** (relation roles in `relations`):  
+  - `created`: the object is being created/first observed in the process (`Create Order` for Orders, `Issue Invoice` for the Invoice, `Record Payment` for Payments).  
+  - `line_item`: Item acting as a line item in an Order when it is added.  
+  - `order_scope`: Order(s) operationally in scope of a non-order-centric event (e.g., shared stock reservation, packing, dispatch, payments).  
+  - `stock_subject`: Items for which stock is reserved.  
+  - `packaged_item`: Items physically packed into a Package.  
+  - `package_subject`: Package central to a packing/dispatch/confirmation step.  
+  - `delivery_subject`: Delivery central to a dispatch/confirmation step.  
+  - `billed_order`: Orders that an Invoice bills.  
+  - `invoice_subject`: Invoice being issued/handled.  
+  - `payment_subject`: Payment object being recorded.  
+  - `settled_invoice`: Invoice whose balance is (partially) settled by a Payment.  
+  - `delivered_order`: Orders whose delivery is being confirmed.  
+  - `closed_order`: Orders being closed.  
+  - `delivered_package`: Packages whose delivery is being confirmed.
+
+- **O2O direction conventions** (`o2o`):  
+  `ocel:oid` → `ocel:oid_2` always encodes “business owner / driver” → “dependent / contained / referenced” object:  
+  - Order `O*` → Item `I*` with `contains_item`.  
+  - Package `P*` → Item `I*` with `packs_item`.  
+  - Delivery `D*` → Package `P*` with `carries_package`.  
+  - Invoice `V1` → Order `O*` with `bills_order`.  
+  - Payment `M*` → Invoice `V1` with `partially_settles_invoice` or `completes_settlement_of_invoice`.
+
+- **Direct relations for logistics and financial events**:  
+  - Logistics events (`Reserve Stock`, `Pack Package`, `Dispatch Package`, `Confirm Delivery`) relate directly to Packages and Deliveries and also to the Orders in operational scope via `order_scope` or `delivered_order`. Items are linked where they are explicitly manipulated (added, reserved, packed) but not for all downstream events to avoid unnecessary fan-out.  
+  - Financial events (`Issue Invoice`, `Record Payment`) relate directly to `invoice` and `payment` objects and explicitly to the billed Orders via `billed_order` and `order_scope`. No direct E2O links are created from payments to Items; the connection from payments to Items is intentionally left as an analytical inference via Orders and O2O.
+
+- **Preventing confusion between analytical propagation and source-system facts**:  
+  - All E2O relations in `relations` reflect source-like facts derived from the narrative (events referencing specific business objects).  
+  - Structural O2O links (`contains_item`, `packs_item`, `carries_package`, `bills_order`, settlement qualifiers) are kept in `o2o` and are never copied back into E2O.  
+  - Any cross-object reasoning beyond those direct links (e.g., inferring which Items were covered by a Payment) is done analytically in downstream analysis (flattening, OC-DFG, OTG), not by materializing synthetic E2O rows.  
+  - Qualifier vocabularies for E2O and O2O are disjoint and documented so that reviewers can see which relations are “observations” and which are static structure.
+
+- **PM4Py / OCEL version-dependent assumption**:  
+  - I assume an OCEL 2-style constructor `from pm4py.objects.ocel2.obj import OCEL` with `OCEL(events=events, objects=objects, relations=relations, o2o=o2o)` and top-level helpers `pm4py.ocel_flattening`, `pm4py.ocel_get_object_types`, `pm4py.ocel_object_type_activities`, `pm4py.discover_ocdfg`, `pm4py.discover_otg`, `pm4py.discover_etot`, `pm4py.discover_oc_petri_net`, and `pm4py.ocel_objects_interactions_summary`.  
+  - If the actual PM4Py version exposes OCEL or these functions under different modules, only the import lines and the OCEL construction call need to be adapted; the DataFrame semantics (columns and relations) remain unchanged.
+
+
+## 2. Complete Python pipeline
+
+```python
+import pandas as pd
+import pm4py
+from pm4py.objects.ocel2.obj import OCEL  # Adapt this import if your PM4Py version exposes OCEL elsewhere.
+
+
+def utc(ts: str):
+    """Helper to create timezone-aware UTC timestamps."""
+    return pd.to_datetime(ts, utc=True)
+
+
+# 1. Events -------------------------------------------------------------------
+events_data = [
+    {"ocel:eid": "E1",  "ocel:activity": "Create Order",      "ocel:timestamp": utc("2026-04-06 08:00:00"), "amount": None},
+    {"ocel:eid": "E2",  "ocel:activity": "Add Item to Order", "ocel:timestamp": utc("2026-04-06 08:05:00"), "amount": None},
+    {"ocel:eid": "E3",  "ocel:activity": "Add Item to Order", "ocel:timestamp": utc("2026-04-06 08:06:00"), "amount": None},
+    {"ocel:eid": "E4",  "ocel:activity": "Create Order",      "ocel:timestamp": utc("2026-04-06 08:10:00"), "amount": None},
+    {"ocel:eid": "E5",  "ocel:activity": "Add Item to Order", "ocel:timestamp": utc("2026-04-06 08:12:00"), "amount": None},
+    {"ocel:eid": "E6",  "ocel:activity": "Reserve Stock",     "ocel:timestamp": utc("2026-04-06 08:30:00"), "amount": None},
+    {"ocel:eid": "E7",  "ocel:activity": "Pack Package",      "ocel:timestamp": utc("2026-04-06 09:00:00"), "amount": None},
+    {"ocel:eid": "E8",  "ocel:activity": "Pack Package",      "ocel:timestamp": utc("2026-04-06 09:05:00"), "amount": None},
+    {"ocel:eid": "E9",  "ocel:activity": "Dispatch Package",  "ocel:timestamp": utc("2026-04-06 10:00:00"), "amount": None},
+    {"ocel:eid": "E10", "ocel:activity": "Dispatch Package",  "ocel:timestamp": utc("2026-04-06 10:15:00"), "amount": None},
+    {"ocel:eid": "E11", "ocel:activity": "Issue Invoice",     "ocel:timestamp": utc("2026-04-06 11:00:00"), "amount": None},
+    {"ocel:eid": "E12", "ocel:activity": "Record Payment",    "ocel:timestamp": utc("2026-04-06 11:30:00"), "amount": 100},
+    {"ocel:eid": "E13", "ocel:activity": "Confirm Delivery",  "ocel:timestamp": utc("2026-04-06 13:00:00"), "amount": None},
+    {"ocel:eid": "E14", "ocel:activity": "Confirm Delivery",  "ocel:timestamp": utc("2026-04-07 09:00:00"), "amount": None},
+    {"ocel:eid": "E15", "ocel:activity": "Record Payment",    "ocel:timestamp": utc("2026-04-07 10:00:00"), "amount": 150},
+    {"ocel:eid": "E16", "ocel:activity": "Close Order",       "ocel:timestamp": utc("2026-04-07 10:30:00"), "amount": None},
+    {"ocel:eid": "E17", "ocel:activity": "Close Order",       "ocel:timestamp": utc("2026-04-07 10:35:00"), "amount": None},
+]
+events = pd.DataFrame(events_data)
+
+# Ensure timestamps are timezone-aware UTC
+assert events["ocel:timestamp"].dt.tz is not None
+
+
+# 2. Objects ------------------------------------------------------------------
+objects_data = [
+    # Orders
+    {"ocel:oid": "O100", "ocel:type": "order"},
+    {"ocel:oid": "O200", "ocel:type": "order"},
+    # Items
+    {"ocel:oid": "I1", "ocel:type": "item"},
+    {"ocel:oid": "I2", "ocel:type": "item"},
+    {"ocel:oid": "I3", "ocel:type": "item"},
+    # Packages
+    {"ocel:oid": "P1", "ocel:type": "package"},
+    {"ocel:oid": "P2", "ocel:type": "package"},
+    # Deliveries
+    {"ocel:oid": "D1", "ocel:type": "delivery"},
+    {"ocel:oid": "D2", "ocel:type": "delivery"},
+    # Invoice
+    {"ocel:oid": "V1", "ocel:type": "invoice"},
+    # Payments
+    {"ocel:oid": "M1", "ocel:type": "payment"},
+    {"ocel:oid": "M2", "ocel:type": "payment"},
+]
+objects = pd.DataFrame(objects_data)
+objects_indexed = objects.set_index("ocel:oid")
+
+
+# 3. Event-to-object relations (E2O) -----------------------------------------
+events_indexed = events.set_index("ocel:eid")
+relations_rows = []
+
+
+def relate(eid: str, oid: str, qualifier: str):
+    ev = events_indexed.loc[eid]
+    relations_rows.append(
+        {
+            "ocel:eid": eid,
+            "ocel:activity": ev["ocel:activity"],
+            "ocel:timestamp": ev["ocel:timestamp"],
+            "ocel:oid": oid,
+            "ocel:type": objects_indexed.loc[oid, "ocel:type"],
+            "ocel:qualifier": qualifier,
+        }
+    )
+
+
+# E1: Create Order for O100
+relate("E1", "O100", "created")
+
+# E2: Add Item I1 to O100
+relate("E2", "I1", "line_item")
+relate("E2", "O100", "order_scope")
+
+# E3: Add Item I2 to O100
+relate("E3", "I2", "line_item")
+relate("E3", "O100", "order_scope")
+
+# E4: Create Order for O200
+relate("E4", "O200", "created")
+
+# E5: Add Item I3 to O200
+relate("E5", "I3", "line_item")
+relate("E5", "O200", "order_scope")
+
+# E6: Reserve Stock jointly for I1 and I3 (shared by O100 and O200)
+relate("E6", "I1", "stock_subject")
+relate("E6", "I3", "stock_subject")
+relate("E6", "O100", "order_scope")
+relate("E6", "O200", "order_scope")
+
+# E7: Pack Package P1 with I1 and I3 (relates to both Orders)
+relate("E7", "P1", "package_subject")
+relate("E7", "I1", "packaged_item")
+relate("E7", "I3", "packaged_item")
+relate("E7", "O100", "order_scope")
+relate("E7", "O200", "order_scope")
+
+# E8: Pack Package P2 with I2 (O100 only)
+relate("E8", "P2", "package_subject")
+relate("E8", "I2", "packaged_item")
+relate("E8", "O100", "order_scope")
+
+# E9: Dispatch Package P1 in Delivery D1
+relate("E9", "P1", "package_subject")
+relate("E9", "D1", "delivery_subject")
+relate("E9", "O100", "order_scope")
+relate("E9", "O200", "order_scope")
+
+# E10: Dispatch Package P2 in Delivery D2
+relate("E10", "P2", "package_subject")
+relate("E10", "D2", "delivery_subject")
+relate("E10", "O100", "order_scope")
+
+# E11: Issue Invoice V1 for both Orders
+relate("E11", "V1", "invoice_subject")
+relate("E11", "O100", "billed_order")
+relate("E11", "O200", "billed_order")
+
+# E12: Record Payment M1 against V1
+relate("E12", "M1", "payment_subject")
+relate("E12", "V1", "settled_invoice")
+relate("E12", "O100", "order_scope")
+relate("E12", "O200", "order_scope")
+
+# E13: Confirm Delivery D1
+relate("E13", "D1", "delivery_subject")
+relate("E13", "P1", "delivered_package")
+relate("E13", "O100", "delivered_order")
+relate("E13", "O200", "delivered_order")
+
+# E14: Confirm Delivery D2
+relate("E14", "D2", "delivery_subject")
+relate("E14", "P2", "delivered_package")
+relate("E14", "O100", "delivered_order")
+
+# E15: Record Payment M2 against V1
+relate("E15", "M2", "payment_subject")
+relate("E15", "V1", "settled_invoice")
+relate("E15", "O100", "order_scope")
+relate("E15", "O200", "order_scope")
+
+# E16: Close Order O200
+relate("E16", "O200", "closed_order")
+
+# E17: Close Order O100
+relate("E17", "O100", "closed_order")
+
+relations = pd.DataFrame(relations_rows)
+
+
+# 4. Object-to-object relations (O2O) ----------------------------------------
+o2o_data = [
+    # Order contains Item
+    {"ocel:oid": "O100", "ocel:oid_2": "I1", "ocel:qualifier": "contains_item"},
+    {"ocel:oid": "O100", "ocel:oid_2": "I2", "ocel:qualifier": "contains_item"},
+    {"ocel:oid": "O200", "ocel:oid_2": "I3", "ocel:qualifier": "contains_item"},
+    # Package packs Item
+    {"ocel:oid": "P1", "ocel:oid_2": "I1", "ocel:qualifier": "packs_item"},
+    {"ocel:oid": "P1", "ocel:oid_2": "I3", "ocel:qualifier": "packs_item"},
+    {"ocel:oid": "P2", "ocel:oid_2": "I2", "ocel:qualifier": "packs_item"},
+    # Delivery carries Package
+    {"ocel:oid": "D1", "ocel:oid_2": "P1", "ocel:qualifier": "carries_package"},
+    {"ocel:oid": "D2", "ocel:oid_2": "P2", "ocel:qualifier": "carries_package"},
+    # Invoice bills Order
+    {"ocel:oid": "V1", "ocel:oid_2": "O100", "ocel:qualifier": "bills_order"},
+    {"ocel:oid": "V1", "ocel:oid_2": "O200", "ocel:qualifier": "bills_order"},
+    # Payment settles Invoice
+    {"ocel:oid": "M1", "ocel:oid_2": "V1", "ocel:qualifier": "partially_settles_invoice"},
+    {"ocel:oid": "M2", "ocel:oid_2": "V1", "ocel:qualifier": "completes_settlement_of_invoice"},
+]
+o2o = pd.DataFrame(o2o_data)
+
+
+# 5. Data-quality validations -------------------------------------------------
+
+# Unique IDs
+assert events["ocel:eid"].is_unique, "Event IDs must be unique"
+assert objects["ocel:oid"].is_unique, "Object IDs must be unique"
+
+# No orphan event IDs in relations
+orphan_eids = set(relations["ocel:eid"]) - set(events["ocel:eid"])
+assert not orphan_eids, f"Orphan event IDs in relations: {orphan_eids}"
+
+# No orphan object IDs in relations or O2O
+all_object_ids = set(objects["ocel:oid"])
+rel_object_ids = set(relations["ocel:oid"])
+o2o_object_ids = set(o2o["ocel:oid"]).union(set(o2o["ocel:oid_2"]))
+assert rel_object_ids.issubset(all_object_ids), "Relations reference unknown objects"
+assert o2o_object_ids.issubset(all_object_ids), "O2O references unknown objects"
+
+# Activity / timestamp consistency
+event_lookup = events.set_index("ocel:eid")[["ocel:activity", "ocel:timestamp"]]
+merged = relations.merge(
+    event_lookup,
+    left_on="ocel:eid",
+    right_index=True,
+    how="left",
+    suffixes=("", "_event"),
+)
+assert (merged["ocel:activity"] == merged["ocel:activity_event"]).all(), "Activity mismatch between events and relations"
+assert (merged["ocel:timestamp"] == merged["ocel:timestamp_event"]).all(), "Timestamp mismatch between events and relations"
+
+# No duplicate relation rows
+assert not relations.duplicated().any(), "Duplicate rows in relations"
+
+
+# 6. Construct OCEL -----------------------------------------------------------
+# If your PM4Py version uses a different constructor or module for OCEL,
+# adapt this single line and the import at the top; the data model stays the same.
+ocel = OCEL(events=events, objects=objects, relations=relations, o2o=o2o)
+
+
+# 7. Basic OCEL introspection -------------------------------------------------
+print(ocel)
+
+print("Activity frequencies:")
+print(events["ocel:activity"].value_counts())
+
+print("Object-type frequencies:")
+print(objects["ocel:type"].value_counts())
+
+print("OCEL object types from pm4py.ocel_get_object_types:")
+print(pm4py.ocel_get_object_types(ocel))
+
+print("Activities per object type from pm4py.ocel_object_type_activities:")
+print(pm4py.ocel_object_type_activities(ocel))
+
+
+# 8. Flattening and discovery per object type --------------------------------
+flattened_logs = {}
+dfg_results = {}
+log_skeletons = {}
+
+for obj_type in ["order", "package", "delivery", "invoice"]:
+    flat_log = pm4py.ocel_flattening(ocel, obj_type)
+    flattened_logs[obj_type] = flat_log
+
+    dfg, start_acts, end_acts = pm4py.discover_dfg(flat_log)
+    dfg_results[obj_type] = {
+        "dfg": dfg,
+        "start_activities": start_acts,
+        "end_activities": end_acts,
+    }
+
+    log_skeletons[obj_type] = pm4py.discover_log_skeleton(flat_log)
+
+
+# 9. Object-centric discovery -------------------------------------------------
+ocdfg = pm4py.discover_ocdfg(ocel)
+otg = pm4py.discover_otg(ocel)
+etot = pm4py.discover_etot(ocel)
+ocpn, ocpn_im, ocpn_fm = pm4py.discover_oc_petri_net(ocel)
+interactions_summary = pm4py.ocel_objects_interactions_summary(ocel)
+
+
+# 10. Optional visualizations (commented to avoid interactive/network issues) -
+# pm4py.view_ocdfg(ocdfg)
+# pm4py.view_ocpn(ocpn, ocpn_im, ocpn_fm)
+```
+
+
+## 3. Data-model audit
+
+- **Objects by type**
+
+| Object type | Objects              |
+|------------|----------------------|
+| order      | O100, O200           |
+| item       | I1, I2, I3           |
+| package    | P1, P2               |
+| delivery   | D1, D2               |
+| invoice    | V1                   |
+| payment    | M1, M2               |
+
+- **O2O qualifiers and cardinalities**
+
+| O2O qualifier                      | Cardinality | Example                                                |
+|------------------------------------|------------|--------------------------------------------------------|
+| contains_item                      | 3          | O100→I1, O100→I2, O200→I3                             |
+| packs_item                         | 3          | P1→I1, P1→I3, P2→I2                                   |
+| carries_package                    | 2          | D1→P1, D2→P2                                          |
+| bills_order                        | 2          | V1→O100, V1→O200                                      |
+| partially_settles_invoice          | 1          | M1→V1                                                 |
+| completes_settlement_of_invoice    | 1          | M2→V1                                                 |
+
+- **Activities and the object types they touch (via E2O)**
+
+| Activity           | Object types involved                         |
+|--------------------|-----------------------------------------------|
+| Create Order       | order                                         |
+| Add Item to Order  | order, item                                   |
+| Reserve Stock      | order, item                                   |
+| Pack Package       | order, item, package                          |
+| Dispatch Package   | order, package, delivery                      |
+| Issue Invoice      | order, invoice                                |
+| Record Payment     | order, invoice, payment                       |
+| Confirm Delivery   | order, package, delivery                      |
+| Close Order        | order                                         |
+
+- **Consequential relation sets for convergence/divergence**
+
+The most convergence-driving events are:
+- **E6 (Reserve Stock)**: connects Items `I1` and `I3` with both Orders `O100` and `O200`, starting the “joint treatment” of the two Orders.  
+- **E7 (Pack Package P1)** and **E9 (Dispatch Package P1 in D1)**: tie Package `P1` simultaneously to Items `I1`/`I3` and to Orders `O100`/`O200`, and then to Delivery `D1`, so they are key for seeing multi-order packaging and shipment.  
+- **E11 (Issue Invoice V1)** and **E12/E15 (Payments M1/M2)**: connect `V1`, `M1`, `M2` to both `O100` and `O200`, showing shared invoicing and settlement.  
+These events cause strong convergence of different Orders in flattened views and in the OC-DFG, while the separate packing of `P2` and later confirmation of `D2` create divergence between the fates of `O100` and `O200`.
+
+
+## 4. Expected flattened behavior
+
+### Order flattening
+
+- **Approximate trace shape**:  
+  - `O100`: `Create Order` → `Add Item to Order` (twice) → `Reserve Stock` → `Pack Package` (P1, P2) → `Dispatch Package` (P1, P2) → `Issue Invoice` → `Record Payment` (M1) → `Confirm Delivery` (D1) → `Confirm Delivery` (D2) → `Record Payment` (M2) → `Close Order`.  
+  - `O200`: `Create Order` → `Add Item to Order` → `Reserve Stock` → `Pack Package` (P1) → `Dispatch Package` (P1) → `Issue Invoice` → `Record Payment` (M1) → `Confirm Delivery` (D1) → `Record Payment` (M2) → `Close Order`.
+- **Copied shared events**:  
+  `Reserve Stock` (E6), `Pack Package` for `P1` (E7), `Dispatch Package` for `P1` (E9), `Issue Invoice` (E11), both `Record Payment` events (E12, E15), and `Confirm Delivery` for `D1` (E13) all appear in **both** Order traces, because they carry `order_scope` or `billed_order` to both `O100` and `O200`.
+- **Omitted lifecycle aspects**:  
+  Item-level distinctions (I1 vs I3 vs I2) and the fact that P1 mixes Items from two Orders are blurred; the Order-level view does not show which Items went into which Package beyond the presence of Pack/Dispatch events. The internal life of Packages and Deliveries is reduced to Pack/Dispatch/Confirm points without explicit container structure.
+- **Likely DFG edges**:  
+  Dominant edges will include `Create Order → Add Item to Order`, `Add Item to Order → Reserve Stock`, `Reserve Stock → Pack Package`, `Pack Package → Dispatch Package`, `Dispatch Package → Issue Invoice`, `Issue Invoice → Record Payment`, `Record Payment → Confirm Delivery`, and `Confirm Delivery → Close Order`. Some edges may appear with parallelism artifacts, e.g., `Record Payment → Confirm Delivery` and `Confirm Delivery → Record Payment` both possible due to `M2` occurring after `D2`.
+- **Misleading interpretations**:  
+  A naïve analyst might conclude that every Order always shares a Package, a Delivery, and an Invoice with other Orders, or that there is a strict order between payments and deliveries, when in reality those are artifacts of this small example and the joint shipment via `P1`. The DFG may incorrectly suggest that an Order is only “delivered” once, although `O100` is completed via both `D1` (P1) and `D2` (P2).
+
+### Package flattening
+
+- **Approximate trace shape**:  
+  - `P1`: `Pack Package` → `Dispatch Package` → `Confirm Delivery`.  
+  - `P2`: `Pack Package` → `Dispatch Package` → `Confirm Delivery`.  
+  Both traces are short and purely logistical.
+- **Copied shared events**:  
+  Shared events between Orders do **not** duplicate across Packages beyond P1’s own events; P1’s trace merges contributions from `O100` and `O200` into one package-centric sequence, while P2’s trace remains purely about `O100`.
+- **Omitted lifecycle aspects**:  
+  Orders, Items, Invoice `V1`, and Payments `M1`/`M2` are absent at the package level (only implicit via O2O and E2O qualifiers). The fact that `P1` contains `I1` and `I3` is structurally present in O2O but not in the flattened event log unless the flattening algorithm optionally propagates via O2O.
+- **Likely DFG edges**:  
+  DFG for packages will show almost only `Pack Package → Dispatch Package → Confirm Delivery`, with very high confidence. No financial or order-management activities appear, so the control-flow looks “clean” and deterministic.
+- **Misleading interpretations**:  
+  One might infer that logistics are always simple three-step processes and independent of Orders, ignoring that P1 actually serves two Orders. It may also be tempting to think that there is no relation between package handling and invoicing, even though they are coupled through Orders and the Invoice in the OCEL.
+
+### Delivery flattening
+
+- **Approximate trace shape**:  
+  - `D1`: `Dispatch Package` → `Confirm Delivery`.  
+  - `D2`: `Dispatch Package` → `Confirm Delivery`.  
+  Both deliveries look like straightforward two-step flows.
+- **Copied shared events**:  
+  Shared multi-order behavior is completely absorbed into `D1`’s case: it shows a dispatch and a confirmation, but not that P1 (and thus D1) serves both `O100` and `O200`. No event is duplicated across Deliveries because each Delivery has its own events.
+- **Omitted lifecycle aspects**:  
+  The upstream `Pack Package` and `Reserve Stock` events, and all financial events, are missing; deliveries appear disconnected from ordering and invoicing. Also, the distinction between P1 (multi-order) and P2 (single-order) is invisible in the control-flow alone.
+- **Likely DFG edges**:  
+  Simple `Dispatch Package → Confirm Delivery` appears as the dominant (and almost only) edge.
+- **Misleading interpretations**:  
+  An analyst may wrongly conclude that deliveries are always independent single-step shipments that have no notion of partial shipments or multi-order consolidation, whereas P1/D1 in reality consolidates items from `O100` and `O200`.
+
+### Invoice flattening
+
+- **Approximate trace shape**:  
+  Single case for `V1`: `Issue Invoice` → `Record Payment` (M1) → `Record Payment` (M2). The two payments show up in order with their amounts 100 and 150.
+- **Copied shared events**:  
+  The same `Record Payment` events that appear in both Order traces are seen only once in the Invoice trace (they are not duplicated, because there is only one Invoice object). The shared billing of `O100` and `O200` is implicit in qualifiers and O2O, but not split into separate invoice cases.
+- **Omitted lifecycle aspects**:  
+  Logistics and order-creation events are missing; the Invoice trace does not show when the stock was reserved or when deliveries were confirmed. There is also no explicit “Invoice closed” event; completion is inferred from Payment coverage.
+- **Likely DFG edges**:  
+  `Issue Invoice → Record Payment` and `Record Payment → Record Payment` are the main edges, highlighting partial settlement followed by completion.
+- **Misleading interpretations**:  
+  A flattened Invoice log might suggest that invoices are processed entirely independently of shipments and orders, and that every invoice always has exactly two payments (because this is the only example). It hides how `V1` aggregates revenue from both `O100` and `O200`.
+
+### Why flattening on Payment would be particularly weak
+
+- **Extremely short traces**:  
+  Each Payment object (`M1`, `M2`) participates in exactly one event (`Record Payment`), so a Payment-based flattened log degenerates into trivial one-activity traces with almost no control-flow information.
+- **Ambiguous allocation across Orders**:  
+  Both Payments partially/fully settle `V1`, which itself bills `O100` and `O200`. In a Payment-centric view, it is unclear how much of each payment is allocated to each Order; the shared context is only visible via O2O and E2O qualifiers, not as distinct flow segments.
+- **Loss of temporal rich context**:  
+  Payment traces do not show when items were shipped or when orders were closed. They cannot distinguish whether a payment preceded or followed certain logistics milestones for a given Order without re-joining to Orders or Invoices.
+- **Misleading interpretations**:  
+  An analyst might incorrectly conclude that Payments are standalone events with no meaningful process structure, underestimating their role in connecting the financial and logistics sides of the OCEL. Only object-centric views and order/invoice flattenings recover the coupling between `M1`, `M2`, `V1`, `O100`, and `O200`.
+
+
+## 5. Expected object-centric structures
+
+- **OC-DFG (object-centric directly-follows graph)**:  
+  - Should show a “spine” of activities from order initiation through logistics to finance: `Create Order → Add Item to Order → Reserve Stock → Pack Package → Dispatch Package → Confirm Delivery → Close Order`, and a financial branch `Issue Invoice → Record Payment`.  
+  - Because P1 and `V1` connect `O100` and `O200`, there will be multi-object arcs where `Reserve Stock`, `Pack Package`, `Dispatch Package`, `Issue Invoice`, and `Record Payment` appear as joint activities for multiple Orders and Items.  
+  - `M1` and `M2` should appear as repeated `Record Payment` nodes associated with `V1`, clarifying that the invoice is partially settled and then fully settled rather than paid once.
+
+- **OTG (object type graph)**:  
+  - Expect a dense hub around `order`, connected to `item` (via `contains_item`), `package` (via shared events and `packs_item`), `delivery` (via `carries_package`), `invoice` (via `bills_order`), and `payment` (via invoice settlement).  
+  - `package` and `delivery` will form a tight logistics subgraph, with `package` also linking back to `item`. `invoice` and `payment` form the financial subgraph.  
+  - OTG should highlight that `package` type, especially `P1`, is a key intermediary between `order` and `delivery`, while `invoice` (`V1`) is the key intermediary between `order` and `payment` (`M1`, `M2`).
+
+- **ET–OT (event-type–object-type graph)**:  
+  - For each activity, the ET–OT will show which object types it touches; for example, `Pack Package` connected to `order`, `item`, and `package`; `Record Payment` to `order`, `invoice`, and `payment`; `Confirm Delivery` to `order`, `package`, and `delivery`.  
+  - This reveals that logistics events are multi-typed (orders, packages, deliveries) while financial events are also multi-typed (orders, invoice, payments), with `V1`, `M1`, `M2`, `O100`, and `O200` forming clear three-way intersections in ET–OT.  
+  - The model will emphasize that `Create Order` and `Close Order` are pure `order` events, while `Reserve Stock` and `Pack Package` bridge `order` and `item`, especially via P1 and its mixed contents.
+
+- **Object-centric Petri net (OC-PN)**:  
+  - The discovered OC-PN should separate logistics and financial subnets but couple them through shared `order` and `invoice` places. Orders `O100` and `O200` will flow from creation through packing and delivery, while `V1` flows from invoicing through payments.  
+  - Concurrency is expected: shipping (via `P1`/`P2`, `D1`/`D2`) can proceed partly in parallel with payments (`M1`, `M2`), and `O100` can still be open when `O200` is already closed.  
+  - The presence of P1 as a package containing items from `O100` and `O200` should lead to shared token flows, where transitions related to P1 and `V1` connect multiple order instances. The Petri net will not have a unique business interpretation, but it should clearly exhibit joint shipment and joint invoicing.
+
+- **Object-interactions summary**:  
+  - The summary should show that P1 has strong interaction counts with `O100`, `O200`, `I1`, `I3`, and `D1`, while P2 mostly interacts with `O100`, `I2`, and `D2`.  
+  - `V1` will show high interaction counts with `O100`, `O200`, `M1`, and `M2`, reflecting that the invoice aggregates both Orders and is settled in two steps.  
+  - For Orders, `O100` will interact with both Deliveries (`D1`, `D2`) and all three Items (`I1`, `I2`, `I3` indirectly through P1), whereas `O200` interacts only with P1, D1, and its single Item `I3`. This contrast is central for understanding how multi-order packaging and invoicing behave in the OCEL.
+
+
+## 6. Modeling alternatives
+
+- **Alternative 1 – Source-minimal E2O relations**:  
+  - Policy: Only link events to the objects that are their primary “system-of-record” entities (e.g., `Reserve Stock` only to Items, `Pack Package` only to Packages and Items, `Dispatch Package` only to Packages and Deliveries, `Issue Invoice` only to `V1`, `Record Payment` only to `M*` and `V1`), and avoid direct `order_scope` links in E2O.  
+  - Effect: Order-based flattening would become much sparser and would need O2O propagation to reconstruct flows; Orders would mostly show creation, line-item additions, and closure. OC-DFG and OTG would still encode the same business story (P1 and V1 connecting `O100` and `O200`), but the paths between order-level states would be seen mainly via object-type transitions rather than direct order-centric traces.
+
+- **Alternative 2 – Full operational involvement of Orders and Items**:  
+  - Policy: Attach Orders (and possibly Items) as E2O participants to **all** downstream events that can be attributed to them, including every pack, dispatch, delivery confirmation, invoicing, and payment.  
+  - Effect: Order-flattened logs would become very rich, with long traces that include all logistics and financial steps, and OC-DFG on the `order` projection would be very close to a traditional end-to-end process model. However, relation inflation would be substantial, and the same event (e.g., P1’s dispatch) would appear in many traces, exaggerating synchronization between Orders and potentially hiding the structural role of P1 and V1 as shared objects.
+
+- **Alternative 3 – O2O-propagated analytical relations only**:  
+  - Policy: Keep E2O relations minimal (as in Alternative 1) and rely on analytic post-processing that, during flattening or querying, propagates events along O2O links (e.g., deriving that Payments M1/M2 affect Orders `O100` and `O200` via `M* → V1 → O*`). Do not materialize these propagated links in `relations`.  
+  - Effect: The discovered OC-DFG, OTG, and ET–OT remain semantically equivalent, since they all can be computed over propagated neighborhoods, but the underlying data model keeps a clear distinction between observed vs inferred links. Flattened logs for Orders, Packages, Deliveries, and Invoices would depend on the propagation policy used at analysis time, making it easier to experiment with different analytical scopes without changing the base OCEL.
+
+
+## 7. Failure modes
+
+- **Relation inflation**:  
+  Adding too many E2O links (e.g., connecting every Payment or Delivery event to every related Item as well as every Order) can massively increase the size of `relations`, causing OC-DFG and flattenings to show artificially dense behavior where nearly all activities seem connected to all object types. In this scenario, over-linking `M1` and `M2` directly to all Items of `O100` and `O200` would blur which Items were actually in P1 vs P2.
+
+- **Missing direct E2O links**:  
+  If we omitted direct links such as `billed_order` from `Issue Invoice` or `order_scope` from `Record Payment`, Orders would appear financially disconnected: flattened Order traces might never show payments, even though they should, and OC-DFG could miss important paths between logistics and finance. Similarly, omitting `order_scope` from P1’s packing/dispatch events would hide the fact that P1 connects `O100` and `O200`.
+
+- **Treating O2O propagation as observation**:  
+  If analytically propagated links (e.g., inferring that `M1` relates to `O100` and `O200` via `M1 → V1 → O*`) were written back into `relations` as if they were original observations, later analyses could double-count paths and misinterpret the process as having more explicit integration than it really does. For example, combining propagated and original `order_scope` relations for P1 would exaggerate the evidence for joint shipment of `O100` and `O200`.
+
+- **Duplicate shared events after flattening**:  
+  When an event legitimately belongs to multiple objects of the same type (e.g., E6, E7, E9, E11, E12, E13 all shared by `O100` and `O200`), careless flattening or aggregation can mistakenly create duplicate rows for the same event–case combination or fail to distinguish which duplicates are expected. This may distort frequencies and DFG probabilities, making it appear that some steps occur more often than they actually do.
+
+- **Ambiguous payment allocation**:  
+  `M1` and `M2` jointly settle `V1`, which bills both `O100` and `O200`. Without additional attributes (e.g., split ratios) or a clear policy, analysts may misallocate payment amounts to Orders, leading to incorrect revenue or margin calculations per Order. If one naively splits amounts 50/50, the business story is unchanged but performance analysis becomes numerically wrong.
+
+- **Overly short Payment traces**:  
+  As noted, Payment-based flattenings produce traces with a single `Record Payment` activity per Payment. If analysts rely on Payment logs alone, they may conclude that the payment process is trivial and lacks meaningful variants, ignoring the context of when shipments occurred or when Orders were closed relative to `M1` and `M2`.
+
+- **Constructor/API version mismatch**:  
+  If the actual PM4Py version exposes OCEL construction through a different API (e.g., `pm4py.read_ocel` or `pm4py.objects.ocel.obj.OCEL`), using `OCEL(events=..., objects=..., relations=..., o2o=...)` as written may fail, even though the DataFrames are semantically correct. This can be misdiagnosed as a data-quality issue rather than an API difference unless the constructor line is clearly isolated and documented.
+
+- **False total order for same-time events**:  
+  Even though this example has no exact-tie timestamps, in real logs events might share timestamps; if the OCEL implementation or flattening algorithm imposes an arbitrary ordering (e.g., by event ID sort) and analysts overinterpret that as a true temporal precedence, they can infer bogus causal relations. The risk is conceptually present here: if Reserve, Pack, and Invoice times were identical, the tooling might still show a sequence that does not reflect actual causality.
+
+
+## 8. Final semantic checks
+
+The following assertions can be manually inspected in the constructed DataFrames to validate alignment with the narrative:
+
+1. **Object inventory**: The `objects` table lists exactly 2 Orders (`O100`, `O200`), 3 Items (`I1`, `I2`, `I3`), 2 Packages (`P1`, `P2`), 2 Deliveries (`D1`, `D2`), 1 Invoice (`V1`), and 2 Payments (`M1`, `M2`), with matching `ocel:type` values.  
+2. **Order–Item containment**: In `o2o`, the qualifier `contains_item` appears three times and only for the pairs (O100, I1), (O100, I2), and (O200, I3), exactly matching the textual description of which Items belong to which Orders.  
+3. **Joint package P1**: For event E7 (`Pack Package`), `relations` shows links to `P1` (`package_subject`), to `I1` and `I3` (`packaged_item`), and to both `O100` and `O200` (`order_scope`), confirming that P1 combines Items from two Orders.  
+4. **Separate package P2**: `o2o` and `relations` together show that P2 only packs `I2` and is only connected via E8/E10/E14 to `O100` (never to `O200`), reflecting that O200 does not use P2.  
+5. **Invoice and payments**: `o2o` includes exactly two `bills_order` rows `V1→O100` and `V1→O200`, and two settlement rows `M1→V1` (`partially_settles_invoice`) and `M2→V1` (`completes_settlement_of_invoice`); in `events`, E12 has `amount=100` and E15 has `amount=150`, matching the narrative payments.  
+6. **Order closures and deliveries**: `relations` shows that `E16` with activity `Close Order` links only to `O200` (`closed_order`), and `E17` only to `O100` (`closed_order`); furthermore, `E13` (`Confirm Delivery` for `D1`) has `delivered_order` links to both `O100` and `O200`, while `E14` (`Confirm Delivery` for `D2`) has `delivered_order` only to `O100`, confirming that `O200` is fully delivered via `D1` whereas `O100` is delivered via both `D1` and `D2`.  
+7. **No orphaned or inconsistent relations**: Checks for orphaned IDs, mismatched activities/timestamps between `events` and `relations`, and duplicate relation rows all pass, indicating that every relation row corresponds exactly to one of the 17 events and one of the defined objects without contradictions.
+

@@ -1,0 +1,569 @@
+## 1. Target definition
+
+The business request is "an early warning model predicting 90‑day default from the first few events of every credit application". Because default is only defined for activated accounts and labels are selectively available, I adopt as the **primary target**:
+
+- **Target event**: occurrence of `default_90d = 1`, i.e. a default within 90 days after `Account Activated`, among accounts that are eventually activated.
+- **Prediction time**: an "early underwriting" landmark defined per case as the first completion of `Credit Review`. If a case has not yet reached `Credit Review` by two calendar days after `Application Started`, prediction is made at `Application Started + 2 days` using whatever events are available up to that time.
+- **Horizon**: 90 days after `Account Activated`. A label is considered mature when its external outcome feed has arrived, i.e. when `label_available_at` is not missing and `label_available_at <= data_extract_time`.
+- **Unit of analysis**: a single credit application case (`case:concept:name`), possibly linked across platforms when a transfer can be matched via the linkage table.
+- **Population**: all applications started between 1 January 2024 and 31 December 2025 that (under the actually implemented 2024–2025 policies) eventually reach `Account Activated` on any platform and for which the 90‑day outcome has matured by the chosen analysis cut‑off.
+- **Estimand**: for a new application that would be activated under current policy, the conditional probability  
+  \( \Pr(\text{default within 90 days after activation} \mid \text{observed prefix up to prediction time},\ \text{eventual activation}) \).
+
+Operationally, this answers: *“Given how this application is behaving in its first few steps, and assuming we will in fact activate it, what is the probability it will default in the first 90 days of the account?”* It deliberately **does not** attempt to answer the counterfactual *“what if we activated everyone, including today's rejects and withdrawals”*, which the data cannot support without strong untestable assumptions.
+
+### Alternative target 1 – multi‑state application outcome
+
+An alternative is a **multi‑state competing‑outcome target** from application start, with mutually exclusive outcomes within a fixed follow‑up window (e.g. 180 days after application start):
+
+- Activated & no default within 90 days of activation (with mature outcome feed).
+- Activated & default within 90 days.
+- Rejected (never activated).
+- Withdrawn by applicant (never activated).
+- Transferred to partner/specialist (with or without follow‑up available).
+- Still open / not yet decided / activation or outcome not yet mature.
+
+This answers a broader business question: *“Given the early prefix, what is the probability this application will end up in each lifecycle state under current policy?”* It is useful for policy analysis and capacity planning but mixes process outcomes (reject/withdraw/transfer) with credit risk conditional on activation.
+
+### Alternative target 2 – time to default after activation
+
+A second alternative is a **time‑to‑event target** for activated accounts: time from `Account Activated` to first default, with right censoring at the minimum of (a) last available follow‑up, (b) account closure, or (c) extraction date. This would be modelled with survival or competing‑risk methods and could estimate the entire default hazard curve over time, not just the 90‑day probability. It uses similar data but answers a different question: *“how quickly and with what hazard do activated accounts default?”* rather than a fixed‑horizon binary event.
+
+---
+
+## 2. Cohort construction
+
+### Inclusion, exclusion, and as‑of rules
+
+- **Inclusion window (case start)**: all applications with `Application Started` between 1 January 2024 and 31 December 2025.
+- **Event window**: all events for these cases up to the global data extraction time `2026‑02‑15 00:00` (truncating any later events if present).
+- **Eligible for primary labeled set**:
+  - Case has an `Account Activated` event (`activation_time` defined).
+  - `default_90d` and `label_available_at` are non‑missing on at least one event.
+  - `label_available_at <= data_extract_time` (label matured by 15 February 2026).
+- **Right‑censored with respect to primary target**:
+  - Activated accounts where the 90‑day window extends beyond extraction or where the external feed has not yet arrived (the 3,600 activated but unlabeled cases).
+- **Competing outcomes / undefined target under activation**:
+  - Rejected, withdrawn, transferred, and still‑open applications are **kept in the process cohort** for descriptive and alternative‑target analyses but **excluded from the primary activated‑only target**, because 90‑day default under activation is undefined for them.
+- **Transfers**:
+  - For ~60% of transferred cases with a linkage, the downstream case(s) are identified. Those downstream cases may produce activated accounts that enter the primary target population.
+  - Unlinked transfers (remaining ~40%) are treated as a **competing event / source of missing follow‑up**, not as non‑default.
+- **Partner‑originated activated accounts with permanently missing feeds**:
+  - Identified using `source_system` plus `activation_time` older than the maximum plausible maturity (90+35 days before extraction) but with `label_available_at` missing.
+  - These are flagged as **permanently missing outcome** and excluded from the labeled primary set but retained for sensitivity analyses.
+
+### Cohort‑flow table (48,000 applications)
+
+All counts are taken from the provided snapshot and are mutually exclusive by row.
+
+| Category (as of 15 Feb 2026) | Count | Role for 90‑day‑default‑after‑activation target | Status label |
+| --- | ---: | --- | --- |
+| All applications started 2024–2025 | 48,000 | Base cohort | — |
+| Activated accounts, 90‑day outcome matured and feed arrived (`default_90d` known; 2,700 default / 18,900 non‑default) | 21,600 | **Primary labeled analysis set** | Labeled |
+| Activated accounts, 90‑day window and/or external feed not yet mature | 3,600 | Excluded from primary analysis; used as right‑censored / delayed‑label cases in sensitivity analyses | Right‑censored / delayed label |
+| Rejected applications (never activated) | 9,100 | Included only in multi‑state/competing‑outcome analyses; target under activation undefined | Competing outcome (Reject) |
+| Withdrawn applications (never activated) | 5,700 | Included only in multi‑state/competing‑outcome analyses; default under activation undefined | Competing outcome (Withdraw) |
+| Transferred applications (never activated on source platform) | 2,900 | 60% with linkage: followed on new platform; 40% unlinked: treated as loss to follow‑up | Competing outcome / selectively unobserved |
+| Still‑open applications (no final decision yet) | 5,100 | May later become activated or closed; at snapshot they are not eligible for primary target | Not yet mature / right‑censored for activation |
+| Activated accounts with permanently missing outcome feeds (subset of activated; especially partner‑originated) | ⩾0, unknown subset of 25,200 activated | Excluded from primary labeled set; included as separate stratum in sensitivity analyses | Permanently missing outcome / selectively unobserved |
+
+In the **primary analysis**, the modeling dataset is restricted to the 21,600 activated and label‑matured accounts. All 48,000 cases remain in the event log used for process discovery, prefix extraction, cohort monitoring, and competing‑risk sensitivity analyses.
+
+---
+
+## 3. Censoring and missing‑label strategy
+
+### Distinct mechanisms
+
+- **Ordinary right censoring**:
+  - Activated accounts where the 90‑day window extends beyond extraction or where the external feed has not yet arrived (the 3,600 activated but unlabeled cases).
+  - Still‑open applications that may later be activated or closed.
+- **Delayed labels**:
+  - For labeled activated accounts, the true event (`default_90d`) is determined by 90‑day behavior after activation, but the label becomes available only at `label_available_at`, 7–35 days later.
+  - We therefore only trust labels where `label_available_at <= analysis_cutoff` and **use `label_available_at` to define which cases are eligible at each modeling time**, not as a feature.
+- **Selection through activation**:
+  - Activation is a **policy decision** based on `risk_score`, requested amount, channel, region, and underwriter judgement. Default is observed **only** for activated accounts. The primary estimand is therefore conditional on eventual activation; it does not attempt to recover default risk for rejected or withdrawn applications.
+- **Transfer as competing event / missing follow‑up**:
+  - Transfers change the responsible platform. For the 60% of transfers with a linkage, we can continue following the customer and potentially observe activation and default elsewhere.
+  - For unlinked transfers, we treat transfer as a **competing process outcome** and subsequent default as **missing follow‑up** from the perspective of the source platform. They are not counted as non‑default.
+- **Permanently missing outcome feeds**:
+  - Some partner‑originated activated accounts never receive an outcome feed. Even if enough time has passed for the 90‑day window and feed delay, `label_available_at` remains missing. This missingness is plausibly **informative** because it depends on `source_system` and integration quality.
+
+### Primary analysis strategy
+
+The primary strategy is a **binary classification analysis among activated, label‑matured accounts**, with an explicit as‑of perspective:
+
+1. **Case eligibility at a reference date \(T\)**:
+   - Case has `activation_time` and `label_available_at`.
+   - `label_available_at <= T`.
+   - `activation_time <= T - 90 days` (so the 90‑day window completed before label arrival).
+   - Case is not flagged as having a permanently missing feed.
+2. **Label definition**:
+   - `Y = 1` if `default_90d = 1` for that case.
+   - `Y = 0` if `default_90d = 0` and criteria above are met.
+3. **Features**:
+   - Derived only from events and attributes observable up to the prediction time for each case (Section 4 and 5), excluding any post‑activation / post‑default leakage.
+4. **Modeling**:
+   - Fit probabilistic classifiers (e.g., gradient boosting, random forest, or logistic regression) to estimate \( \Pr(Y=1 \mid X, \text{eventual activation}) \).
+   - Include calendar and policy‑regime indicators (pre/post 1 July 2025, pre/post 15 October 2025) as features to absorb systematic shifts.
+
+Under this strategy, **ordinary right censoring** (recent activations without matured labels and still‑open applications) simply means those cases are **not yet eligible** for training or evaluation. They still appear in monitoring and backtesting as "future data".
+
+Key assumptions for validity:
+
+- Conditional on observables used in the model, **label maturity** and ordinary censoring do not depend on the unobserved default outcome (i.e., independent censoring given features and time).
+- Activated accounts with permanently missing feeds differ from labeled ones along measured dimensions such as `source_system`, which we can stratify on in sensitivity analyses.
+
+### Sensitivity analyses
+
+1. **Outcome‑missingness sensitivity (partner feeds and unlinked transfers)**:
+   - Define strata where outcome missingness is concentrated (e.g., `source_system = partner_platform`, transferred and unlinked).
+   - For each stratum, re‑estimate performance metrics under **bounds**:
+     - Best case: treat all permanently missing outcomes as non‑defaults.
+     - Worst case: treat them all as defaults.
+     - Intermediate: impute outcome using a model trained on similar but labeled cases.
+   - Compare overall and subgroup calibration and AUC across these assumptions to assess robustness.
+2. **Activation‑selection sensitivity (policy‑specific counterfactual)**:
+   - Fit a separate model for the **probability of activation** given early‑prefix features.
+   - Use inverse‑probability weighting or g‑computation to approximate what default risk would look like under a different activation propensity (e.g., activating some marginal rejects), clearly labelling this as a **policy‑dependent, untestable counterfactual**.
+   - Contrast predictions from the standard conditional‑on‑activation model with those under hypothetical activation policies.
+
+### Testable vs untestable assumptions
+
+- **Partially testable**:
+  - Relationship between features and label maturity: we can check whether censoring patterns (`label_available_at` missing or late) differ by channel, region, or risk bands.
+  - Impact of policy and migration changes: compare calibration and feature distributions pre/post 1 July 2025 and pre/post 15 October 2025.
+- **Fundamentally untestable from these data**:
+  - What defaults would have been observed if rejected/withdrawn/never‑activated applications had instead been activated.
+  - Whether permanent outcome missingness (e.g., partner feeds) is independent of unobserved default, even after conditioning on observed features and `source_system`.
+
+These untestable aspects are explicitly excluded from the primary estimand and handled only via labelled sensitivity analysis.
+
+---
+
+## 4. Prefix extraction
+
+### General principles
+
+- Prefixes must reflect **only information available at the prediction time** for each case.
+- Event and attribute data after the chosen prediction time (including `Contract Signed`, `Account Activated`, collections events, and any snapshots updated later in the day) are **excluded** from feature construction.
+- Two families of prefixes are considered:
+  - **Fixed event‑count prefixes** (e.g., first 3 or first 5 events).
+  - **Elapsed‑time prefixes** (e.g., all events within 48 hours of `Application Started`).
+
+### Concrete prefix rules
+
+1. **Per‑case prediction time**:
+   - Primary definition: first event where `concept:name = "Credit Review"`.
+   - Fallback: if no `Credit Review` has occurred by `Application Started + 2 days`, set prediction time to `Application Started + 2 days`.
+   - All prefix events satisfy `time:timestamp <= prediction_time`.
+2. **Fixed event‑count prefixes**:
+   - After truncating by prediction time, order events by `time:timestamp` and an internal sequence.
+   - For training and evaluation, we primarily use a single prefix per case:
+     - If the truncated case has at least **5** events, take the prefix of length 5.
+     - Otherwise, use the **full truncated trace** (short cases).
+   - `pm4py.get_prefixes_from_log` is used to generate prefixes of all lengths for inspection and potential future work, but the primary model uses the fixed‑length representation.
+3. **Elapsed‑time prefixes**:
+   - For time‑based analysis, define a window (e.g., 48 hours after `Application Started`).
+   - Keep events with `time:timestamp <= ApplicationStarted + 48 hours` and `time:timestamp <= prediction_time` (to preserve the earlier landmark constraint).
+   - This design supports sensitivity checks on how much early information is sufficient.
+
+### Handling short cases, loops, and activity renaming
+
+- **Short cases**:
+  - If a case has fewer events than the target prefix length, we keep its entire truncated trace.
+  - Feature engineering uses counts, durations, and indicator variables that are well‑defined even for very short traces (e.g., number of KYC checks, total elapsed time).
+- **Document loops and rework**:
+  - Repeated sequences such as `Credit Review → Request Documents → Credit Review` are preserved in the event log.
+  - Prefix features include:
+    - Number of returns to `Credit Review`.
+    - Number and total duration of `Request Documents` segments.
+    - Time spent waiting between document requests and reviews.
+- **Activity renaming and duplicate events (post‑15 October 2025)**:
+  - Apply a **mapping table** that collapses old and new activity names to a canonical set before prefix generation (e.g., mapping `KYC Check` and `Identity Verification` to a single activity).
+  - Remove exact duplicate events produced by migration (same case, activity, timestamp, and resource), keeping the earliest occurrence.
+  - This ensures that control‑flow features are comparable across the migration boundary and that prefixes are not artificially lengthened by duplicates.
+
+---
+
+## 5. Process‑aware features
+
+All features are constructed **as of the per‑case prediction time**, using only events with `time:timestamp <= prediction_time` and attributes whose values would have been known then.
+
+### Static case attributes (known at application start)
+
+- `case:channel` (e.g., online, branch, partner).
+- `case:region`.
+- `case:requested_amount` (and simple transforms such as log amount and requested‑amount bands).
+- Initial `risk_score` at or immediately after `Application Started`.
+- `source_system` (e.g., in‑house vs partner platforms).
+- Calendar features:
+  - Application start date, month, and day‑of‑week.
+  - Indicators for **policy regime** (pre/post 1 July 2025) and **system regime** (pre/post 15 October 2025), based on `Application Started`.
+
+### Prefix‑derived dynamic features
+
+From the truncated prefix per case:
+
+- **Control‑flow features**:
+  - Count of distinct activities seen so far.
+  - Whether KYC has been completed yet.
+  - Number of times the case has returned to `Credit Review`.
+  - Variant or pattern identifier using `pm4py.get_variants` and `pm4py.discover_dfg` on the prefix log (e.g., mapping common variants to categorical features).
+- **Timing features**:
+  - Time from `Application Started` to prediction time.
+  - Time from `Application Started` to first `Identity/KYC Check`.
+  - Mean and maximum inter‑event time.
+  - Waiting times computed by `pm4py.insert_case_service_waiting_time`, aggregated per case.
+- **Resource / workload features** (carefully time‑aligned):
+  - For each event, `org:resource`.
+  - Historical working load of the resource (e.g., number of active cases the same day) computed from past data only.
+  - Prior case volume and default rate for the resource’s team (from historical labeled data, excluding the current case).
+- **Risk‑score dynamics**:
+  - Latest `risk_score` before prediction time.
+  - Change between initial and latest `risk_score`.
+  - Number of risk‑score updates.
+
+### Features requiring historical reference data
+
+The following features are computed using **historical cases strictly prior to the current case’s prediction time**, to avoid target leakage:
+
+- Channel‑level and region‑level default rates among activated accounts.
+- Historical default rate bands conditional on `risk_score` deciles.
+- Prior activation rates (probability that an application is ultimately activated) by channel/region/time‑of‑year.
+- Typical processing time distributions between `Application Started`, `Identity/KYC Check`, and `Credit Review` to flag unusually slow or fast cases.
+
+These historical summaries are refreshed only using data whose `label_available_at` and event times precede the analysis cutoff, ensuring they would have been known in a real‑time deployment.
+
+---
+
+## 6. Leakage audit
+
+`Feature or data element | Leakage or bias risk | Valid availability rule | Keep/repair/drop | Rationale`
+
+- `final_limit | Determined only after a final credit decision; strongly correlated with activation and risk judgement. | May be used only in analyses where prediction time is *after* the final decision; for early‑warning use, treat as unknown. | Drop for this early‑prefix model. | Using `final_limit` when predicting from early events would leak the underwriter’s final decision and implicitly encode activation selection.`
+- `decision_reason | Recorded at or after Accept/Reject; directly describes underwriting judgement. | Not available at early prediction time by design. | Drop. | Including decision reasons would collapse the model to reproducing past decisions instead of learning from early process behavior.`
+- `collection_status | Updated after activation; may explicitly encode whether default has already occurred. | Can be used only for label construction (e.g., confirming default events), never as a predictor. | Drop as feature; keep only in label‑engineering code. | This field can carry direct outcome information (e.g., “in collections”, “charged off”), which would trivially leak the target.`
+- `Future events (Contract Signed, Account Activated, Collections Contact, Default Recorded, any event after prediction_time) | Occur chronologically after the intended prediction point; many are part of the outcome or strongly correlated with it. | Exclude all events with `time:timestamp > prediction_time` for each case when building features. | Drop post‑prefix events from feature table. | Using any information from future events violates the as‑of principle and would overstate performance.`
+- `documents_total | Nightly snapshot can include documents uploaded later on the same calendar day as the nominal prediction time. | Either lag by at least one day (use previous midnight’s snapshot) or treat as unavailable at prediction time. | Prefer repair (lag) or otherwise drop. | Without lagging, `documents_total` can reflect same‑day uploads that happened *after* prediction, creating subtle intra‑day look‑ahead.`
+- `risk_score (updated over time) | Later updates may incorporate downstream information not yet visible at early prefixes. | Use only the values of `risk_score` observed at or before prediction_time, and summarize per case (initial, latest, number of updates). | Keep with repair. | Risk scores are legitimate predictors when restricted to their historical trajectory; using post‑prediction updates would leak underwriter actions and late information.`
+- `Resource experience (stored at extraction time) | Captures the employee’s tenure as of extraction, not at historical event time; overestimates past experience and partially encodes future employment history. | Reconstruct approximate experience from historical logs (first seen event date for each resource) relative to the event time or omit. | Repair if feasible; otherwise drop as feature. | Naively using extraction‑time experience would treat future tenure as if known in the past, biasing comparisons across time.`
+- `label_available_at | Directly tied to follow‑up duration and data‑pipeline behavior; highly correlated with case age and possibly with default or source system. | Use only for eligibility filters and censoring/coverage diagnostics, never as a predictive feature. | Drop as feature; keep for selection logic. | Including this timestamp in the model would unfairly advantage older cases and allow the model to exploit label‑maturity mechanisms.`
+- `data_extract_time | Constant or nearly constant within the snapshot; mainly encodes “how old” a case can be. | May be used only to enforce maturity windows, not as a predictor. | Drop as feature. | Its role is purely technical for snapshot timing, not a customer attribute.`
+- `source_system (for partner platforms) | Correlated with both default behavior and probability of permanent feed missingness. | May be used as a predictor and for stratified diagnostics, but not to infer labels. | Keep. | This field is important for identifying heterogeneity and missing‑data mechanisms; it is not inherently a leakage if used appropriately.`
+
+The implementation skeleton (Section 9) will include an automated check that none of the “drop” columns are present in the final feature set.
+
+---
+
+## 7. Validation design
+
+### Temporal splitting and label maturity
+
+Because both policy and logging changed over time, and labels mature with delay, validation must respect **calendar time**:
+
+1. **Define a label‑maturity cutoff** for training data, e.g.  
+   \( T_\text{train,end} = \text{2025‑10‑13} \approx \text{2026‑02‑15} - (90 + 35) \) days.  
+   Only activated accounts with `label_available_at <= 2025‑10‑13` enter the training set.
+2. **Train / validation / test splits by application start**:
+   - **Training**: applications started from 1 Jan 2024 up to 30 Jun 2025 (mostly pre‑policy‑change), with labels matured by `T_train,end`.
+   - **Validation (“policy‑changed”)**: applications started from 1 Jul 2025 to 14 Oct 2025 (after policy change, before system migration), with label maturity enforced separately.
+   - **Test (“post‑migration”)**: applications started from 15 Oct 2025 to 31 Dec 2025 (after system migration), again restricted to cases whose labels can mature by the extraction date.
+3. **Rolling‑origin backtesting**:
+   - Repeat the procedure for multiple cut dates \(T_1, T_2, \dots\) to emulate training on earlier data and forecasting a subsequent 3–6 month window, always lagging the training window by the maximum label delay (125 days).
+   - This produces a series of backtests covering different seasons, channels, and policy regimes.
+
+Random case splits are **misleading** here because:
+
+- They mix pre‑ and post‑policy‑change and pre‑ and post‑migration cases in both train and test, allowing the model to “see the future”.
+- They distort the censoring pattern: older cases are more likely to have matured labels, so a random split conditional on label availability implicitly conditions on case age.
+- They hide distribution shifts in channel mix, requested amount, and process behavior that the model will face in true prospective deployment.
+
+### Calibration, subgroup performance, and metrics
+
+For the activated‑only binary target with censoring handled via eligibility filters:
+
+- **Primary discrimination metrics**:
+  - ROC‑AUC and PR‑AUC on the activated, label‑matured test set.
+- **Calibration metrics**:
+  - Brier score.
+  - Calibration curves and expected/observed default rates across deciles of predicted risk.
+- **Subgroup performance**:
+  - AUC, Brier score, and calibration by:
+    - `case:channel`, `case:region`, and `source_system`.
+    - Risk‑score bands.
+    - Pre‑ vs post‑policy‑change and pre‑ vs post‑migration periods.
+- **Drift monitoring**:
+  - Compare feature distributions (e.g., via PSI or KS statistics) between training and later periods.
+  - Track base default rates and activation rates over time to detect shifts that may require model recalibration or retraining.
+
+For the alternative time‑to‑event formulation, appropriate metrics would also include the concordance index (C‑index) and time‑dependent Brier scores, but those models are connected later and not implemented directly in the skeleton.
+
+---
+
+## 8. Limitations and decision‑use boundary
+
+- The primary model estimates **default risk conditional on eventual activation under the historical 2024–2025 policy**. It does **not** estimate what would happen if policy changed to activate all applicants or a very different subset.
+- The study relies on the assumption that **right censoring and delayed labels are ignorable** given observed features and time; violations (e.g., systematic loss of follow‑up for high‑risk partner accounts) can bias estimates.
+- Transfers without linkage and partner‑originated accounts with permanently missing feeds remain a source of **non‑ignorable missing data**, only partially addressed by sensitivity analyses.
+- Because we do not assign non‑defaults to rejected, withdrawn, or still‑open cases, we cannot make statements about **overall portfolio‑level default under hypothetical activation policies**, only about risk among accounts we actually activate.
+- Deployment could materially change the data‑generating process in several ways:
+  1. **Activation decisions**: underwriters may change which applications they activate in response to the model, altering the conditional distribution of features among activated accounts (selection shift).
+  2. **Process behavior**: knowing that early process patterns feed a model may change how documents are requested or how quickly KYC is completed, changing prefix distributions.
+  3. **Channel and partner mix**: success or failure of the model may drive more traffic to certain channels or partners, altering `source_system`, label‑missingness mechanisms, and base rates.
+  4. **Collections strategy**: early‑warning use may trigger earlier collections actions, which in turn may change what counts as a “default” event in the feed.
+- For these reasons, the model should be used as a **decision‑support tool** to prioritize reviews or adjust limits for accounts likely to be activated, not as an automated gatekeeper for granting or denying credit without ongoing monitoring and governance.
+
+---
+
+## 9. PM4Py‑oriented Python implementation skeleton
+
+```python
+import pandas as pd
+from datetime import timedelta
+import pm4py
+
+# Configuration
+CSV_PATH = "applications_events.csv"
+AS_OF_DATE = pd.Timestamp("2026-02-15")
+HORIZON_DAYS = 90
+MAX_LABEL_DELAY_DAYS = 35
+LABEL_MATURITY_LAG = HORIZON_DAYS + MAX_LABEL_DELAY_DAYS
+PREDICTION_FALLBACK_DAYS = 2
+PREFIX_LENGTH = 5
+
+# 1. Read and format the event log
+df = pd.read_csv(
+    CSV_PATH,
+    parse_dates=["time:timestamp", "label_available_at", "data_extract_time"],
+)
+
+df = pm4py.format_dataframe(
+    df,
+    case_id="case:concept:name",
+    activity_key="concept:name",
+    timestamp_key="time:timestamp",
+)
+
+# Keep only events up to the snapshot as-of date
+df = df[df["time:timestamp"] <= AS_OF_DATE].copy()
+df.sort_values(["case:concept:name", "time:timestamp"], inplace=True)
+
+# 2. Case-level start, activation, terminal, and label maturity information
+case_group = df.groupby("case:concept:name", sort=False)
+
+case_summary = case_group.agg(
+    case_start=("time:timestamp", "min"),
+    case_end=("time:timestamp", "max"),
+).reset_index()
+
+# Terminal event to classify reject/withdraw/transfer/open
+terminal_event = case_group["concept:name"].last().rename("terminal_event")
+case_summary = case_summary.merge(terminal_event, on="case:concept:name", how="left")
+
+# Activation time
+activated = df["concept:name"] == "Account Activated"
+activation_time = (
+    df[activated]
+    .groupby("case:concept:name")["time:timestamp"]
+    .min()
+    .rename("activation_time")
+)
+case_summary = case_summary.merge(activation_time, on="case:concept:name", how="left")
+
+# Case-level default_90d label and label availability
+label_info = case_group[["default_90d", "label_available_at"]].agg(
+    default_90d=("default_90d", "max"),  # assumes 1 > 0 and NaN handled upstream
+    label_available_at=("label_available_at", "max"),
+)
+label_info = label_info.reset_index()
+case_summary = case_summary.merge(label_info, on="case:concept:name", how="left")
+
+# Label maturity and permanent-missing flags for activated accounts
+case_summary["label_matured"] = (
+    case_summary["activation_time"].notna()
+    & case_summary["label_available_at"].notna()
+    & (case_summary["label_available_at"] <= AS_OF_DATE)
+)
+case_summary["possible_to_mature"] = (
+    case_summary["activation_time"].notna()
+    & (case_summary["activation_time"] + timedelta(days=LABEL_MATURITY_LAG) <= AS_OF_DATE)
+)
+case_summary["permanent_missing_outcome"] = (
+    case_summary["activation_time"].notna()
+    & case_summary["possible_to_mature"]
+    & case_summary["label_available_at"].isna()
+)
+
+# Primary binary label among activated, label-matured accounts
+case_summary["y_default90"] = case_summary["default_90d"].where(
+    case_summary["label_matured"]
+)
+
+# Rough outcome-category flags for cohort accounting
+case_summary["is_activated"] = case_summary["activation_time"].notna()
+case_summary["is_rejected"] = case_summary["terminal_event"].eq("Rejected")
+case_summary["is_withdrawn"] = case_summary["terminal_event"].eq("Withdrawn")
+case_summary["is_transferred"] = case_summary["terminal_event"].eq("Transferred")
+case_summary["is_open"] = (
+    ~case_summary[["is_activated", "is_rejected", "is_withdrawn", "is_transferred"]]
+    .any(axis=1)
+)
+
+# 3. Temporal splits by case start (illustrative cut points)
+policy_change_date = pd.Timestamp("2025-07-01")
+migration_date = pd.Timestamp("2025-10-15")
+
+def assign_split(row):
+    start = row["case_start"]
+    if start < policy_change_date:
+        return "train_pre_policy"
+    elif start < migration_date:
+        return "val_post_policy"
+    else:
+        return "test_post_migration"
+
+case_summary["temporal_split"] = case_summary.apply(assign_split, axis=1)
+
+# 4. Per-case prediction times (first Credit Review or fallback)
+first_review = (
+    df[df["concept:name"] == "Credit Review"]
+    .groupby("case:concept:name")["time:timestamp"]
+    .min()
+    .rename("prediction_time")
+)
+case_summary = case_summary.merge(first_review, on="case:concept:name", how="left")
+case_summary["prediction_time"] = case_summary["prediction_time"].fillna(
+    case_summary["case_start"] + timedelta(days=PREDICTION_FALLBACK_DAYS)
+)
+case_summary["prediction_time"] = case_summary["prediction_time"].clip(
+    upper=AS_OF_DATE
+)
+
+# 5. Build the prefix log (events up to prediction_time)
+df = df.merge(
+    case_summary[["case:concept:name", "prediction_time"]],
+    on="case:concept:name",
+    how="left",
+)
+df_prefix = df[df["time:timestamp"] <= df["prediction_time"]].copy()
+
+# Optional: canonize activity names and drop duplicates after migration
+# (implementation of mapping not shown)
+# df_prefix["concept:name"].replace(activity_mapping, inplace=True)
+df_prefix.drop_duplicates(
+    subset=["case:concept:name", "concept:name", "time:timestamp", "org:resource"],
+    inplace=True,
+)
+
+# 6. Create fixed-length prefixes using pm4py
+log_prefix = pm4py.convert_to_event_log(df_prefix)
+prefix_log_k = pm4py.get_prefixes_from_log(
+    log_prefix, max_prefix_length=PREFIX_LENGTH
+)
+
+# 7. Process-aware prefix features
+# Temporal features at event level, then aggregated per case
+df_temporal = pm4py.extract_temporal_features_dataframe(
+    df_prefix,
+    case_id_key="case:concept:name",
+    timestamp_key="time:timestamp",
+)
+df_wait = pm4py.insert_case_service_waiting_time(
+    df_prefix,
+    case_id_key="case:concept:name",
+    timestamp_key="time:timestamp",
+)
+
+# Aggregate prefix features per case
+prefix_group = df_prefix.groupby("case:concept:name")
+prefix_features = prefix_group.agg(
+    n_events=("concept:name", "size"),
+    n_activities=("concept:name", pd.Series.nunique),
+).reset_index()
+
+# Example integration of temporal / waiting-time summaries
+wait_summary = df_wait.groupby("case:concept:name")["case_service_waiting_time"].agg(
+    mean_wait="mean",
+    max_wait="max",
+).reset_index()
+prefix_features = prefix_features.merge(
+    wait_summary, on="case:concept:name", how="left"
+)
+
+# Add static attributes (channel, region, requested_amount, initial and last risk_score)
+static_attrs = prefix_group.agg(
+    channel=("case:channel", "first"),
+    region=("case:region", "first"),
+    requested_amount=("case:requested_amount", "first"),
+    initial_risk_score=("risk_score", "first"),
+    last_risk_score=("risk_score", "last"),
+).reset_index()
+prefix_features = prefix_features.merge(static_attrs, on="case:concept:name", how="left")
+
+# 8. Leakage-audit check on feature set
+risky_columns = {
+    "final_limit",
+    "decision_reason",
+    "collection_status",
+    "documents_total",
+    "label_available_at",
+    "data_extract_time",
+}
+present_risky = risky_columns.intersection(prefix_features.columns)
+if present_risky:
+    raise ValueError(f"Leakage risk: remove columns {present_risky} from features.")
+
+# 9. Combine features with labels and temporal split for modeling
+dataset = prefix_features.merge(
+    case_summary[
+        [
+            "case:concept:name",
+            "y_default90",
+            "label_matured",
+            "permanent_missing_outcome",
+            "temporal_split",
+            "is_activated",
+        ]
+    ],
+    on="case:concept:name",
+    how="left",
+)
+
+# Keep only activated, label-matured accounts with non-missing labels for primary model
+primary_mask = (
+    dataset["is_activated"]
+    & dataset["label_matured"]
+    & ~dataset["permanent_missing_outcome"]
+    & dataset["y_default90"].notna()
+)
+primary_dataset = dataset[primary_mask].copy()
+
+# At this point, primary_dataset can be passed to a classifier.
+# TODO: connect survival / competing-risk modeling on (activation_time, default time, censoring)
+#       using case_summary for time-to-event analyses.
+
+# Basic cohort counts for monitoring
+print("Cohort counts by outcome category:")
+print(
+    case_summary[
+        [
+            "is_activated",
+            "label_matured",
+            "possible_to_mature",
+            "permanent_missing_outcome",
+            "is_rejected",
+            "is_withdrawn",
+            "is_transferred",
+            "is_open",
+        ]
+    ].agg("sum")
+)
+
+print("Primary modeling rows by temporal split:")
+print(primary_dataset["temporal_split"].value_counts())
+```
+
+---
+
+This skeleton focuses on data engineering, cohort definition, prefix construction, leakage auditing, and temporal splitting. A production implementation would add model training, calibration, monitoring dashboards, and governance around policy changes.
