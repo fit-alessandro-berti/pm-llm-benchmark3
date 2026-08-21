@@ -515,6 +515,7 @@ _CLOSED_SOURCE_MODEL_ALIASES = (
     "mimo",
     "muse",
     "inkling",
+    "ox-alpha",
 )
 
 _CLOSED_SOURCE_MODEL_MARKERS = (

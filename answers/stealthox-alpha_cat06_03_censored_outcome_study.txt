@@ -1,0 +1,260 @@
+## 1. Target definition
+
+**Primary target — multi-state / competing-outcome absolute risk (application level).**
+
+- **Unit of analysis:** one credit application (`case:concept:name`).
+- **Prediction time t:** the timestamp of the *k*-th event of the case (primary: k = 3, i.e., shortly after entry into Credit Review; robustness checked at k = 2 and k = 4). All features must be computable strictly from events with timestamp  t.
+- **State space:** transient states (Application Started  KYC  Credit Review  document-request loop) and absorbing states: **R** = Rejected, **W** = Withdrawn, **X** = Transferred out (no linked follow-up), **AD** = Activated and default recorded within 90 days of activation, **AN** = Activated and no default within 90 days.
+- **Target:** the cause-specific cumulative incidence F_D(t, ) = P(case reaches D by time  after t), jointly with the competing CIFs for R, W, X. Because default is structurally impossible without activation, F_D implicitly decomposes as P(activation in du) · P(default within 90 d | activation) — the model reports both the activation propensity and the conditional severity.
+- **Population:** all applications started 20240101 – 20251231 (N = 48,000), under the **as-run policy**.
+- **Estimand:** the policy-dependent absolute risk of the trajectory Start  …  Activated  Default90d, identified by an Aalen–Johansen-type decomposition under non-informative censoring of still-open cases (given history) and under a weighting model for missing outcome feeds.
+
+This is defensible because it (i) uses all 48,000 cases for what they genuinely inform, (ii) never treats "not activated" as "not defaulted," and (iii) matches the operational setting, where most applications never expose the lender to credit risk.
+
+**Alternative target A — conditional on activation:** P(defaultd | eventually activated). Answers *"what is the quality of the funded book?"* — useful for pricing and provisioning, but a different question: it cannot rank applications that will be rejected, and it inherits feed-missingness selection. Retained as a secondary head.
+
+**Alternative target B — counterfactual:** P(defaultd | do(accept & activate)). Answers *"what would happen if we accepted everyone?"* Requires consistency, no-unmeasured confounding between prefix variables and the accept decision, and positivity — the latter is visibly violated by the 20250701 threshold change unless explicitly modeled. Clearly labeled as research-only; not the primary estimand.
+
+## 2. Cohort construction
+
+**Inclusion:** applications with start timestamp in [20240101, 20251231] and  1 valid event.
+**Exclusion:** exact duplicate events introduced by the 20251015 migration (deduplicated on case/activity/timestamp/resource); cases with internally inconsistent timestamps (event < start); obvious synthetic/test accounts by `source_system`.
+**As-of rules:** features as-of t; labels as-of analysis cutoff C = 20260215. A label is *fully mature* only if activation + 90 d + 35 d (max feed delay)  C, i.e., activation  20251013; *possibly mature* (fast feed) if activation  20251110.
+
+**Cohort flow (accounts for all 48,000):**
+
+| Segment | N | Observability status | Role in analysis |
+|---|---|---|---|
+| Activated, matured, feed received (= current ML export) | 21,600 (2,700 D / 18,900 N) | Fully observed | Labeled positives and negative controls |
+| Rejected | 9,100 | Default **undefined** (never exposed to credit) | Competing event R — **never y = 0** |
+| Withdrawn | 5,700 | Undefined | Competing event W |
+| Transferred | 2,900 | Undefined on this platform; ~60% linkage | Competing event X (unlinked); linked follow-up used in sensitivity only |
+| Still open at extraction | 5,100 | Unresolved | Right-censored at C |
+| Activated, window or feed not mature | 3,600 | Pending | Right-censored now; audit must sub-classify into window-immature / feed-pending / **feed-overdue-and-missing** |
+| **Total** | **48,000** | | |
+
+Audit note: the warehouse taxonomy does not separate "permanently missing feed" from "not yet mature." Partner-originated activations with permanently missing feeds are therefore *hidden* inside segment 6 (or misfiled) and must be surfaced from `collection_status` / `label_available_at`; they constitute the selectively-unobserved stratum.
+
+## 3. Censoring and missing-label strategy
+
+Five distinct mechanisms:
+
+1. **Ordinary right censoring** — still-open cases (5,100) and immature activations: administratively censored at C; handled by standard competing-risk likelihood, valid if censoring is non-informative given covariates (**partially testable**: compare covariate distributions of resolved vs. unresolved; reverse Kaplan–Meier for censoring hazard).
+2. **Delayed labels** — feed arrives 7–35 d after window end: pure administrative latency. **Testable** from `label_available_at` distributions. Handled by maturity-tiered evaluation, not by imputation.
+3. **Selection through activation** — default is undefined without activation. This is a *structural* feature of the process, not missing data: handled by the multi-state decomposition, never by imputing zeros.
+4. **Transfer as competing event / missing follow-up** — unlinked transfers (40%) are censored at transfer in the primary analysis; the 60% linkage table enables a sensitivity analysis treating linked partner trajectories as observed follow-up.
+5. **Permanently missing outcome feeds** — elevated for partner-originated activations; plausibly **MNAR** (missingness correlated with collection intensity/partner behavior). **Fundamentally untestable** from these data alone.
+
+**Primary strategy:** competing-risks (cause-specific hazards + Aalen–Johansen CIFs) with **inverse-probability-of-censoring weights** for feed receipt among matured activations: w = 1/P(feed observed | activation covariates, partner flag, calendar time).
+**Sensitivity analyses:** (a) complete-case vs. IPCW; (b) pattern-mixture/delta adjustment for MNAR feeds; (c) worst/best-case bounds on the default CIF; (d) transfers censored-at-transfer vs. linked follow-up included.
+
+## 4. Prefix extraction
+
+- **Fixed-count prefixes:** truncate each trace to its first k events (k  {2,3,4}); cases with fewer than k events are excluded from the fixed-k cohort and scored instead under the time-based scheme (their shortness is itself informative and is captured as a feature there).
+- **Elapsed-time prefixes:** all events with timestamp  start +  ( = 48 h primary), guaranteeing coverage of short and fast cases.
+- **Hard as-of rule:** no event with timestamp > t may enter the feature frame; snapshot columns are reconstructed as "value at or before t" or dropped (§6).
+- **Short cases:** retained via time-prefixes; a `case_ended_before_k` indicator distinguishes early exits (fast rejects/withdrawals) from data gaps.
+- **Document loops:** loop/rework counts are capped (e.g., at 5 with an "5" flag) and the raw count kept as a feature; no truncation of the trace itself.
+- **Activity renaming:** a canonical mapping table (old  post-migration name) is applied before prefixing and variant computation; the raw names are preserved in an audit column. Duplicate migration events are removed by key deduplication with a same-second tolerance.
+
+## 5. Process-aware features
+
+- **Static case attributes:** channel, region, requested_amount at start, source_system, start month/day-of-week/hour, policy-era flag.
+- **Prefix-derived control-flow:** prefix variant ID (coded against the *training-period* variant catalogue), number of activities executed, KYC-passed flag, document-request loop count, whether Credit Review was entered, distance of prefix from the training DFG (e.g., infrequent-transition count).
+- **Timing:** inter-event statistics, time since last event, sojourn in current state, end-to-end prefix span, after-hours activity share.
+- **Resource/queue:** distinct resources touched, resource concurrency (cases simultaneously in the same stage at t, computed from historical reference data), team-level backlog at t. Resource *experience* is excluded unless reconstructed at event time (§6).
+- **Rework:** self-loop and revisit counts per activity.
+- **Historical-reference features:** rolling default/acceptance rates by region × month computed **only from matured cases with a lag (expanding window + embargo)**, so today's outcome never informs today's feature.
+- **Calendar/cohort:** pre/post 20250701 policy flag, pre/post 20251015 migration flag — used for stratified evaluation, and allowed as features only with explicit regime-interaction caution.
+
+## 6. Leakage audit
+
+| Feature or data element | Leakage or bias risk | Valid availability rule | Keep/repair/drop | Rationale |
+|---|---|---|---|---|
+| `final_limit` | Populated only after final decision; reveals decision outcome | Null at early t; usable only in post-decision secondary models | Drop for early model | Perfect proxy for the accept/reject event we are predicting ahead of |
+| `decision_reason` | Populated at/after Accept/Reject | Only for t placed after the decision | Drop at early t | Directly encodes the future decision |
+| `collection_status` | Post-activation; directly reveals default | Never as a pre-outcome feature | Drop | Is effectively the label observed early |
+| Future events (Contract Signed, Account Activated, Collections Contact, Default Recorded) | Post-t events in file | Events strictly  t | Hard filter | Activation timing is needed for *label construction*, never as a feature |
+| `documents_total` | Nightly snapshot may include uploads later on the nominal day | Value provably as-of t | Repair via event-sourced reconstruction, else drop | Same-day-later uploads leak post-t information |
+| `risk_score` (updated at several events) | Latest stored value may post-date t | Last value at or before t | Repair | Store update history; as-of lookup only |
+| Resource experience | Stored at extraction time, not event time | Experience as of event date | Drop (or reconstruct from HR history) | Look-ahead: seniority accrues over the observation window |
+| `label_available_at` | Administrative metadata | Used only for maturity filtering / IPCW weights | Keep (meta only) | Must never enter the predictor matrix |
+| `default_90d` on events | Repeated label column | Never | Strip from feature frame | Label column adjacent to features invites accidental inclusion |
+| `source_system`, `data_extract_time` | Audit metadata | Audit only | Keep (meta only) | Useful for detecting migration artifacts, not prediction |
+
+## 7. Validation design
+
+**Temporal, regime-aware splits by case start time** (never random):
+
+| Split | Case start window | Regime | Notes |
+|---|---|---|---|
+| Train | 20240101 – 20250331 | Pre-policy-change | Embargo  p99(start  label maturity) before validation |
+| Embargo band | 202501… – 20250331 tail | — | Training cases whose label windows overlap validation are dropped |
+| Validation / calibration | 20250701 – 20250930 | Post-policy, pre-migration | Tests policy-shift generalization; calibration fit here |
+| Test / backtest | 20251015 – 20251231 | Post-migration | Evaluated only on cases with mature labels; expect reduced power — acknowledged |
+
+Plus **rolling-origin backtesting**: monthly origins through 2025; train on all prior *matured* data, score the next month's starts once mature; plot metric trajectories across the July and October discontinuities. `pm4py.split_train_test` may be run as a convenience baseline, but results are reported only alongside the temporal scheme.
+
+**Why random splits mislead:** they smear the 20250701 policy discontinuity across train/test (the same prefix maps to different selection probabilities and outcome relationships), mix near-duplicate application templates across splits, let calendar features memorize seasonality, and hide miscalibration that appears exactly at deployment-relevant regime boundaries.
+
+**Metrics:** IPCW Brier score at the horizon; Uno-type time-dependent AUC; calibration slope/intercept and reliability curves; Aalen–Johansen CIF curves vs. observed shares; cause-specific concordance; operationally, precision@alert-budget and decision-curve net benefit. **Subgroups:** channel, region, partner vs. direct, amount bands, pre/post policy. **Shift monitoring:** PSI/KS on feature distributions, calibration drift by calendar month, and a label-latency dashboard (share of scored cases with mature labels over time).
+
+## 8. Limitations and decision-use boundary
+
+**Can claim:** ranking of applications by policy-dependent probability of reaching default-via-activation; calibrated CIFs for future periods resembling the training regimes; identification of process characteristics (document loops, queue delays) *associated* with outcomes.
+
+**Cannot claim:** the default risk of rejected applications had they been accepted (counterfactual, untestable here); effects of changing thresholds; an unconditional "default rate of all applications" without the activation model; reliable performance on partner platforms where feeds are systematically missing (report bounds only). Predictive association  causal effect: the model partly learns the *selection* into activation, so high scores mean "likely to activate and default under current policy," not "bad credit universally."
+
+**Deployment will change the data-generating process. At least three ways:**
+1. Risk-based triage reallocates reviewers, changing processing times and queue features — making them endogenous to the model.
+2. Flagged cases receive enhanced scrutiny, shifting the rejection/withdrawal hazards (competing-risk structure moves).
+3. Model-informed policy tightening changes the activation population (selection directly on predicted risk), degrading calibration of the conditional severity head.
+Additionally: applicants may adapt behavior; partner-platform composition and feed completeness may drift.
+
+## 9. PM4Py-oriented Python implementation skeleton
+
+```python
+# =====================================================================
+# Uncertainty-aware PPM skeleton: cohort, prefixes, leakage audit.
+# pm4py >= 2.7 assumed. ASSUMPTION comments mark choices to revisit.
+# =====================================================================
+import numpy as np
+import pandas as pd
+import pm4py
+
+CFG = {"path": "applications_events.csv",
+       "as_of": pd.Timestamp("2026-02-15"),            # analysis cutoff C
+       "policy_change": pd.Timestamp("2025-07-01"),
+       "horizon_d": 90, "feed_max_d": 35,              # ASSUMPTION: max feed latency
+       "k_prefix": 3,                                  # prediction point: k-th event
+       "embargo_d": 210}                               # ASSUMPTION: p99(start->maturity)
+
+# ------------------------------------------------------------ load
+ev = pd.read_csv(CFG["path"], parse_dates=["time:timestamp",
+                                           "label_available_at", "data_extract_time"])
+ev = ev.sort_values(["case:concept:name", "time:timestamp"], kind="stable")
+
+# Repair 1: duplicates introduced by the 2025-10-15 migration
+key = ["case:concept:name", "concept:name", "time:timestamp", "org:resource"]
+print("[audit] duplicates removed:", int(ev.duplicated(key).sum()))
+ev = ev.drop_duplicates(key, keep="first")
+
+# Repair 2: canonical activity names after the migration rename
+RENAME = {"Credit_Check": "Identity/KYC Check"}        # extend from mapping table
+ev["concept:name"] = ev["concept:name"].replace(RENAME)
+
+ev = pm4py.format_dataframe(ev, case_id="case:concept:name",
+                            activity_key="concept:name",
+                            timestamp_key="time:timestamp")
+
+# ------------------------------------------------ case-level backbone
+first = (ev.groupby(["case:concept:name", "concept:name"])["time:timestamp"]
+           .min().unstack(fill_value=pd.NaT))
+for a in ["Application Started", "Account Activated", "Rejected",
+          "Withdrawn", "Transferred"]:
+    if a not in first.columns:
+        first[a] = pd.NaT
+
+cases = pd.DataFrame(index=first.index)
+cases["start"], cases["activation"] = first["Application Started"], first["Account Activated"]
+cases["closed_at"] = ev.groupby("case:concept:name")["time:timestamp"].max()
+cases["followup_end"] = cases["closed_at"].clip(upper=CFG["as_of"])  # censoring time
+
+known = ev[ev["default_90d"].notna() & (ev["label_available_at"] <= CFG["as_of"])]
+cases["y_obs"] = known.groupby("case:concept:name")["default_90d"].last()
+cases["mature_at"] = (cases["activation"] + pd.Timedelta(days=CFG["horizon_d"])
+                      + pd.Timedelta(days=CFG["feed_max_d"]))
+
+# -------------------------------------------------- cohort statuses
+def status(r):
+    if pd.isna(r["activation"]):                        # default UNDEFINED here
+        for act, lab in [("Rejected", "competing:rejected"),
+                         ("Withdrawn", "competing:withdrawn"),
+                         ("Transferred", "competing:transferred")]:
+            if pd.notna(r[act]):
+                return lab
+        return "right_censored:open"
+    if r["mature_at"] > CFG["as_of"]:
+        return "right_censored:immature"                # audit sub-classifies feed-missing
+    if pd.notna(r["y_obs"]):
+        return "labeled:" + ("default" if r["y_obs"] == 1 else "no_default")
+    return "selectively_unobserved:feed_missing"        # MNAR suspect stratum
+
+cases["status"] = cases.apply(status, axis=1)
+cases["era"] = np.where(cases["start"] < CFG["policy_change"], "pre", "post")
+flow = cases.assign(n=1).pivot_table(index="status", columns="era",
+                                     values="n", aggfunc="sum", fill_value=0)
+flow["total"] = flow.sum(axis=1)
+print("[cohort flow]\n", flow, "\ngrand total:", int(flow["total"].sum()))
+
+# ------------------------------------------- temporal split + embargo
+# Primary design: split by case START. pm4py.split_train_test is a
+# convenience baseline only; it is not regime-aware.
+b_val, b_test = pd.Timestamp("2025-04-01"), pd.Timestamp("2025-08-01")
+emb = pd.Timedelta(days=CFG["embargo_d"])
+def split(r):
+    if r["start"] < b_val - emb: return "train"
+    if r["start"] < b_val:       return "embargo"       # label window overlaps val
+    if r["start"] < b_test:      return "val"
+    return "test"   # evaluate only rows with mature_at <= as_of
+cases["split"] = cases.apply(split, axis=1)
+print(cases["split"].value_counts())
+
+# ------------------------------------------------- fixed-length prefixes
+log = pm4py.convert_to_event_log(ev)
+prefix_logs = pm4py.get_prefixes_from_log(log, length=CFG["k_prefix"])
+# Traces shorter than k are excluded here; they are scored via elapsed-time
+# prefixes (events <= start + 48h) in the companion time-based extractor.
+
+# --------------------------- as-of feature frame (leakage-controlled)
+t0 = ev.groupby("case:concept:name")["time:timestamp"] \
+       .nth(CFG["k_prefix"] - 1).rename("t0")           # k-th event time
+p = ev.join(t0, on="case:concept:name")
+p = p[p["time:timestamp"] <= p["t0"]]                   # HARD as-of cut
+
+FORBIDDEN = ["final_limit", "decision_reason", "collection_status",
+             "default_90d", "label_available_at"]       # post-t0 information
+feat = p.drop(columns=[c for c in FORBIDDEN if c in p.columns]).copy()
+
+feat["risk_score_t0"] = (p[p["risk_score"].notna()]      # snapshot repair:
+                         .groupby("case:concept:name")   # last value AT/BEFORE t0
+                         ["risk_score"].last())
+feat = feat.drop(columns=["documents_total"], errors="ignore")   # not provably as-of
+feat = feat.drop(columns=["org:resource_experience"], errors="ignore")  # look-ahead
+
+agg = feat.groupby("case:concept:name").agg(
+    n_events=("concept:name", "size"),
+    n_resources=("org:resource", "nunique"),
+    doc_requests=("concept:name", lambda s: int((s == "Request Documents").sum())),
+    span_h=("time:timestamp", lambda s: (s.max() - s.min()).total_seconds() / 3600))
+feat_tbl = agg.join(feat["risk_score_t0"]).join(cases[["split", "status"]])
+
+# ------------------------------- reference structure (TRAIN ONLY)
+tr_ids = cases.index[cases["split"] == "train"]
+tr_ev  = ev[ev["case:concept:name"].isin(tr_ids)]
+dfg, sa, ea = pm4py.discover_dfg(pm4py.convert_to_event_log(tr_ev))  # control-flow prior
+vres = pm4py.get_variants(tr_ev.pipe(pm4py.convert_to_event_log))
+variants = vres[0] if isinstance(vres, tuple) else vres   # version-dependent return
+tmp_feats = pm4py.extract_temporal_features_dataframe(tr_ev)  # arrival-pattern refs
+tr_q = pm4py.insert_case_service_waiting_time(tr_ev.copy())   # queue proxy; interpret
+                                                              # cautiously (timestamps only)
+# ------------------------------------------------ leakage-audit gate
+def leakage_audit(ff, pf):
+    checks = {"forbidden_cols_absent": not (set(FORBIDDEN) & set(ff.columns)),
+              "no_event_after_t0": bool((pf["time:timestamp"] <= pf["t0"]).all()),
+              "label_not_in_features": "default_90d" not in ff.columns,
+              "t0_not_null": bool(pf["t0"].notna().all())}
+    rep = pd.Series(checks, name="pass")
+    assert rep.all(), f"LEAKAGE CHECK FAILED:\n{rep}"
+    return rep
+print(leakage_audit(feat_tbl, p))
+
+# -------- hooks: survival / competing-risk modelling (next stage)
+# * Cause-specific hazards for {Activated, Rejected, Withdrawn, Transferred}
+#   + Aalen-Johansen CIFs (lifelines / scikit-survival); open cases censored
+#   at followup_end.
+# * Conditional default head on (activation, activation+90d], weighted by
+#   IPCW: w = 1/P(feed observed | activation covariates, partner flag).
+# * Sensitivity: complete-case vs IPCW; delta-adjusted MNAR bounds;
+#   transfers censored-at-transfer vs linked-partner follow-up.
+```
