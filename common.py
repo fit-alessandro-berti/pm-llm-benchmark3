@@ -501,7 +501,6 @@ _CLOSED_SOURCE_COMMERCIAL_TIERS = (
     "qwen3.6-max",
     "qwen3.6-plus",
     "qwen3.8-max",
-    "qwen3.8-flash",
 )
 
 _CLOSED_SOURCE_MODEL_ALIASES = (
