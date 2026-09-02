@@ -1,0 +1,814 @@
+# 1. Assumptions, objectives, and decision variables
+
+## 1.1 What the prompt fixes and what had to be assumed
+
+Everything below is derived from the five tables in the prompt. Where the prompt is silent I introduce a labelled assumption (A1–A12) and say why it is needed. Numbers quoted later come from the Python in Section 8 (30 seeds per policy × scenario, seeds 0–29), so they are estimates with the seed-to-seed spread stated, not facts.
+
+| id | assumption | why it is needed |
+|---|---|---|
+| A1 | Arrivals per two-hour block are Poisson with the stated mean, uniformly spread inside the block; priority and case type are drawn independently from the block percentages. | Only expected counts are given. Poisson is the least-informative count model; independence of priority and type is unstated, so the simplest form is used and flagged as a validation item. |
+| A2 | Service time = mixture: with the complex-tail probability draw Uniform(tail range), otherwise Uniform(ordinary range). Means in base minutes: Intake 6.9, Mechanical 26.3, Electrical 32.8, Software 38.5, Validation 15.7. Effective time = base draw × resource multiplier. | Ranges are given without a shape; uniform is the maximum-entropy choice on a bounded range. The mixture reproduces the stated tail probabilities exactly. |
+| A3 | The 7-minute handover and the 5-minute team switch occupy the receiving resource (both parties are involved); the team switch applies only when the family changes (MECH vs Electrical/Software) and the resource changes, which is the literal reading of "unless the same cross-skilled resource retains the case". | The prompt says "add 7 minutes of delay" but not whose calendar it consumes. Charging it to the receiver is the conservative reading; the alternative (pure case delay, no capacity loss) would make pooling look better than it is. |
+| A4 | The 5-minute setup applies when a resource's previous diagnostic task was for a different case and a different family. A cross-skilled owner doing Mechanical then Electrical on the same ME case pays no setup (the rule speaks of "consecutive cases"). | Literal reading; it is the one thing that makes the sequential-on-one-owner option attractive. |
+| A5 | The 8-minute parallel coordination is charged only when the two branches were actually executed by two different resources; it is a pure case delay before Validation. | If the branches happened to run on the same person there is nothing to coordinate. |
+| A6 | Breaks: an idle resource takes the break at the scheduled time; a busy resource takes the full break when the current task finishes (breaks are not preempted, not skipped, except when the task ends after shift end). | Needed for time-varying capacity; keeps the 30-minute break budget intact. |
+| A7 | Overtime: a task is started only if its projected finish (handover + setup + effective service) is ≤ shift end + 30 minutes. Otherwise it waits for another resource or the next day. | Implements the 30-minute overtime cap without mid-task abandonment. |
+| A8 | Preemption: any activity of a P1 case may trigger a preemption; the victim must be an in-progress P2/P3 *diagnostic* activity (Intake/Validation are never interrupted), a case is a victim at most once, a task within 5 minutes of finishing is not interrupted, and the victim's remaining base time is multiplied by 1.10 and re-queued at its original queue position. | Follows the prompt's wording ("may preempt a lower-priority diagnostic activity"); the 5-minute floor is an operational sanity rule. |
+| A9 | Parallel/sequential is decided when Intake finishes (the earliest moment the branch structure is known) using the policy's rule (Section 3). In "sequential" mode the second branch is created only when the first finishes and the assignment cost penalises resources that cannot do both branches, so the case tends to stay with one cross-skilled owner. | The prompt makes this a choice; it must be a dispatch rule to be auditable. |
+| A10 | Carry-over: work unfinished at 20:30 rolls to the next day. For SLA accounting a carried-over P1 or P2 is a miss; a carried-over P3 is counted as met if it arrived after 10:00 (its 24-hour clock still allows completion by 10:00 next day), flagged as *conditional on next-morning capacity*. | The prompt gives no night shift, so the day must end. The evening blocks are far over capacity (Section 2) so this rule matters. |
+| A11 | Scenario readings: U1 adds the 8 percentage points to P1 pro rata from P2 and P3. U2 is read as *absolute* E and ES demand doubling (12:00–16:00 arrivals rise from 7 → 9.8 and 10 → 14.2) with the mix renormalised; the milder mix-only reading is discussed in Section 2. U5 = U1 + U3 + no Intake may *start* between 09:30 and 10:00 (Intakes already running continue). | "Demand doubles" and "proportions are renormalised" are both satisfied by the absolute reading; it is the harsher and therefore the more useful stress. |
+| A12 | Metric definitions: flow = completion − arrival; delay (waiting) = flow − sum of that case's service segments (parallel branches both counted, which slightly understates waiting for parallel cases); SLA is measured on flow; utilisation = (service + handover + setup minutes) / (shift − break); values above 1.0 mean overtime or a skipped break was used. | Needed so that the tables are comparable across policies and interpretable against the prompt's 90% fairness cap. |
+
+## 1.2 How ME/ES parallelism is decided (decision rule, not a label)
+
+At Intake completion of an ME/ES case the dispatcher chooses:
+
+- `always`: two branch tasks in the two skill queues (specialist model). Cost: two handovers (7 min each, +5 if a family change with a new resource), 8-minute coordination, but the critical path is max(branch) rather than the sum.
+- `p3_seq`: P1/P2 parallel, P3 sequential on one owner (no coordination, no branch handover, sum of branches on the critical path — acceptable for a 24-hour clock).
+- `threshold`: P1 always parallel; P2 parallel only if both branches could start right now (≥ 2 idle qualified resources) or if > 40% of its 8-hour clock is already used; P3 sequential unless > 50% of its clock is used.
+
+Break-even intuition: parallel saves min(branch) − 8 minutes of critical path but costs an extra handover of 7–12 minutes of *capacity*. With Mechanical ≈ 26 and Electrical ≈ 33 base minutes, parallelism buys ~18 minutes of elapsed time for ~10 minutes of capacity; worth it when the clock is short (P1), rarely worth it when the system is over capacity and the clock is long (P3).
+
+## 1.3 Objectives
+
+- **O1 – SLA and tail risk (lexicographic):** maximise P1 attainment first (target ≥ 0.90 of P1 cases within 120 minutes), then P2 attainment within 8 hours, then minimise the p90 of flow time; carried-over P1/P2 cases count as misses.
+- **O2 – Robustness with fairness:** maximise the worst case over U1–U5 of `0.5·P1_SLA + 0.3·P2_SLA − 0.2·(p90 regret in hours)`, where regret is the p90 flow time minus the best policy's p90 in the same scenario, subject to two fairness constraints: no resource planned above 90% utilisation in the base case, and the spread of P2 attainment across case types (M, E, S, ME, ES) ≤ 0.30 so that no case type is systematically sacrificed.
+- **O3 – Throughput/cost (secondary):** minimise handover + setup + coordination minutes as a share of service minutes, the number of preemptions, and end-of-day carry-over.
+
+O1 and O2 can disagree (Section 5): the throughput-maximising ordering wins O1's P2 and tail terms but violates O2's type-fairness constraint.
+
+## 1.4 Decision variables
+
+Eligibility set per activity (home queue vs any qualified resource); ordering key inside the queue (priority class, stage, FIFO, shortest expected remaining work, aging); overflow wait thresholds per priority; reservation (guard resource and what it may accept); preemption thresholds (which victims, after how long); the parallelisation rule; the weight given to ownership continuity (handover minutes inside the assignment cost); use of the 30-minute overtime.
+
+# 2. Capacity and offered-load analysis
+
+## 2.1 Offered load in base minutes (multiplier 1.0), base scenario
+
+Activity counts per block follow from the mix (Mechanical = M + ME, Electrical = E + ME + ES, Software = S + ES; every case needs Intake and Validation). Multiplying by the A2 means:
+
+| block | arrivals | Intake | Mech | Elec | SW | Valid | load + ~60% handover est. | available minutes (shift − break) | ρ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 08–10 | 7 | 49 | 92 | 126 | 67 | 110 | 503 | 480 (Ada, Ben, Chen, Farah) | 1.05 |
+| 10–12 | 9 | 62 | 118 | 177 | 87 | 142 | 662 | 600 (+Deepa) | 1.10 |
+| 12–14 | 7 | 49 | 77 | 138 | 81 | 110 | 514 | 510 (Farah gone, Emil in, 3 breaks) | 1.01 |
+| 14–16 | 10 | 69 | 105 | 203 | 116 | 157 | 735 | 570 (Deepa break) | 1.29 |
+| 16–18 | 6 | 42 | 55 | 108 | 92 | 94 | 442 | 210 (Deepa, Emil; Emil break) | 2.11 |
+| 18–20 | 3 | 21 | 28 | 44 | 52 | 47 | 217 | 120 (Emil only) | 1.81 |
+| day | 42 | 291 | 476 | 798 | 495 | 661 | ≈3,070 | 2,490 | ≈1.23 |
+
+The handover estimate (≈ 350 minutes/day) assumes 60% of the two stage transitions per case change hands at 7 minutes each; the observed values in the simulation are 0.17–0.31 of service minutes depending on policy, i.e. 340–620 minutes/day, so the estimate is central rather than pessimistic.
+
+**Observation (not estimate):** pure service demand is 2,720 base minutes against 2,490 available minutes, so even with every activity done by a 1.00 resource and zero handovers the day is at ρ ≈ 1.09, and the maximum legal overtime (6 × 30 = 180 minutes) does not close the gap. The base scenario is structurally infeasible within the day; roughly 500–700 base minutes (8–11 case-equivalents) must roll over each day, in whichever form the routing policy chooses. This is why every policy in Section 4 shows 16–20 carried-over cases (many of them partially processed evening arrivals) and why no resource can respect the 90% planned-utilisation rule: in the base case 3–4 of the 6 resources exceed 90% under every policy. Routing decides *who waits*, not *whether* someone waits.
+
+**Skill-specific bounds (base):**
+
+- Software 08:00–12:00: qualified capacity is Chen at 1.25 and Farah at 1.40, i.e. 96 + 86 = 182 base-minute-equivalents per block against 67–87 minutes of Software load, *if they did nothing else*. Chen also carries Electrical (1.00) and Validation, so Software is the first skill to queue in the morning; Emil (1.00) arrives only at 12:00.
+- Mechanical 18:00–20:00: zero qualified capacity (Emil has no Mechanical skill). 35% of 18–20 arrivals (M + ME) cannot be finished the same day whatever the policy; from 16:00 to 18:00 Deepa (1.25) is the only Mechanical resource.
+- Electrical after 16:00: Deepa (1.00) and Emil (1.30) only, while Electrical is the largest single diagnostic load (798 minutes/day).
+- Validation is 661 minutes/day (24% of all service) and every hand-off adds 7 minutes to a 15.7-minute activity (+45%). Validation is not skill-bound (everyone can do it) but it is where ownership continuity pays most.
+
+**P1 ceiling:** a Monte-Carlo of a P1 case that never waits (1.00 multipliers, one 7-minute handover, ME/ES parallel + 8 minutes) meets 120 minutes in ≥ 0.99 of draws for all types (0.98 for ES with doubled tails). So every P1 miss in Section 4 is a queueing or skill-availability loss, except Software tail cases done by a 1.25–1.40 resource (45–80 × 1.4 = 63–112 minutes plus Intake and Validation can exceed 120 on its own).
+
+## 2.2 Bottlenecks by scenario (static ρ per block; simulation confirms the direction)
+
+| scenario | ρ by block 08/10/12/14/16/18 | binding constraint and where it migrates |
+|---|---|---|
+| Base | 1.05 / 1.10 / 1.01 / 1.29 / 2.11 / 1.81 | Aggregate capacity from 14:00 onwards; Mechanical has no server after 18:00; Software is slow (1.25/1.40) before noon. Backlog created 14–16 is never recovered. |
+| U1 morning surge | 1.78 / 1.88 / 1.01 / 1.29 / 2.11 / 1.81 | ≈ 900 base minutes of morning deficit spill into an afternoon that is itself over capacity; Farah (the widest skill set) leaves at 12:00 exactly when the queue peaks. P2 cases arriving 08–12 must finish by 16–20 and collide with the afternoon peak. |
+| U2 E/ES incident | 1.05 / 1.10 / 1.42 / 1.84 / 2.11 / 1.81 | Electrical load 230–341 minutes per block from 12:00; Electrical-capable base-minute capacity in 12–14 is ≈ 67 (Ada at 1.35) + 90 (Chen) + 120 (Deepa) + 92 (Emil at 1.30) = 369 *if dedicated*. Pulling Ada/Emil into Electrical at 1.30–1.35 lowers effective capacity by 25–30% for that work; Mechanical demand then waits for Ben. Under the mix-only reading of U2 (same volume, more E/ES) the aggregate ρ is unchanged and only the skill mix shifts toward Electrical; qualitatively the same bottleneck, smaller magnitude. |
+| U3 Chen absent | 1.40 / 1.38 / 1.22 / 1.63 / 2.11 / 1.81 | −450 minutes (18% of capacity). Software before 12:00 is Farah alone at 1.40 (86 base-minute-equivalents vs 67–87 load); Electrical before 10:00 has no 1.00 resource (Ada 1.35, Farah 1.40). P1 S/ES cases in the morning are served slowly and fail more often. |
+| U4 long tails | 1.13 / 1.19 / 1.09 / 1.39 / 2.28 / 1.95 | +10–15% diagnostic load, but the damage is in the tail: a 45–80-minute Software draw at 1.25–1.40 breaks the P1 clock alone; preemptions become both more valuable and more costly (10% of a larger remainder). |
+| U5 combined | 2.38 / 2.34 / 1.22 / 1.63 / 2.11 / 1.81 | Worst case: surge without Chen; the 09:30–10:00 Intake outage releases a bulge of 3–6 Intakes at 10:00 when Deepa arrives; Software in the morning is Farah only. Everything downstream is behind for the rest of the day. |
+
+# 3. Candidate policies
+
+All four are implemented in Section 8 with the same engine; the differences are only the fields in the `POLICIES` dictionary.
+
+**P-A SPEC – strict specialisation with fixed queues.**
+Eligibility: Intake {Farah, Ada, Deepa}; Mechanical {Ada, Ben}; Electrical {Chen, Deepa}; Software {Emil, Chen (as morning cover, otherwise Software has no server before 12:00)}; Validation {Ben, Deepa, Emil}. Priority score: class (P1 > P2 > P3) then FIFO. No reservation, no preemption. ME/ES always parallel (two teams). Resource choice within the queue: lowest multiplier, ties alphabetical; handover minutes are *not* weighed, so ownership is incidental. No overflow.
+
+**P-B POOL – full pooling with a transparent rule.**
+Eligibility: any resource with a multiplier for the activity. Priority: class then FIFO over the task's queue-entry time. Resource choice: minimise `multiplier × remaining + handover(7, +5 team switch) + setup(5)`, which is ownership continuity expressed in minutes and auditable case by case. Preemption: a waiting P1 task with no idle eligible resource interrupts the lowest-priority in-progress diagnostic (P3 before P2, then the one with the most remaining work), immediately. Parallelisation `p3_seq`. No reservation, no overflow thresholds (everything is already eligible).
+
+**P-C POOL_SRPT – pooling with shortest expected remaining work first.**
+Identical to P-B except the ordering inside a class: the case with the smallest expected remaining work (sum of A2 means of its unfinished activities) goes first. This is the classic throughput maximiser under overload; it is included to expose what the mean-delay optimum costs in fairness.
+
+**P-D HYBRID – owner-continuity pooling with guarded overflow (the candidate for recommendation).**
+1. *Eligibility / overflow:* home queues as in P-A; a task overflows to any qualified resource after waiting 0 minutes (P1), 10 minutes (P2), 20 minutes (P3). The 10-minute figure is the speed break-even: waiting w minutes for a 1.00 specialist beats taking a slower resource now when w < (m_slow − 1.00) × base time, i.e. ≈ 11 minutes for Ada on Electrical (0.35 × 33) and ≈ 15 minutes for Farah on Software (0.40 × 38.5).
+2. *Priority score:* class first; inside a class **finish before start** (Validation before diagnostics before Intake), then FIFO. This is the transparent counterpart of SRPT: it prevents the "start everything, finish nothing" pattern without needing duration estimates.
+3. *Anti-starvation:* a P3 is promoted to the P2 class once 50% of its 24-hour clock is used (in practice: the next morning). A fixed 90-minute aging was tested and rejected (Section 4 note): under ρ > 1 it forces P3 work into the day and costs 8–10 points of P2 attainment.
+4. *Reservation:* a guard (Farah 08:00–12:00, Deepa 12:00–18:00, the widest skill sets) takes no P3 unless the P3 has waited 45 minutes. A stricter guard (no long P2 tasks either) was tested and rejected: it idles capacity in an overloaded system and reduces P2 attainment by ~8 points for < 2 points of P1.
+5. *Preemption:* P1 may interrupt a P3 diagnostic immediately and a P2 diagnostic only after the P1 task has waited 5 minutes; one interruption per victim case; not within 5 minutes of a task's end.
+6. *Parallelisation:* `threshold` rule of Section 1.2.
+7. *Handover minimisation:* handover and setup minutes are inside the assignment cost, so the resource that just finished a case's activity wins the next activity unless a faster resource saves more than the 7–12 minutes of handover.
+
+Operator's checklist for HYBRID (what a dispatcher actually does): (i) take P1 first, P2 second, P3 third; (ii) within the class, finish open cases before opening new ones; (iii) stay in your home queue unless the top task has waited 10 minutes (P2) or 20 minutes (P3); (iv) if you are the guard, do not take P3 unless it has waited 45 minutes; (v) a P1 with nobody free may interrupt a P3 diagnostic now, a P2 diagnostic after 5 minutes; (vi) ME/ES: P1 in parallel, P2 in parallel only if two people are free now, P3 sequentially with one owner.
+
+Variants tested and not adopted (20 seeds, all six scenarios): overflow thresholds 0/0/0, 5/10, 15/30 (differences within ±15 minutes of p90, i.e. within noise); always-parallel for P1/P2 (within noise, more coordination minutes); immediate P2-victim preemption (P1 +4–6 points, preemptions 6–8/day instead of 4–5); fixed-time aging (rejected, see above); strict guard (rejected).
+
+# 4. Scenario comparison
+
+Estimates are means over 30 seeded days. Seed-to-seed standard deviations: p90 flow 45–110 minutes (standard error of the mean ≈ 8–20), P2 SLA 0.12–0.21 (SE ≈ 0.02–0.04), P1 SLA is computed on ≈ 5 P1 cases per day, so a single day's P1 attainment swings by ±0.2; the 30-day mean has SE ≈ 0.03. Differences below ~0.05 in attainment or ~20 minutes in p90 should be read as ties. `mean_delay` = mean waiting (flow − service) in minutes; `p90_delay` = p90 of flow time in minutes; `max_util` = highest resource utilisation (A12); `util_fairness` = spread max−min across resources / number of resources above the 90% cap; `handover_or_setup_burden` = (handover + setup + coordination minutes)/service minutes; `resilience` = P2 attainment retained relative to the same policy's base case (P1 retained in brackets), and for the base rows the O2 robust score.
+
+| policy | scenario | mean_delay | p90_delay | P1_SLA | P2_SLA | max_util | util_fairness | handover_or_setup_burden | resilience | main_failure_mode |
+|---|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| SPEC | Base | 87 | 247 | 0.65 | 0.66 | 1.02 | 0.64 / 2.6 | 0.26 | score −0.09 | two forced handovers per case; Software only via Chen (1.25) before noon; P1 waits behind running work (no preemption); Farah under-used, Chen saturated |
+| SPEC | U1 | 151 | 378 | 0.65 | 0.59 | 1.03 | 0.37 / 4.4 | 0.27 | 0.89 (1.00) | morning queues in Mechanical/Electrical while Farah can only do Intake |
+| SPEC | U2 | 97 | 273 | 0.67 | 0.55 | 1.03 | 0.65 / 2.7 | 0.27 | 0.83 (1.03) | Electrical queue (Chen, Deepa) while Ben/Ada idle relative to demand |
+| SPEC | U3 | 130 | 329 | 0.51 | 0.48 | 1.04 | 0.66 / 2.0 | 0.30 | 0.73 (0.78) | no Software server before 12:00 and no Electrical 1.00 before 10:00; morning S/ES P1 cases wait for Emil |
+| SPEC | U4 | 99 | 284 | 0.56 | 0.59 | 1.03 | 0.64 / 2.6 | 0.25 | 0.89 (0.86) | long tails block fixed queues; nobody may help |
+| SPEC | U5 | 159 | 420 | 0.45 | 0.30 | 1.04 | 0.39 / 3.2 | 0.31 | 0.45 (0.69) | all of the above at once |
+| POOL | Base | 47 | 192 | 0.87 | 0.60 | 1.03 | 0.30 / 3.8 | 0.24 | score 0.28 | FIFO inside a class starts many cases and finishes few: highest carry-over of the pooled policies (19.9), 6.7 preemptions/day |
+| POOL | U1 | 100 | 307 | 0.85 | 0.54 | 1.05 | 0.13 / 5.6 | 0.27 | 0.90 (0.98) | WIP explosion in the morning; 8.7 preemptions/day |
+| POOL | U2 | 52 | 209 | 0.82 | 0.52 | 1.04 | 0.29 / 3.8 | 0.24 | 0.87 (0.94) | Ada/Emil pulled into Electrical at 1.30–1.35 |
+| POOL | U3 | 66 | 226 | 0.81 | 0.50 | 1.04 | 0.23 / 3.6 | 0.25 | 0.83 (0.93) | Farah at 1.40 carries morning Software |
+| POOL | U4 | 51 | 205 | 0.80 | 0.56 | 1.03 | 0.28 / 3.9 | 0.23 | 0.93 (0.92) | tails + FIFO: long cases block, preemptions cost more |
+| POOL | U5 | 117 | 358 | 0.76 | 0.33 | 1.05 | 0.13 / 4.7 | 0.28 | 0.55 (0.87) | lowest P2 of all pooled policies |
+| POOL_SRPT | Base | 43 | 193 | 0.86 | 0.72 | 1.03 | 0.31 / 3.6 | 0.18 | score 0.55 | P2 attainment by type: E 0.83, M 0.79, ME 0.74, S 0.59, **ES 0.41** (spread 0.42): long cases are starved; 6.8 preemptions/day; depends on estimates |
+| POOL_SRPT | U1 | 70 | 265 | 0.91 | 0.71 | 1.04 | 0.13 / 5.3 | 0.18 | 0.99 (1.06) | best throughput under surge; 9.3 preemptions/day |
+| POOL_SRPT | U2 | 45 | 184 | 0.83 | 0.65 | 1.04 | 0.31 / 3.8 | 0.18 | 0.90 (0.97) | ES cases (the incident type) are exactly the ones deferred |
+| POOL_SRPT | U3 | 57 | 219 | 0.81 | 0.62 | 1.04 | 0.24 / 3.5 | 0.18 | 0.86 (0.94) | Software starvation compounds with Chen absent |
+| POOL_SRPT | U4 | 43 | 201 | 0.76 | 0.67 | 1.03 | 0.29 / 3.8 | 0.18 | 0.93 (0.88) | lowest P1 of the pooled policies here: tail cases are deferred by construction |
+| POOL_SRPT | U5 | 87 | 298 | 0.77 | 0.55 | 1.05 | 0.12 / 4.7 | 0.17 | 0.76 (0.90) | still the best P2/p90 but the ES/S backlog rolls over |
+| HYBRID | Base | 60 | 217 | 0.87 | 0.68 | 1.02 | 0.35 / 3.2 | 0.23 | score 0.28 | 10–20 min p90 behind SRPT from waiting for home specialists; guard is inert under overload; 4.7 preemptions/day; type spread 0.26 (E 0.77 … ES 0.51) |
+| HYBRID | U1 | 97 | 297 | 0.88 | 0.66 | 1.04 | 0.16 / 5.3 | 0.22 | 0.97 (1.01) | home-queue wait (10 min) is wasted time when everyone is overloaded |
+| HYBRID | U2 | 65 | 221 | 0.85 | 0.60 | 1.03 | 0.36 / 3.5 | 0.22 | 0.88 (0.98) | Electrical overflow to Ada/Emil at 1.30–1.35 |
+| HYBRID | U3 | 82 | 266 | 0.79 | 0.59 | 1.04 | 0.25 / 3.2 | 0.22 | 0.87 (0.91) | Software = Farah only in the morning |
+| HYBRID | U4 | 63 | 227 | 0.80 | 0.64 | 1.03 | 0.34 / 3.5 | 0.21 | 0.94 (0.92) | tails; finish-first keeps carry-over lowest of all (18.7) |
+| HYBRID | U5 | 125 | 374 | 0.80 | 0.48 | 1.04 | 0.14 / 4.4 | 0.20 | 0.71 (0.92) | P2 collapses with the morning backlog; P1 still 0.80 |
+
+Robustness summary (worst case over U1–U5; regret = p90 minus the best policy's p90 in the same scenario):
+
+| policy | base P1 | worst P1 | worst P2 | worst p90 (min) | max p90 regret (min) | O2 score |
+|---|---:|---:|---:|---:|---:|---:|
+| POOL_SRPT | 0.86 | 0.77 | 0.55 | 298 | 1 | 0.55 |
+| HYBRID | 0.87 | 0.79 | 0.48 | 374 | 76 | 0.28 |
+| POOL | 0.87 | 0.76 | 0.33 | 358 | 60 | 0.28 |
+| SPEC | 0.65 | 0.45 | 0.30 | 420 | 122 | −0.09 |
+
+Readings that survive the noise:
+
+- Specialisation is dominated everywhere: −20 points of P1 in base and −30 to −35 under U3/U5, +50% more handover minutes, the worst tail. The tension the prompt asks about resolves clearly in favour of pooling *in this instance* because (a) the system is over capacity, where any idle minute is expensive, and (b) the skill matrix has holes (no Software 1.00 before 12:00, no Mechanical after 18:00) that fixed queues cannot route around.
+- Among pooled policies the ordering rule matters more than the eligibility rule: FIFO-within-class (POOL) loses 8–12 points of P2 and 3–4 cases of carry-over to both finish-first (HYBRID) and SRPT, because it opens new cases while validations wait.
+- SRPT buys its P2 and tail advantage (0.72 vs 0.68 in base, within ~1.5 SE; 0.55 vs 0.48 in U5, ~2 SE; p90 −30 to −75 minutes under U1/U5, significant) by starving ES and S cases (ES P2 attainment 0.41 vs 0.51 in HYBRID and 0.55 in SPEC), which violates the O2 fairness constraint.
+- P1 attainment saturates around 0.85–0.90 for every pooled policy and drops to 0.76–0.81 under U3/U4/U5. The residual misses are structural (Section 2: evening Mechanical gap, morning Software speed, non-preemptable Intake/Validation) and no routing rule reaches the 0.90 target in base without the capacity changes listed in Section 5.
+- No policy meets the 90% planned-utilisation rule: 3–4 of 6 resources exceed it in base under every policy; Farah is the only resource consistently below (0.79–0.85), because her 1.40 multipliers make her the last choice for diagnostics.
+
+# 5. Robust recommendation
+
+**Primary: HYBRID (owner-continuity pooling with guarded overflow), run in two modes with an explicit trigger.**
+
+Why it is the best trade-off under O1 + O2 rather than the O2 score alone: it has the best or tied-best P1 attainment in base and the best worst-case P1 (0.79), keeps the type-fairness spread at 0.26 (SRPT 0.42), uses 30% fewer preemptions than the two pure pooling policies, needs no duration estimates (so it cannot be gamed through them), and its six-line checklist is auditable from the event log. Its P2 and p90 deficit to SRPT is within noise in Base/U2/U3/U4 and real only under the two surge scenarios (U1, U5), which is exactly where the fallback mode is meant to switch on.
+
+**Fallback (surge mode): keep HYBRID's eligibility, preemption and parallelisation rules but replace the within-class order by shortest expected remaining work, with a pass-over cap** (a task passed over by shorter work five times is moved to the head of its class). This captures most of SRPT's throughput advantage under U1/U5 (p90 −30 to −75 minutes, P2 +5 to +7 points) while bounding starvation. The cap has not been simulated; it is a design requirement for the pilot.
+
+Trigger thresholds (all observable from the live queue; hysteresis to avoid flapping):
+
+- Enter surge mode when either (a) the number of waiting P1 + P2 tasks ≥ 6, or (b) the projected two-hour load ratio (sum of expected remaining work of waiting P1/P2 tasks + expected arrivals of the next block, divided by available minutes of the next two hours) ≥ 1.3, or (c) a known shock is declared (absence of a resource covering a unique skill, Intake outage, incident notification).
+- Return to normal mode when waiting P1 + P2 tasks ≤ 2 for 30 consecutive minutes and the projected load ratio < 1.1.
+- Preemption governor: if preemptions exceed 8 in a day, raise the P2-victim threshold from 5 to 15 minutes for the rest of the day (P1 cost ≈ 4–6 points, Section 3 variants).
+
+When another policy is preferable:
+
+- If the objective is O3 (mean delay, completions per day) and management explicitly accepts that complex ES/S cases wait longer, POOL_SRPT is the right choice outright.
+- If capacity is added so that ρ falls below ~0.9 in every block, the guard and the overflow thresholds start to matter (a lightly loaded system benefits from waiting for the specialist and from keeping one person free for P1), and the case for finish-first over FIFO weakens. Re-run the experiment before removing them.
+- If the handover cost turns out to be pure delay rather than receiver capacity (A3 is wrong), pooling looks even better and SPEC even worse; the ranking does not change.
+
+**Capacity actions that the routing analysis makes unavoidable** (recommendations, not policy parameters): (1) close the Mechanical gap 18:00–20:00 (cross-train Emil, or shift Deepa to 12:00–20:00 on days with evening Mechanical demand); (2) move ≈ 500–700 base minutes of capacity from the morning to 14:00–20:00 (e.g. Farah 14:00–18:00 instead of 08:00–12:00 on alternate days, or one additional 14:00–20:00 resource); (3) make Validation ownership the default so that a 7-minute handover is not paid on a 16-minute activity. Without (1)–(2) every policy will roll over 8–11 case-equivalents per day into a morning that is itself at ρ ≈ 1.05–1.10, so the backlog compounds day over day.
+
+# 6. Secondary effects and implementation risks
+
+- **Gaming of estimates.** SRPT and the surge mode depend on "expected remaining work". Use type-level constants from the service table (as the code does), never operator-entered estimates; audit `planned_min` vs `actual_min` per resource and per type monthly. Case-type mislabelling (declaring an ES case as E to move it up) is detectable as a type-conditional rise in Software activity on cases labelled E.
+- **Starvation of P3.** In an overloaded day P3 work is deferred by every policy (P3 same-day completion is low; the 24-hour clock is what makes attainment look fine). Two risks: the next morning opens with 8–11 case-equivalents of promoted P3 work that then competes as P2 (the aging rule), and P3 cases that were half-processed pay a second handover the next day. Monitor the P3 age distribution at 08:00 and the fraction of P3 cases with Intake done but no diagnostic started.
+- **Skill erosion and multiplier drift.** Pooling sends Ada to Electrical at 1.35 and Farah to everything at 1.40, and pulls Chen off Software toward Electrical; specialists lose practice on their 1.00 skill and generalists accumulate slow work. Track the actual/planned ratio by resource × activity as a drift statistic; if a 1.00 multiplier degrades by more than 10% over a month, tighten the overflow threshold for that activity.
+- **Excessive preemption.** 4–9 interruptions per day (10–20% of cases) is a lot of context switching; each costs 10% of the remaining time plus a 7–12-minute handover if the victim resumes elsewhere. Keep the one-per-case rule, the 5-minutes-to-finish floor and the daily governor; record `pause/resume` explicitly so the true cost is visible.
+- **Coordination overhead.** Parallel branches cost 8 minutes plus two handovers; the threshold rule keeps parallel share at ~30–50% versus 85–100% under POOL/SPEC, with no measurable loss of P1 attainment. Watch the share creep up under pressure (dispatchers parallelise to "do something").
+- **New bottleneck at Validation.** Finish-first pushes Validation to the front of each class, which is intended, but if ownership means the diagnosing resource validates its own work, a segregation-of-duties question arises. If a different validator is required by policy, add 7 minutes to every case (≈ 300 minutes/day) and re-run; the ranking will not change, the capacity gap will widen.
+- **Fairness among people.** Under every policy 3–4 resources sit at 0.94–1.05 utilisation while Farah is at 0.8; this violates the 90% rule and is a capacity fact, not a routing artefact. Publish utilisation by resource weekly; a policy that cannot meet the cap must be accompanied by the capacity actions of Section 5.
+- **Human interpretability.** HYBRID's rules are a six-item checklist; SRPT requires the dispatcher to trust a number. Log the eligible set and the chosen resource for each assignment so that every decision can be replayed and challenged.
+
+# 7. Monitoring and process-mining design
+
+Event attributes (one row per service segment, plus a zero-duration `Arrival` row per case so that PM4Py's sojourn equals flow time):
+
+`case:concept:name`, `concept:name` (Intake/Mechanical/Electrical/Software/Validation), `start_timestamp`, `time:timestamp`, `org:resource`, `priority`, `case_type`, `queue_entry` (when the task became dispatchable), `assigned` (assignment decision time), `eligible` (the eligible-resource set at assignment), `skill_used` and `skill_mult`, `planned_min` (type mean × multiplier), `actual_min`, `handover_min`, `setup_min`, `segment` (first/resume) and `preempted_here` (pause/resume), `branch_mode` (single/parallel/sequential), `policy_version` (normal/surge and a rule-set hash), `scenario_flag` (declared shock: absence, outage, incident), `sla_left` (SLA clock remaining at segment end).
+
+Deployment indicators (daily, by block): P1/P2/P3 attainment; p50/p90 flow by priority and type; stage-specific queue waits (`assigned − queue_entry` per activity — PM4Py's case-level waiting cannot give this); handover minutes per case and off-diagonal mass of the handover network; setup minutes per resource; preemptions per day and their realised penalty (`resume` segment length vs plan); parallel share; utilisation per resource and count above 90%; carry-over count and age at 08:00; mode-switch count and time in surge mode; type-fairness spread of P2 attainment.
+
+PM4Py analyses and what each reveals:
+
+- `pm4py.format_dataframe` with `start_timestamp_key` to build an interval log, then `pm4py.insert_case_service_waiting_time` for case-level `@@service_time`, `@@sojourn_time`, `@@waiting_time`. Label carefully: service is the *sum* of activity durations (parallel branches double counted), sojourn is first-start to last-end (equals flow only because of the Arrival row), waiting is their difference and is *not* a queue-specific wait. In the base HYBRID day of Section 8 the case-level mean waiting was 59 minutes with p90 163, while the stage-specific queue waits from the attributes were Intake 49 (p90 163), Electrical 26, Software 19, Validation 14: the Intake queue dominates and that is invisible at case level.
+- `pm4py.get_service_time` per activity (and, by filtering on `org:resource`, per resource): drift in service times and multipliers. In the sample day Software averaged 55 minutes against a 38.5 base mean because it was done by 1.25–1.40 resources before noon; that gap is the "who does Software before Emil arrives" question in one number. Rising values on a 1.00 resource signal skill erosion or tail growth (U4-type days).
+- `pm4py.discover_handover_of_work_network` (exclude the Arrival row): the diagonal weight (Deepa→Deepa 0.11, Ada→Ada 0.11 in the sample) measures ownership continuity, the off-diagonal mass measures handover burden; compare by `policy_version` to see whether a rule change moved work between teams. `pm4py.discover_working_together_network` shows which pairs execute parallel branches together.
+- `pm4py.discover_performance_dfg` / `pm4py.discover_dfg` per two-hour window and per `scenario_flag`: the edge with the largest waiting time is the migrating bottleneck (Intake→diagnostic in the morning surge, diagnostic→Validation when finish-first is switched off, Software edges when Chen is absent).
+- `pm4py.discover_organizational_roles` over sliding windows: detects role drift (Ada becoming an Electrical resource) as a precursor of skill erosion.
+- Conformance: a reference Petri net (Intake → diagnostics with optional AND-split → Validation) plus `pm4py.conformance_diagnostics_token_based_replay`; `resume` segments and ME/ES sequential cases appear as repeated activities and must be modelled (or filtered) rather than reported as deviations.
+- Concept drift: compare service-time and waiting-time distributions between `policy_version` values and between weeks with `pm4py.filter_time_range`; a change in the Intake wait distribution without a change in arrivals is the signature of a dispatch-rule change.
+
+# 8. Reproducible Python
+
+```python
+"""Robust multi-skill staffing: transparent discrete-event simulation + PM4Py post-analysis.
+Every mechanism (handover, team switch, setup, parallel/sequential branching, preemption,
+breaks, overtime cap, outage) is an explicit field in RULES or in the POLICY definitions.
+Run: python staffing_sim.py  (pandas, numpy, pm4py required)."""
+import heapq
+import numpy as np
+import pandas as pd
+import pm4py
+
+# --------------------------------------------------------------------------------------
+# 1. DATA TABLES (transcribed from the prompt)
+# --------------------------------------------------------------------------------------
+def hm(h, m=0):
+    return h * 60 + m
+
+SERVICE = {  # activity: (ord_lo, ord_hi, tail_lo, tail_hi, tail_prob)   minutes
+    'Intake': (5, 8, 10, 14, 0.08), 'Mechanical': (18, 28, 35, 55, 0.15),
+    'Electrical': (22, 35, 40, 65, 0.18), 'Software': (25, 40, 45, 80, 0.20),
+    'Validation': (10, 18, 22, 35, 0.12)}
+DIAG = ('Mechanical', 'Electrical', 'Software')
+FAMILY = {'Mechanical': 'MECH', 'Electrical': 'ES', 'Software': 'ES'}
+SKILL = {  # speed multiplier (None = not qualified)
+    'Ada':   dict(Intake=1.00, Mechanical=1.00, Electrical=1.35, Software=None, Validation=1.15),
+    'Ben':   dict(Intake=1.10, Mechanical=1.00, Electrical=None, Software=None, Validation=1.00),
+    'Chen':  dict(Intake=1.10, Mechanical=None, Electrical=1.00, Software=1.25, Validation=1.10),
+    'Deepa': dict(Intake=1.00, Mechanical=1.25, Electrical=1.00, Software=None, Validation=1.00),
+    'Emil':  dict(Intake=1.10, Mechanical=None, Electrical=1.30, Software=1.00, Validation=1.00),
+    'Farah': dict(Intake=1.00, Mechanical=1.40, Electrical=1.40, Software=1.40, Validation=1.20)}
+SHIFT = {  # start, end, break_start, break_end (minutes after midnight)
+    'Ada': (hm(8), hm(16), hm(12, 15), hm(12, 45)), 'Ben': (hm(8), hm(16), hm(12), hm(12, 30)),
+    'Chen': (hm(8), hm(16), hm(12, 30), hm(13)), 'Deepa': (hm(10), hm(18), hm(14), hm(14, 30)),
+    'Emil': (hm(12), hm(20), hm(16), hm(16, 30)), 'Farah': (hm(8), hm(12), None, None)}
+DEMAND = pd.DataFrame([
+    (hm(8), 7, 10, 55, 35, 30, 25, 15, 20, 10), (hm(10), 9, 15, 55, 30, 25, 25, 15, 25, 10),
+    (hm(12), 7, 12, 58, 30, 22, 28, 18, 20, 12), (hm(14), 10, 18, 52, 30, 20, 30, 18, 20, 12),
+    (hm(16), 6, 10, 50, 40, 20, 25, 25, 15, 15), (hm(18), 3, 5, 45, 50, 25, 20, 30, 10, 15)],
+    columns=['block', 'arrivals', 'P1', 'P2', 'P3', 'M', 'E', 'S', 'ME', 'ES']).astype(float)
+TYPES = ['M', 'E', 'S', 'ME', 'ES']
+TYPE_ACTS = {'M': ['Mechanical'], 'E': ['Electrical'], 'S': ['Software'],
+             'ME': ['Mechanical', 'Electrical'], 'ES': ['Electrical', 'Software']}
+SLA_MIN = {'P1': 120, 'P2': 8 * 60, 'P3': 24 * 60}
+PRIO_RANK = {'P1': 0, 'P2': 1, 'P3': 2}
+
+RULES = dict(  # coordination/handover rules from the prompt + modelling assumptions (A*)
+    handover_min=7,          # resource change between consecutive activities of a case
+    team_switch_min=5,       # extra when case moves MECH <-> ES family on a different resource
+    setup_min=5,             # resource switches diagnostic family between consecutive CASES
+    parallel_coord_min=8,    # ME/ES branches executed by two resources -> coordination before Validation
+    preempt_penalty=0.10,    # restart penalty on remaining active service time
+    max_preempt_per_case=1,
+    overtime_min=30,         # no task may be started that would end after shift_end + overtime
+    fair_util_cap=0.90,
+    day_end=hm(20),
+    handover_consumes_receiver=True,   # A: handover/setup minutes occupy the receiving resource
+    break_policy='after_current_task',  # A: a busy resource takes the (full) break once its task ends
+    carryover_p3_next_morning_ok=True)  # A: P3 unfinished at 20:30 is cleared by ~10:00 next day (24h SLA)
+
+def mean_service(act, tail_mult=1.0):
+    lo, hi, tlo, thi, p = SERVICE[act]
+    p = min(1.0, p * tail_mult) if act in DIAG else p
+    return (1 - p) * (lo + hi) / 2 + p * (tlo + thi) / 2
+
+# --------------------------------------------------------------------------------------
+# 2. SCENARIOS
+# --------------------------------------------------------------------------------------
+def build_scenario(name):
+    d = DEMAND.copy(); shifts = dict(SHIFT); tail_mult = 1.0; outages = []
+    if name in ('U1', 'U5'):
+        m = d.block < hm(12)
+        d.loc[m, 'arrivals'] *= 1.7
+        old_p1 = d.loc[m, 'P1'].copy()
+        d.loc[m, 'P1'] = old_p1 + 8                     # A: the 8 pp are taken from P2/P3 pro rata
+        scale = (100 - d.loc[m, 'P1']) / (100 - old_p1)
+        d.loc[m, 'P2'] *= scale; d.loc[m, 'P3'] *= scale
+    if name == 'U2':  # A: absolute E and ES demand doubles (harsher reading); mix renormalised
+        m = (d.block >= hm(12)) & (d.block < hm(16))
+        extra = (d.loc[m, 'E'] + d.loc[m, 'ES']) / 100
+        d.loc[m, 'arrivals'] *= (1 + extra)
+        d.loc[m, 'E'] *= 2; d.loc[m, 'ES'] *= 2
+        tot = d.loc[m, TYPES].sum(axis=1)
+        for c in TYPES:
+            d.loc[m, c] = d.loc[m, c] / tot * 100
+    if name in ('U3', 'U5'):
+        shifts.pop('Chen')
+    if name == 'U4':
+        tail_mult = 2.0
+    if name == 'U5':
+        outages = [('Intake', hm(9, 30), hm(10))]
+    return d, shifts, tail_mult, outages
+
+SCENARIOS = ['Base', 'U1', 'U2', 'U3', 'U4', 'U5']
+
+# --------------------------------------------------------------------------------------
+# 3. OFFERED LOAD vs CAPACITY (static approximation, base-minutes = minutes at multiplier 1.0)
+# --------------------------------------------------------------------------------------
+def offered_load_table(name):
+    d, shifts, tail_mult, outages = build_scenario(name)
+    rows = []
+    for _, r in d.iterrows():
+        n = r.arrivals
+        cnt = {'Intake': n, 'Validation': n,
+               'Mechanical': n * (r.M + r.ME) / 100,
+               'Electrical': n * (r.E + r.ME + r.ES) / 100,
+               'Software': n * (r.S + r.ES) / 100}
+        load = {a: cnt[a] * mean_service(a, tail_mult) for a in SERVICE}
+        b0, b1 = r.block, r.block + 120
+        cap = 0.0; cap_sw = 0.0; cap_mech = 0.0
+        for res, (s, e, bs, be) in shifts.items():
+            avail = max(0, min(e, b1) - max(s, b0))
+            if bs is not None:
+                avail -= max(0, min(be, b1) - max(bs, b0))
+            cap += avail
+            if SKILL[res]['Software']: cap_sw += avail / SKILL[res]['Software']
+            if SKILL[res]['Mechanical']: cap_mech += avail / SKILL[res]['Mechanical']
+        handover_est = n * 2 * RULES['handover_min'] * 0.6   # A: ~60% of stage transitions change hands
+        rows.append(dict(scenario=name, block=f"{int(b0)//60:02d}:00", arrivals=round(n, 1),
+                         **{k: round(v) for k, v in load.items()},
+                         total_load=round(sum(load.values()) + handover_est),
+                         capacity=round(cap), rho=round((sum(load.values()) + handover_est) / cap, 2) if cap else np.inf,
+                         sw_cap=round(cap_sw), mech_cap=round(cap_mech)))
+    return pd.DataFrame(rows)
+
+# --------------------------------------------------------------------------------------
+# 4. POLICIES (operational dispatch rules; nothing is hidden in the engine)
+# --------------------------------------------------------------------------------------
+QUALIFIED = {a: [r for r in SKILL if SKILL[r][a] is not None] for a in SERVICE}
+HOME = {  # strict-specialisation queues (1.00 resources; Chen covers Software before Emil's shift)
+    'Intake': ['Farah', 'Ada', 'Deepa'], 'Mechanical': ['Ada', 'Ben'], 'Electrical': ['Chen', 'Deepa'],
+    'Software': ['Emil', 'Chen'], 'Validation': ['Ben', 'Deepa', 'Emil']}
+GUARD = {(hm(8), hm(12)): 'Farah', (hm(12), hm(18)): 'Deepa'}  # reserved P1 capacity by period
+
+POLICIES = {
+    'SPEC': dict(desc='strict specialisation: fixed 1.00 queues, priority then FIFO, no preemption, always parallel, '
+                      'no ownership preference',
+                 eligible=HOME, overflow_wait=None, weigh_handover=False, preempt=None,
+                 parallel='always', order='fifo', guard=None),
+    'POOL': dict(desc='full pooling: any qualified resource, priority then FIFO, choose min(effective time + handover + setup), '
+                      'P1 preempts any P2/P3 diagnostic, P1/P2 parallel, P3 sequential',
+                 eligible=QUALIFIED, overflow_wait=None, weigh_handover=True, preempt=dict(P3=0, P2=0),
+                 parallel='p3_seq', order='fifo', guard=None),
+    'POOL_SRPT': dict(desc='as POOL but within a priority class the case with the shortest expected remaining work goes first',
+                      eligible=QUALIFIED, overflow_wait=None, weigh_handover=True, preempt=dict(P3=0, P2=0),
+                      parallel='p3_seq', order='srpt', guard=None),
+    'HYBRID': dict(desc='home queues; overflow to any qualified resource after waiting P1:0/P2:10/P3:20 min; guard resource '
+                        '(Farah 08-12, Deepa 12-18) takes no P3 unless it waited 45 min; P1 preempts P3 at once, P2 only after '
+                        '5 min; threshold parallelisation; within a class finish cases before starting new ones; P3 promoted to '
+                        'P2 class once 50% of its 24h SLA clock is used; ownership preferred (handover-weighted choice)',
+                   eligible=HOME, overflow_wait=dict(P1=0, P2=10, P3=20), weigh_handover=True,
+                   preempt=dict(P3=0, P2=5), parallel='threshold', order='finish_first_aging', aging_sla_frac=0.5,
+                   # p2_max_task_min: set e.g. 20 to also keep the guard off long P2 tasks (tested: idles capacity, hurts P2)
+                   guard=dict(periods=GUARD, p3_release_wait=45, p2_max_task_min=10 ** 6)),
+}
+
+def p1_zero_queue_bound(n=20000, seed=0, tail_mult=1.0):
+    """Monte-Carlo ceiling on P1 attainment if a P1 case NEVER waits: best multipliers (1.0), one 7-min handover,
+    ME/ES in parallel (+8 coordination). Anything below this is queueing/skill-gap loss, not policy loss."""
+    rng = np.random.default_rng(seed); res = {}
+    for ty, acts in TYPE_ACTS.items():
+        ok = 0
+        for _ in range(n):
+            diag = [draw_service(rng, a, tail_mult) for a in acts]
+            d = max(diag) + (RULES['parallel_coord_min'] if len(acts) == 2 else 0)
+            flow = draw_service(rng, 'Intake', tail_mult) + d + draw_service(rng, 'Validation', tail_mult) + RULES['handover_min']
+            ok += flow <= SLA_MIN['P1']
+        res[ty] = ok / n
+    return res
+
+# --------------------------------------------------------------------------------------
+# 5. DISCRETE-EVENT SIMULATION
+# --------------------------------------------------------------------------------------
+class Case:
+    __slots__ = ('cid', 'arr', 'prio', 'ctype', 'draw', 'mode', 'done', 'branch_res',
+                 'preempts', 'end', 'last_res', 'last_family', 'service_sum')
+    def __init__(self, cid, arr, prio, ctype, draw):
+        self.cid, self.arr, self.prio, self.ctype, self.draw = cid, arr, prio, ctype, draw
+        self.mode = None; self.done = set(); self.branch_res = {}
+        self.preempts = 0; self.end = None; self.last_res = None; self.last_family = None; self.service_sum = 0.0
+
+class Task:
+    __slots__ = ('case', 'act', 'remaining', 'queue_entry', 'ready', 'preempted', 'next_act',
+                 '_h', '_s', '_assigned', '_elig')
+    def __init__(self, case, act, remaining, t, ready=None, next_act=None):
+        self.case, self.act, self.remaining, self.queue_entry = case, act, remaining, t
+        self.ready = t if ready is None else ready; self.preempted = False; self.next_act = next_act
+        self._h = self._s = self._assigned = 0.0; self._elig = None
+
+class Res:
+    __slots__ = ('name', 'start', 'end', 'bs', 'be', 'busy', 'on_break_until', 'break_taken',
+                 'break_pending', 'last_family', 'last_case', 'busy_min', 'over_min',
+                 'svc_start', 'svc_end', 'task', 'mult', 'token')
+    def __init__(self, name, shift):
+        self.name = name; self.start, self.end, self.bs, self.be = shift; self.token = 0
+        self.busy = False; self.on_break_until = -1; self.break_taken = self.bs is None; self.break_pending = False
+        self.last_family = None; self.last_case = None; self.busy_min = 0.0; self.over_min = 0.0
+        self.svc_start = self.svc_end = None; self.task = None; self.mult = None
+    def available(self, t):
+        return (not self.busy) and self.start <= t < self.end and t >= self.on_break_until
+
+def draw_service(rng, act, tail_mult):
+    lo, hi, tlo, thi, p = SERVICE[act]
+    p = min(1.0, p * tail_mult) if act in DIAG else p
+    return rng.uniform(tlo, thi) if rng.random() < p else rng.uniform(lo, hi)
+
+def sample_cases(rng, d, tail_mult):
+    cases = []
+    for _, r in d.iterrows():
+        for _ in range(rng.poisson(r.arrivals)):   # A: Poisson counts, uniform within block
+            arr = r.block + rng.uniform(0, 120)
+            prio = rng.choice(['P1', 'P2', 'P3'], p=np.array([r.P1, r.P2, r.P3]) / 100)
+            ctype = rng.choice(TYPES, p=np.array([r[c] for c in TYPES]) / 100)
+            draw = {a: draw_service(rng, a, tail_mult) for a in ['Intake', 'Validation'] + TYPE_ACTS[ctype]}
+            cases.append(Case(None, arr, prio, ctype, draw))
+    cases.sort(key=lambda c: c.arr)
+    for i, c in enumerate(cases):
+        c.cid = f'C{i + 1:03d}'
+    return cases
+
+def expected_remaining_work(case, tail_mult):
+    return sum(mean_service(a, tail_mult) for a in ['Intake', 'Validation'] + TYPE_ACTS[case.ctype] if a not in case.done)
+
+def simulate(policy_name, scenario, seed, keep_log=False):
+    pol = POLICIES[policy_name]
+    d, shifts, tail_mult, outages = build_scenario(scenario)
+    rng = np.random.default_rng(seed)
+    cases = sample_cases(rng, d, tail_mult)
+    R = {n: Res(n, s) for n, s in shifts.items()}
+    horizon = RULES['day_end'] + RULES['overtime_min']
+    ev = []; seq = [0]
+    def push(t, kind, payload=None):
+        seq[0] += 1; heapq.heappush(ev, (t, seq[0], kind, payload))
+    for c in cases:
+        push(c.arr, 'arrival', c)
+    for r in R.values():
+        push(r.start, 'tick'); push(r.end, 'tick')
+        if r.bs is not None: push(r.bs, 'break')
+    for _, s, e in outages:
+        push(e, 'tick')
+    queue = []; log = []; stats = dict(preempts=0, handover_min=0.0, setup_min=0.0, coord_min=0.0, parallel=0, seq=0)
+    now = [0.0]   # simulation clock (minutes after midnight), updated by the event loop
+
+    def blocked(act, t):
+        return any(a == act and s <= t < e for a, s, e in outages)
+
+    def eligible_set(task, t):
+        elig = list(pol['eligible'][task.act])
+        if pol['overflow_wait'] is not None and (t - task.queue_entry) >= pol['overflow_wait'][task.case.prio]:
+            elig = QUALIFIED[task.act]
+        if pol['guard']:
+            for (gs, ge), g in pol['guard']['periods'].items():
+                if gs <= t < ge and g in elig and g in R:
+                    waited = t - task.queue_entry
+                    eff = SKILL[g][task.act] * task.remaining
+                    drop = (task.case.prio == 'P3' and waited < pol['guard']['p3_release_wait']) or \
+                           (task.case.prio == 'P2' and eff > pol['guard']['p2_max_task_min'])
+                    if drop:
+                        elig = [x for x in elig if x != g]
+        return [x for x in elig if x in R]
+
+    def enqueue(task):
+        queue.append(task)
+        waits = set()
+        if pol['overflow_wait']: waits |= set(pol['overflow_wait'].values())
+        if pol['guard']: waits.add(pol['guard']['p3_release_wait'])
+        if pol['preempt']: waits |= set(pol['preempt'].values())
+        for w in waits:   # re-evaluate dispatch when a time threshold is crossed (never schedule in the past)
+            if w: push(max(now[0], task.queue_entry + w), 'tick')
+        if pol.get('aging_sla_frac') and task.case.prio == 'P3':
+            push(max(now[0], task.case.arr + pol['aging_sla_frac'] * SLA_MIN['P3']), 'tick')
+
+    def penalties(res, task):
+        h = 0.0
+        if task.case.last_res is not None and res.name != task.case.last_res:
+            h += RULES['handover_min']
+            if task.act in DIAG and task.case.last_family and FAMILY[task.act] != task.case.last_family:
+                h += RULES['team_switch_min']
+        s = RULES['setup_min'] if (task.act in DIAG and res.last_family and res.last_family != FAMILY[task.act]
+                                   and res.last_case != task.case.cid) else 0.0
+        return h, s
+
+    def cost(res, task):
+        m = SKILL[res.name][task.act]; h, s = penalties(res, task)
+        c = m * task.remaining + s + (h if pol['weigh_handover'] else 0)
+        if task.next_act and SKILL[res.name][task.next_act] is None:   # sequential mode wants a cross-skilled owner
+            c += RULES['handover_min'] + RULES['team_switch_min']
+        return c
+
+    def can_finish(res, task, t):
+        m = SKILL[res.name][task.act]; h, s = penalties(res, task)
+        return t + h + s + m * task.remaining <= res.end + RULES['overtime_min']
+
+    def start(res, task, t):
+        m = SKILL[res.name][task.act]; h, s = penalties(res, task)
+        stats['handover_min'] += h; stats['setup_min'] += s
+        res.busy = True; res.task = task; res.mult = m
+        res.svc_start = t + h + s; res.svc_end = res.svc_start + m * task.remaining
+        task._h, task._s, task._assigned, task._elig = h, s, t, None
+        res.busy_min += h + s
+        res.token += 1
+        push(res.svc_end, 'end', (res.name, res.token))   # token invalidates the event if preempted
+        if keep_log:
+            task._elig = ','.join(eligible_set(task, t))
+
+    def order_key(task):
+        prio = PRIO_RANK[task.case.prio]
+        if pol['order'] == 'srpt':
+            return (prio, 0, expected_remaining_work(task.case, tail_mult), task.queue_entry)
+        if pol['order'] == 'finish_first_aging':
+            if prio == 2 and (now[0] - task.case.arr) >= pol['aging_sla_frac'] * SLA_MIN['P3']:
+                prio = 1                                   # anti-starvation: P3 competes as P2 once half its SLA clock is used
+            stage = 0 if task.act == 'Validation' else (1 if task.act in DIAG else 2)
+            return (prio, stage, task.queue_entry, 0)    # finish cases before starting new ones
+        return (prio, 0, task.queue_entry, 0)
+
+    def dispatch(t):
+        now[0] = t
+        # break start for idle resources handled in 'break' event; here: assignment + preemption
+        for task in sorted(queue, key=order_key):
+            if task.ready > t or blocked(task.act, t):
+                continue
+            cands = [R[n] for n in eligible_set(task, t) if R[n].available(t) and can_finish(R[n], task, t)]
+            if cands:
+                best = min(cands, key=lambda r: cost(r, task))
+                queue.remove(task); start(best, task, t)
+        # preemption pass (P1 only, diagnostic victims only, one preemption per case)
+        if pol['preempt'] is None:
+            return
+        for task in sorted(queue, key=order_key):
+            # any activity of a P1 case may trigger preemption; only a P2/P3 DIAGNOSTIC activity can be the victim
+            if task.case.prio != 'P1' or task.ready > t or blocked(task.act, t):
+                continue
+            victims = []
+            for n in eligible_set(task, t):
+                r = R[n]
+                if not r.busy or r.on_break_until > t: continue
+                v = r.task
+                if v.act not in DIAG or v.case.prio == 'P1' or v.case.preempts >= RULES['max_preempt_per_case']: continue
+                if (t - task.queue_entry) < pol['preempt'][v.case.prio]: continue
+                if r.svc_end - t < 5: continue          # A: do not preempt a task about to finish
+                if not can_finish(r, task, t): continue
+                victims.append((PRIO_RANK[v.case.prio], -(r.svc_end - t), cost(r, task), r))
+            if victims:
+                r = max(victims)[3]   # lowest priority victim, then most remaining work
+                finish(r, t, preempted=True)
+                queue.remove(task); start(r, task, t); stats['preempts'] += 1
+
+    def finish(r, t, preempted=False):
+        task = r.task; c = task.case
+        if t <= r.svc_start:
+            done_base, seg_start, seg_end = 0.0, None, None
+        else:
+            seg_start = r.svc_start; seg_end = t
+            done_base = (t - r.svc_start) / r.mult
+        r.busy_min += max(0.0, t - r.svc_start) if seg_start is not None else 0.0
+        if t > r.end: r.over_min = max(r.over_min, t - r.end)
+        if keep_log and seg_start is not None:
+            log.append(dict(case=c.cid, activity=task.act, start=seg_start, end=seg_end, resource=r.name,
+                            priority=c.prio, ctype=c.ctype, queue_entry=task.queue_entry, assigned=task._assigned,
+                            eligible=task._elig, skill_mult=r.mult, planned_min=mean_service(task.act, tail_mult) * r.mult,
+                            actual_min=seg_end - seg_start, handover_min=task._h, setup_min=task._s,
+                            segment='resume' if task.preempted else 'first', preempted_here=preempted,
+                            branch_mode=c.mode, sla_left=c.arr + SLA_MIN[c.prio] - seg_end))
+        c.service_sum += (seg_end - seg_start) if seg_start is not None else 0.0
+        r.busy = False; r.task = None
+        if task.act in DIAG:
+            r.last_family = FAMILY[task.act]; r.last_case = c.cid
+        if preempted:
+            rem = max(0.0, task.remaining - done_base) * (1 + RULES['preempt_penalty'])
+            nt = Task(c, task.act, rem, task.queue_entry, next_act=task.next_act); nt.preempted = True
+            c.preempts += 1; enqueue(nt)
+            return
+        c.done.add(task.act); c.last_res = r.name
+        if task.act in DIAG:
+            c.last_family = FAMILY[task.act]; c.branch_res[task.act] = r.name
+        # --- routing of the next stage ---
+        if task.act == 'Intake':
+            acts = TYPE_ACTS[c.ctype]
+            if len(acts) == 1:
+                enqueue(Task(c, acts[0], c.draw[acts[0]], t)); c.mode = 'single'
+            else:
+                c.mode = decide_parallel(c, acts, t)
+                if c.mode == 'parallel':
+                    stats['parallel'] += 1
+                    for a in acts: enqueue(Task(c, a, c.draw[a], t))
+                else:
+                    stats['seq'] += 1
+                    enqueue(Task(c, acts[0], c.draw[acts[0]], t, next_act=acts[1]))
+        elif task.act in DIAG:
+            acts = TYPE_ACTS[c.ctype]
+            left = [a for a in acts if a not in c.done]
+            if left and c.mode == 'sequential':
+                enqueue(Task(c, left[0], c.draw[left[0]], t))
+            elif not left:
+                coord = 0.0
+                if len(acts) == 2 and len(set(c.branch_res.values())) == 2:
+                    coord = RULES['parallel_coord_min']; stats['coord_min'] += coord
+                enqueue(Task(c, 'Validation', c.draw['Validation'], t, ready=t + coord))
+                if coord: push(t + coord, 'tick')
+        else:
+            c.end = t
+        if r.break_pending and t < r.end:
+            r.break_pending = False; r.break_taken = True
+            r.on_break_until = t + (r.be - r.bs); push(r.on_break_until, 'tick')
+
+    def decide_parallel(c, acts, t):
+        rule = pol['parallel']
+        if rule == 'always': return 'parallel'
+        if rule == 'p3_seq': return 'sequential' if c.prio == 'P3' else 'parallel'
+        # threshold: P1 parallel; P2 parallel only if both branches can start now; P3 sequential unless SLA clock > 50% used
+        if c.prio == 'P1': return 'parallel'
+        idle = [n for n in R if R[n].available(t)]
+        both_now = all(any(SKILL[n][a] for n in idle) for a in acts) and len(idle) >= 2
+        clock_used = (t - c.arr) / SLA_MIN[c.prio]
+        if c.prio == 'P2': return 'parallel' if (both_now or clock_used > 0.4) else 'sequential'
+        return 'parallel' if clock_used > 0.5 else 'sequential'
+
+    while ev:
+        t, _, kind, payload = heapq.heappop(ev)
+        if t > horizon: break
+        assert t >= now[0] - 1e-9, 'event scheduled in the past'
+        now[0] = t
+        if kind == 'arrival':
+            enqueue(Task(payload, 'Intake', payload.draw['Intake'], t))
+        elif kind == 'end':
+            name, token = payload
+            if R[name].busy and R[name].token == token:
+                finish(R[name], t)
+        elif kind == 'break':
+            for r in [x for x in R.values() if x.bs == t]:
+                if r.busy: r.break_pending = True
+                else:
+                    r.break_taken = True; r.on_break_until = t + (r.be - r.bs); push(r.on_break_until, 'tick')
+        dispatch(t)
+
+    # ---- metrics ----
+    rows = []
+    for c in cases:
+        flow = (c.end - c.arr) if c.end is not None else None
+        if c.end is not None:
+            met = flow <= SLA_MIN[c.prio]
+        else:
+            met = (c.prio == 'P3' and RULES['carryover_p3_next_morning_ok'] and c.arr >= hm(10))
+        rows.append(dict(case=c.cid, prio=c.prio, ctype=c.ctype, arr=c.arr, flow=flow, service=c.service_sum,
+                         wait=(flow - c.service_sum) if flow is not None else None, met=met, carry=c.end is None,
+                         mode=c.mode))
+    cdf = pd.DataFrame(rows)
+    util = {}
+    for r in R.values():
+        avail = (r.end - r.start) - ((r.be - r.bs) if r.bs is not None else 0)
+        util[r.name] = r.busy_min / avail
+    done = cdf[~cdf.carry]
+    svc_total = done.service.sum() + 1e-9
+    m = dict(policy=policy_name, scenario=scenario, seed=seed, n_cases=len(cdf),
+             mean_wait=done.wait.mean(), p90_flow=done.flow.quantile(0.9), mean_flow=done.flow.mean(),
+             P1_SLA=cdf[cdf.prio == 'P1'].met.mean() if (cdf.prio == 'P1').any() else np.nan,
+             P2_SLA=cdf[cdf.prio == 'P2'].met.mean(), P3_SLA=cdf[cdf.prio == 'P3'].met.mean(),
+             carryover=int(cdf.carry.sum()), max_util=max(util.values()), util_spread=max(util.values()) - min(util.values()),
+             n_over90=sum(u > RULES['fair_util_cap'] for u in util.values()),
+             handover_burden=(stats['handover_min'] + stats['setup_min'] + stats['coord_min']) / svc_total,
+             preempts=stats['preempts'], parallel_share=stats['parallel'] / max(1, stats['parallel'] + stats['seq']),
+             max_overtime=max(r.over_min for r in R.values()))
+    return m, cdf, pd.DataFrame(log), util, R
+
+# --------------------------------------------------------------------------------------
+# 6. EXPERIMENT + ROBUSTNESS SUMMARY
+# --------------------------------------------------------------------------------------
+def run_experiment(n_seeds=30):
+    out = []
+    for sc in SCENARIOS:
+        for p in POLICIES:
+            for s in range(n_seeds):
+                out.append(simulate(p, sc, s)[0])
+    return pd.DataFrame(out)
+
+def summarize(df):
+    g = df.groupby(['policy', 'scenario'])
+    agg = g.agg(mean_wait=('mean_wait', 'mean'), p90_flow=('p90_flow', 'mean'), p90_flow_sd=('p90_flow', 'std'),
+                P1_SLA=('P1_SLA', 'mean'), P1_SLA_p10=('P1_SLA', lambda x: x.quantile(0.1)),
+                P2_SLA=('P2_SLA', 'mean'), P2_SLA_sd=('P2_SLA', 'std'), P3_SLA=('P3_SLA', 'mean'), carry=('carryover', 'mean'),
+                max_util=('max_util', 'mean'), n_over90=('n_over90', 'mean'), spread=('util_spread', 'mean'),
+                hand=('handover_burden', 'mean'), preempts=('preempts', 'mean'), par=('parallel_share', 'mean'))
+    return agg.reset_index()
+
+def sla_by_type(policies, scenario='Base', n_seeds=30, prio='P2'):
+    """Fairness check: does a policy buy its average by starving long case types (S, ES, ME)?"""
+    rows = []
+    for p in policies:
+        for s in range(n_seeds):
+            _, cdf, _, _, _ = simulate(p, scenario, s)
+            sub = cdf[cdf.prio == prio]
+            for ty, g in sub.groupby('ctype'):
+                rows.append(dict(policy=p, ctype=ty, met=g.met.mean(), n=len(g)))
+    d = pd.DataFrame(rows)
+    return d.groupby(['policy', 'ctype']).apply(lambda g: np.average(g.met, weights=g.n)).unstack().round(2)
+
+def robustness(summary):
+    rows = []
+    for p, sub in summary.groupby('policy'):
+        sub = sub.set_index('scenario'); base = sub.loc['Base']
+        shocks = sub.drop('Base')
+        # regret in p90 flow vs the best policy in the same scenario (minutes)
+        regret = max(sub.loc[sc, 'p90_flow'] - summary[summary.scenario == sc].p90_flow.min() for sc in SCENARIOS)
+        rows.append(dict(policy=p, base_P1=base.P1_SLA, worst_P1=shocks.P1_SLA.min(), worst_P2=shocks.P2_SLA.min(),
+                         worst_p90_flow=shocks.p90_flow.max(), max_regret_p90=regret,
+                         worst_scn_P2=shocks.P2_SLA.idxmin(), mean_over90=sub.n_over90.mean(),
+                         # explicit robustness objective: worst-case P1, worst-case P2, tail regret (per hour)
+                         robust_score=0.5 * shocks.P1_SLA.min() + 0.3 * shocks.P2_SLA.min() - 0.2 * regret / 60))
+    return pd.DataFrame(rows).sort_values('robust_score', ascending=False)
+
+# --------------------------------------------------------------------------------------
+# 7. EVENT LOG + PM4PY POST-ANALYSIS
+# --------------------------------------------------------------------------------------
+def to_event_log(log_df, cdf, policy, scenario, day='2026-09-02'):
+    base = pd.Timestamp(day)
+    ev = log_df.copy()
+    ev['case:concept:name'] = ev['case']; ev['concept:name'] = ev['activity']; ev['org:resource'] = ev['resource']
+    ev['start_timestamp'] = base + pd.to_timedelta(ev['start'], unit='m')
+    ev['time:timestamp'] = base + pd.to_timedelta(ev['end'], unit='m')
+    ev['policy_version'] = policy; ev['scenario_flag'] = scenario
+    arr = pd.DataFrame({'case:concept:name': cdf.case, 'concept:name': 'Arrival', 'org:resource': 'system',
+                        'start_timestamp': base + pd.to_timedelta(cdf.arr, unit='m'),
+                        'time:timestamp': base + pd.to_timedelta(cdf.arr, unit='m'), 'priority': cdf.prio,
+                        'policy_version': policy, 'scenario_flag': scenario})
+    ev = pd.concat([ev, arr], ignore_index=True).sort_values(['time:timestamp', 'start_timestamp'])
+    return pm4py.format_dataframe(ev, case_id='case:concept:name', activity_key='concept:name',
+                                  timestamp_key='time:timestamp', start_timestamp_key='start_timestamp')
+
+def pm4py_analysis(ev):
+    # (a) case-level service/sojourn/waiting as PM4Py defines them: service = SUM of activity durations (parallel
+    #     branches are double counted), sojourn = last end - first start (Arrival row makes this = flow time),
+    #     waiting = sojourn - service.  These are NOT queue-specific waits.
+    cs = pm4py.insert_case_service_waiting_time(ev, start_timestamp_key='start_timestamp', timestamp_key='time:timestamp',
+                                                case_id_key='case:concept:name', activity_key='concept:name')
+    case_lvl = cs.groupby('case:concept:name')[['@@service_time', '@@sojourn_time', '@@waiting_time']].first() / 60
+    print('\nPM4Py case-level (minutes; service=SUM of activity durations, sojourn=flow incl. initial queue):')
+    print(case_lvl.agg(['mean', 'median', lambda x: x.quantile(0.9)]).set_axis(['mean', 'median', 'p90']).round(1))
+    # (b) activity-level mean service time (seconds -> minutes)
+    st = pm4py.get_service_time(ev, start_timestamp_key='start_timestamp', timestamp_key='time:timestamp',
+                                aggregation_measure='mean', case_id_key='case:concept:name', activity_key='concept:name')
+    print('PM4Py mean service time per activity (min):', {k: round(v / 60, 1) for k, v in st.items() if k != 'Arrival'})
+    # (c) handover-of-work network (exclude the synthetic Arrival row)
+    how = pm4py.discover_handover_of_work_network(ev[ev['concept:name'] != 'Arrival'], resource_key='org:resource',
+                                                  timestamp_key='time:timestamp', case_id_key='case:concept:name')
+    conn = how.connections if hasattr(how, 'connections') else how   # SNA object (pm4py>=2.7) or plain dict
+    top = sorted(conn.items(), key=lambda kv: -kv[1])[:8]
+    print('PM4Py handover-of-work (top pairs, relative weight):', [(f'{a}->{b}', round(v, 3)) for (a, b), v in top])
+    # (d) stage-specific queue waits from our own attributes (what PM4Py cannot tell you)
+    seg = ev[ev['concept:name'] != 'Arrival']
+    stage_wait = (seg['assigned'] - seg['queue_entry']).groupby(seg['concept:name']).agg(['mean', lambda x: x.quantile(0.9)])
+    stage_wait.columns = ['mean_queue_wait', 'p90_queue_wait']
+    print('Stage-specific queue waits from the log attributes (min):'); print(stage_wait.round(1))
+    print('Handover/setup minutes recorded in log:', round(seg.handover_min.sum()), round(seg.setup_min.sum()),
+          '| resume segments (preemptions):', int((seg.segment == 'resume').sum()))
+
+# --------------------------------------------------------------------------------------
+if __name__ == '__main__':
+    pd.set_option('display.width', 200); pd.set_option('display.max_columns', 30)
+    print('Mean base service minutes:', {a: round(mean_service(a), 1) for a in SERVICE})
+    print('P1 zero-queue attainment ceiling by case type (base tails):', {k: round(v, 2) for k, v in p1_zero_queue_bound().items()})
+    print('P1 zero-queue attainment ceiling by case type (U4 tails):  ', {k: round(v, 2) for k, v in p1_zero_queue_bound(tail_mult=2).items()})
+    print('\n=== OFFERED LOAD vs CAPACITY (base-minutes incl. ~60% handover estimate; rho>1 = infeasible in block) ===')
+    for sc in SCENARIOS:
+        print(offered_load_table(sc).to_string(index=False))
+    for p, spec in POLICIES.items():
+        print(f'{p}: {spec["desc"]}')
+    df = run_experiment(n_seeds=30)
+    summ = summarize(df)
+    print('\n=== POLICY x SCENARIO (30 seeds; means; p90_flow_sd = seed-to-seed sd) ===')
+    print(summ.round(2).to_string(index=False))
+    print('\n=== ROBUSTNESS (worst case over U1-U5; regret = p90_flow minus best policy in that scenario) ===')
+    print(robustness(summ).round(3).to_string(index=False))
+    print('\n=== FAIRNESS: P2 SLA attainment by case type, Base (30 seeds) ===')
+    print(sla_by_type(list(POLICIES), 'Base').to_string())
+    m, cdf, log, util, _R = simulate('HYBRID', 'Base', seed=1, keep_log=True)
+    ev = to_event_log(log, cdf, 'HYBRID', 'Base')
+    print('\n=== EVENT LOG SAMPLE (HYBRID, Base, seed 1) ===')
+    print(ev[['case:concept:name', 'concept:name', 'start_timestamp', 'time:timestamp', 'org:resource',
+              'handover_min', 'setup_min', 'segment', 'branch_mode']].head(12).to_string(index=False))
+    print('Utilisation by resource:', {k: round(float(v), 2) for k, v in util.items()})
+    pm4py_analysis(ev)
+```
+
+Mechanisms deliberately omitted or simplified (so the scaffold is honest): a single day is simulated, so the compounding of carry-over into the next morning is described (Section 2) but not simulated; the 24-hour P3 clock is closed with rule A10; breaks are never split; a task cannot be handed over mid-service at shift end (A7); the surge-mode pass-over cap of Section 5 is not implemented; handover minutes are charged to the receiver only (A3); dispatch decisions are made at event times only, so a "wait 2 minutes for the specialist who is about to finish" behaviour is captured only through the overflow thresholds; resources do not speed up under pressure or slow down with fatigue. Run time is ≈ 10 s for 720 simulated days on a laptop; pm4py ≥ 2.7 (the handover network returns an `SNA` object; the code also accepts the older dict).
+
+# 9. Limits and validation plan
+
+What cannot be concluded from expected arrivals and service ranges alone:
+
+- The arrival process. Poisson-uniform within a block is an assumption; real incident arrivals cluster (an incident produces several correlated cases), which would make the U1/U2 behaviour the norm rather than the exception and would make the surge trigger fire often. The correlation between priority and type (are P1 cases disproportionately S/ES?) drives P1 attainment and is unknown.
+- Service-time shape and its dependence on resource and load. Uniform-on-a-range is a placeholder; real distributions are right-skewed with occasional very long cases; the multipliers may not be constant (a 1.40 generalist may be 1.2 on easy cases and 1.8 on tail cases), which changes the overflow break-even.
+- The true cost of handovers, setup and preemption. The prompt's constants are point values; the case for pooling rests on them (if a handover really costs 7 minutes of *both* people, pooling loses ~150 more minutes per day than modelled, still not enough to change the ranking).
+- The steady state. One day cannot show how quickly the backlog compounds; a multi-day run with the promoted-P3 rule is required before any statement about P3 attainment beyond "conditional on next-morning capacity".
+- The probability of each U scenario, hence any expected-value comparison across scenarios; only worst-case and per-scenario statements are legitimate.
+- Whether the guard and the overflow thresholds have value: in an over-capacity system they are inert; their benefit only appears at ρ < 0.9 and cannot be measured here.
+- Behavioural response: dispatchers and technicians adapt to rules (parallelising to look busy, re-labelling types), which no simulation of a fixed rule set captures.
+
+Pilot and backtest design that separates the policies while protecting P1:
+
+1. **Calibration backtest (weeks 1–2, no operational change).** Replay historical arrivals (real timestamps, priorities, types) through the simulator with service distributions re-estimated per resource × activity from the existing log; compare simulated and actual flow times, handover counts and utilisation under the *current* practice. Accept the model only if p50/p90 flow per priority are within ±15% and the handover network is qualitatively reproduced; otherwise revise A2/A3 before piloting.
+2. **Shadow mode (weeks 3–4).** Compute the HYBRID recommendation for every assignment in real time, log recommended vs actual resource, eligible set and predicted wait, do not enforce. Measures the disagreement rate, the predicted gain, and trains dispatchers on the checklist.
+3. **Stepped-wedge pilot (weeks 5–12).** Switch one two-hour block at a time to HYBRID (start with 12:00–16:00, where the skill sets overlap most and the P1 share is highest), keep the others on current practice, rotate the order across weeks so that block effects and day-of-week effects are separable. P1 handling is identical in all arms (P1 always gets class priority and the preemption rule), so the experiment only randomises P2/P3 ordering, overflow and parallelisation. Surge mode is enabled only after the base mode has two clean weeks.
+4. **Pre-registered metrics and stop rules.** Primary: P2 attainment and p90 flow by block; secondary: P1 attainment, handover minutes per case, preemptions per day, carry-over count and age, P2 attainment spread across case types, utilisation spread. Minimum detectable effect at 30 days per arm: ≈ 0.05 in P2 attainment and ≈ 20 minutes in p90 (from the seed spreads in Section 4). Stop and revert if P1 attainment in any arm falls below 0.80 on two consecutive days, if preemptions exceed 10 in a day, or if any case type's P2 attainment falls below 0.40 for a week.
+5. **Capacity experiment in parallel.** Trial the two staffing changes of Section 5 (Emil Mechanical cross-training; moving four hours of capacity into 14:00–20:00) on alternate weeks; they are expected to matter more than any routing choice and must not be confounded with the routing pilot, hence the alternation.
+6. **Process-mining gate.** Every week, rebuild the interval log of Section 7, recompute `get_service_time` per resource × activity (multiplier drift), the handover network by `policy_version`, the stage-specific queue waits and the performance DFG per block; a rule change is kept only if the log confirms the mechanism it was supposed to produce (fewer off-diagonal handovers, shorter Validation queues), not merely a better average.

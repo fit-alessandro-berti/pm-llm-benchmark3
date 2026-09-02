@@ -1,0 +1,171 @@
+
+
+# 1. Cluster diagnoses
+
+| cluster | top_explanation | second_explanation | confidence_0_to_100 | strongest_evidence | strongest_counterevidence | physical_concurrency_plausible | data_correction_needed |
+|---|---|---|---|---|---|---|---|
+| G1 | genuine simultaneous batch | start batching | 95 | Automated fixture capacity (4 items); identical start/ends | None significant | Yes | None |
+| G2 | start batching | sequential batching | 80 | "Begin group" button; identical start, staggered complete | None | No (sequential work) | None |
+| G3 | end batching | shared-account artifact | 75 | All complete at 11:30 despite spread in starts; manual bulk form submission habit | Starts spread significantly | No | None |
+| G4 | sequential batching | concurrent work | 50 | Distinct timestamps; scanner source suggests automation | None | No | None |
+| G5 | shared-account artifact | concurrent work | 90 | Resource ID explicitly shared (`analyst_pool`); staggered starts/ends overlap | None | Yes (physically, not logically) | Identity resolution |
+| G6 | end-of-shift bulk entry | end batching | 98 | Identical start/complete (17:00); manual bulk form; spread queue arrivals | No | No | Interval-censoring |
+| G7 | timestamp coarsening | genuine simultaneous batch | 70 | Precision field = 15 min; rounded to quarter-hours | Queue arrivals not all at same time | No | Precision rounding |
+| G8 | sequential batching | queue accumulation after capacity loss | 75 | Sequential starts/ends; safety check creates delay gap | None | No | Clock synchronization |
+
+**Assumption:** I assume that identical start/complete timestamps usually imply batched logging rather than simultaneous physical execution unless hardware constraints (like G1 fixture) or explicit manual entry rules (like G6/G7) dictate otherwise.
+
+# 2. Expected temporal signatures
+
+| Signature | G1 | G2 | G3 | G4 | G5 | G6 | G7 | G8 |
+|---|---|---|---|---|---|---|---|---|
+| Start equality | Yes | Yes | No | No | No | Yes | Yes | No |
+| End equality | Yes | No | Yes | No | No | Yes | Yes | No |
+| Adjacency | Mixed | Yes | Yes | Yes | Yes | Mixed | Mixed | Yes |
+| Overlap (time overlap) | High | Low | High | No | Yes | High | High | No |
+| Recording lag | Seconds | Minutes | Minutes | Seconds | Minutes | Minutes | Minutes | Seconds |
+| Source precision | 1 sec | 1 min | 1 min | 1 sec | 1 min | 1 min | 15 min | 1 sec |
+| Resource identity reliability | High | High | High | High | Low | High | High | High |
+| Queue-arrival pattern | Tightly clustered | Staggered | Wide spread | Tight | Tight | Wide (14:00-17:00) | Wide | Wide |
+| Behavior under smaller tolerance | Collapses to single event | Shows start grouping | Shows end grouping | Stable | Stable | Collapses to null duration | Collapses to single event | Stable |
+
+# 3. Consequences for performance analysis
+
+- **G1:** Service time (3 min) applies to the batch. If treated as individual, resource utilization is overestimated by 4x. Throughput per item appears identical to actual throughput.
+- **G2:** Waiting time for items 2–4 is overestimated (they arrive before start). If "begin group" logic is unmodeled, service time for the group is fragmented (e.g. completion 1 = 10:08, but arrival was 09:42).
+- **G3:** End batching compresses actual duration. If actual work took 30 minutes but was logged as 15 (11:15 to 11:30), service time metrics are biased low for late items.
+- **G5:** Shared resource identity inflates utilization. If three analysts worked sequentially on `analyst_pool`, it looks like a single resource working continuously (utilization > 100% is common here).
+- **G6:** This creates the classic "zero service, high wait" artifact. Queue time = (17:00 – `queue_arrival`). Service time = 0. Throughput looks instantaneous.
+- **G7:** Coarse precision (15 min) hides variance. If real durations are 20–25 min, the recorded 15 min is systematic underreporting.
+- **G8:** Safety checks create apparent waiting; if clocks are unsynchronized, queue analysis may incorrectly attribute 35 mins to waiting time instead of a process step.
+
+# 4. PM4Py and pandas analysis
+
+```python
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import io
+
+# 1. Construct supplied rows
+data_str = """
+cluster,case,activity,resource,queue_arrival,start,complete,recorded_at,source,precision,sequence_no
+G1,L01,Apply label,RBT-7,08:54,09:00,09:03,09:03:02,PLC,1 sec,501
+G1,L02,Apply label,RBT-7,08:55,09:00,09:03,09:03:02,PLC,1 sec,502
+G1,L03,Apply label,RBT-7,08:56,09:00,09:03,09:03:03,PLC,1 sec,503
+G1,L04,Apply label,RBT-7,08:58,09:00,09:03,09:03:03,PLC,1 sec,504
+G2,S01,Surface inspection,T-B,09:42,10:00,10:08,10:09,tablet,1 min,810
+G2,S02,Surface inspection,T-B,09:46,10:00,10:14,10:15,tablet,1 min,811
+G2,S03,Surface inspection,T-B,09:49,10:00,10:21,10:22,tablet,1 min,812
+G2,S04,Surface inspection,T-B,09:54,10:00,10:27,10:28,tablet,1 min,813
+G3,E01,Release review,T-C,10:40,11:02,11:30,11:31,desktop_form,1 min,1201
+G3,E02,Release review,T-C,10:52,11:10,11:30,11:31,desktop_form,1 min,1202
+G3,E03,Release review,T-C,10:58,11:17,11:30,11:31,desktop_form,1 min,1203
+G3,E04,Release review,T-C,11:05,11:24,11:30,11:31,desktop_form,1 min,1204
+G4,P01,Pack item,T-D,11:58,12:05,12:09,12:09:04,scanner,1 sec,2101
+G4,P02,Pack item,T-D,11:59,12:09,12:13,12:13:05,scanner,1 sec,2102
+G4,P03,Pack item,T-D,12:00,12:13,12:17,12:17:03,scanner,1 sec,2103
+G4,P04,Pack item,T-D,12:01,12:17,12:21,12:21:06,scanner,1 sec,2104
+G4,P05,Pack item,T-D,12:02,12:21,12:25,12:25:05,scanner,1 sec,2105
+G5,A01,Root-cause analysis,analyst_pool,12:45,13:00,13:25,13:26,shared_VDI,1 min,3051
+G5,A02,Root-cause analysis,analyst_pool,12:50,13:05,13:20,13:21,shared_VDI,1 min,3052
+G5,A03,Root-cause analysis,analyst_pool,12:54,13:10,13:30,13:31,shared_VDI,1 min,3053
+G5,A04,Root-cause analysis,analyst_pool,12:57,13:12,13:22,13:23,shared_VDI,1 min,3054
+G6,C01,Close ticket,T-F,14:05,17:00,17:00,17:01,manual_bulk_form,1 min,4401
+G6,C02,Close ticket,T-F,14:32,17:00,17:00,17:01,manual_bulk_form,1 min,4402
+G6,C03,Close ticket,T-F,14:58,17:00,17:00,17:01,manual_bulk_form,1 min,4403
+G6,C04,Close ticket,T-F,15:10,17:00,17:00,17:01,manual_bulk_form,1 min,4404
+G6,C05,Close ticket,T-F,15:44,17:00,17:00,17:01,manual_bulk_form,1 min,4405
+G6,C06,Close ticket,T-F,16:02,17:00,17:00,17:01,manual_bulk_form,1 min,4406
+G6,C07,Close ticket,T-F,16:25,17:00,17:00,17:01,manual_bulk_form,1 min,4407
+G7,M01,Manual measure,T-G,13:58,14:00,14:15,14:16,legacy_MES,15 min,7071
+G7,M02,Manual measure,T-G,14:01,14:00,14:15,14:17,legacy_MES,15 min,7072
+G7,M03,Manual measure,T-G,14:04,14:00,14:15,14:18,legacy_MES,15 min,7073
+G7,M04,Manual measure,T-G,14:07,14:00,14:15,14:19,legacy_MES,15 min,7074
+G7,M05,Manual measure,T-G,14:11,14:00,14:15,14:20,legacy_MES,15 min,7075
+G8,Q01,Repair triage,T-H,15:00,15:38,15:45,15:45:06,scanner,1 sec,9201
+G8,Q02,Repair triage,T-H,15:02,15:45,15:52,15:52:05,scanner,1 sec,9202
+G8,Q03,Repair triage,T-H,15:04,15:52,15:59,15:59:03,scanner,1 sec,9203
+G8,Q04,Repair triage,T-H,15:05,15:59,16:06,16:06:04,scanner,1 sec,9204
+G8,Q05,Repair triage,T-H,15:08,16:06,16:13,16:13:02,scanner,1 sec,9205
+"""
+
+df = pd.read_csv(io.StringIO(data_str))
+df['queue_arrival'] = pd.to_datetime(df['queue_arrival'])
+df['start'] = pd.to_datetime(df['start'])
+df['complete'] = pd.to_datetime(df['complete'])
+df['recorded_at'] = pd.to_datetime(df['recorded_at'])
+
+# 2. Create PM4Py-compatible interval log
+# We assume PM4Py is available. We construct event log format compatible with format_dataframe.
+# Columns needed for format_dataframe: 'case:concept:name', 'activity', 'resource', 'time:timestamp'
+log_df = df[['case', 'activity', 'resource', 'complete']].rename(columns={'complete': 'time:timestamp', 'case': 'case:concept:name'})
+
+# 3. Call PM4Py functions (Note: Imports assume PM4Py environment)
+try:
+    import pm4py
+    log = pm4py.format_dataframe(log_df)
+    # 4. Batch discovery
+    # We need merge_distance and min_batch_size. Let's use two values each.
+    merge_dists = [timedelta(minutes=1), timedelta(minutes=10)]
+    min_sizes = [2, 4]
+    
+    batch_results = {}
+    for md in merge_dists:
+        for ms in min_sizes:
+            batch = pm4py.discover_batches(log, merge_distance=md, min_batch_size=ms)
+            key = f"md_{md.total_seconds()}_min_{ms}"
+            batch_results[key] = len(batch)
+except ImportError:
+    batch_results = {"pm4py_unavailable": 0}
+
+# 5. Compute independent diagnostics
+def compute_diagnostic(cluster):
+    d = df[df['cluster'] == cluster]
+    if len(d) == 0: return {'cases': 0}
+    start_equal = d['start'].nunique() == 1
+    end_equal = d['complete'].nunique() == 1
+    start_equal_count = d['start'].nunique()
+    return {
+        'cases': len(d),
+        'start_equal': start_equal,
+        'end_equal': end_equal,
+        'max_queue_wait_min': (d['start'] - d['queue_arrival']).max().total_seconds() / 60
+    }
+
+diagnostics = df.groupby('cluster').apply(compute_diagnostic).to_dict()
+df2 = pd.DataFrame(diagnostics).T
+# 6. Print compact table
+print("Cluster Diagnostics:")
+print(df2.to_string())
+# Compare
+print("\nBatch Discovery Results:")
+print(batch_results)
+```
+
+# 5. Robustness and alternative explanations
+
+- **Resource ID Trust:** If `analyst_pool` (G5) is trusted as a single resource, utilization exceeds 100%, flagging process violations. If treated as shared account (as suggested by "badge-level identity not retained"), utilization is normalized but process conformance (resource consistency) is lost.
+- **Timestamp Precision:** If G7 timestamps are exact (ignoring 15-min precision), service time variance is hidden. If interval-censored (real start within 15 min of recorded), service time is uncertain by ±15 min.
+- **Multiple Physical Explanations:** 
+    1. **G1/G6:** Identical timestamps could be simultaneous execution (G1) or end-of-shift bulk logging (G6). Without context on fixtures, they are ambiguous.
+    2. **G2/G8:** Both show staggered starts/ends. G2 is grouped by "begin" button; G8 is natural sequential triage.
+    3. **G3/G5:** Both have shared resources (folder vs analyst pool). G3 is end-batching; G5 is concurrent work on shared login.
+
+# 6. Data-collection redesign
+
+**Prioritized recommendations:**
+
+1.  **Unique Execution Events:** Add explicit `start` and `complete` timestamps at case level, not folder/batch level (fixes G3/G6).
+2.  **Group Identifiers:** Add optional `batch_id` to separate logical work batches from physical case instances.
+3.  **Identity Tracking:** Require badge/ID on shared resource logs (fixes G5); otherwise use session IDs.
+4.  **Clock Synchronization:** Ensure queue_arrival system (upstream) and local source (downstream) share a common clock; otherwise log time offsets.
+5.  **Precision Metadata:** Store and validate precision field to allow interval-censoring in analysis.
+
+# 7. Final adjudication
+
+- **High confidence:** G1 (physical batch due to hardware), G4 (sequential), G8 (sequential triage).
+- **Excluded or interval-censored for queue analysis:** G6 (bulk entry inflates waiting time), G7 (precision prevents accurate timing).
+- **Requires operational validation:** G2 (button logic), G3 (folder submission habits), G5 (shared account behavior). 
+
+Assumptions used: All supplied data reflects the actual events of interest; the `recorded_at` column accurately reflects logging latency; no missing rows exist within a cluster.

@@ -1,0 +1,207 @@
+
+
+## 1. Duplicate-handling decision tree
+
+Root: Events share identical source_event_key and hash?
+
+*   **YES**: Exact technical duplicate. Action: Drop one copy, retain provenance of discarded ID.
+*   **NO**: Check shared objects + timestamp match.
+    *   **Same objects + Same activity + Same timestamp**:
+        *   Do sources belong to same lineage (e.g., ERP vs ERP)? Action: Check source_seq.
+            *   If same source_seq and distinct keys, check payload hash. If identical, Drop.
+            *   If hash differs, Action: Merge attributes (union), retain both event IDs with qualifier.
+        *   Do sources represent different systems (e.g., WMS vs SCANNER)?
+            *   Known factual reconciliation (Fact 1)? Action: Retain both, mark physical equivalence, merge enriched attributes.
+            *   No fact, objects differ (e.g., I1 vs I2)? Action: Retain both unchanged (distinct concurrent events).
+            *   No fact, objects same, system hierarchy known (WMS vs ERP)? Action: Check payload detail. If one is summary and one is detailed (Fact 3, 8), retain both with refined labels (Detailed/Summary).
+    *   **Same objects + Same activity + Different timestamp**:
+        *   If timestamp is within tolerance and source_seq implies continuity (e.g., Auth then Capture). Action: Retain both, link via lifecycle constraint.
+        *   If harmonization collision (e.g., WMS Dispatch vs CARRIER Dispatch mapped to same label): Action: Retain both, add source suffix to activity label (e.g., Dispatch (WMS), Dispatch (CARRIER)).
+    *   **Different objects**:
+        *   If objects are disjoint (e.g., I1 vs I2), retain both.
+    *   **Unresolved candidate**:
+        *   If decision cannot be made from metadata alone. Action: Quarantine for review.
+
+Terminal Decision Summary:
+*   **Drop**: Only exact technical duplicates.
+*   **Merge attributes**: Same physical event (e03/e04), same invoice (e11/e16).
+*   **Retain both with refined labels**: Summary/Detailed (e06/e07), harmonized collisions (e08/e09).
+*   **Retain both unchanged**: Distinct concurrent events (e03/e05).
+*   **Quarantine**: Ambiguous relationships needing manual inspection.
+
+## 2. Event-by-event decisions
+
+| Event(s) | Candidate relationship | Decision | Confidence | Preserved canonical eid | Attribute merge policy | Relation merge policy | Provenance retained | Main risk |
+|---|---|---|---|---|---|---|---|---|
+| e03/e04 | Same physical pick (I1, Fact 1) | Retain both, enrich | High | Keep e03, link e04 | Union payloads (keep location) | O2O: Both link O1, I1 | Source keys preserved | Loss of scan detail if dropped |
+| e03/e05 | Concurrent distinct (I1 vs I2) | Retain both unchanged | High | Keep both | None | O2O: Both O1 + I1/I2 | Timestamps preserved | Misinterpreting as 1 pick |
+| e06/e07 | Detailed vs Summary (Fact 3) | Retain both, refine labels | High | Keep both | Merge to e06 (details) for analytics | O2O: Both link P1 | e07 keeps "ERP Summary" tag | Treating summary as original |
+| e08/e09 | Harmonized (WMS vs CARRIER) | Retain both, refine labels | Medium | Keep both | None | O2O: Both P1, D1 | Activity labels suffix | False single-step Dispatch |
+| e09/e10 | Sequential logic (Fact 5) | Retain both, ordered | High | Keep both | None | O2O: Both P1, D1 | Ordering enforced | False rework if inverted |
+| e11/e16 | Same invoice (Fact 6) | Merge attributes, retain IDs | Medium | Keep both | Union attributes (V1) | O2O: Both V1 | Source keys preserved | Losing billing source attributes |
+| e12/e13 | Precedence (Fact 7) | Retain both, ordered | High | Keep both | None | O2O: Both M1 | Timestamp tie-break | Loss of causal constraint |
+| e13/e14 | Distinct Payment (Fact 7) | Retain both unchanged | High | Keep both | None | O2O: M1 vs M2 | M1, M2 objects preserved | Collapsing payments |
+| e13/e15 | Summary (Fact 8) | Retain both, refine | Medium | Keep both | Link e15 to M1, M2 | O2O: e15 to O1 | e15 marked Summary | Loss of payment split detail |
+
+## 3. Timestamp-tie ordering rules
+
+To establish a deterministic total order without asserting physical truth, we apply a prioritized policy. Semantic rules determine logical flow; deterministic rules break remaining ties.
+
+1.  **Domain Constraints (Semantic):** Lifecycle states enforce order regardless of timestamps. Payment Authorize (e12) must precede Capture (e13). If timestamps tie, enforce this order.
+2.  **Within-Source Sequence (Deterministic):** When events come from the same source (e.g., CARRIER e09, e10), use `source_seq`.
+3.  **Lifecycle Constraints on Shared Objects (Semantic):** Pick (e03) logically precedes Pack (e06). If timestamps tie, order by lifecycle phase.
+4.  **Source-Specific Semantics (Semantic):** WMS Pack (e06) typically precedes ERP Status Update (e07) in system architecture.
+5.  **Ingestion Time (Deterministic Fallback):** Use `ingested_at` only if all above match or are unavailable.
+6.  **Stable Fallback Order (Deterministic):** If still tied, use `eid` alphabetical.
+
+**Risk of Synthetic Microseconds:** Adding microseconds (e.g., 10:00:00.000001) creates an artificial total order. Process mining tools may infer a false dependency (e.g., "Pick must happen before Pack") even if systems were truly concurrent. This distorts process discovery, leading to over-specific process maps and incorrect performance metrics.
+
+**Intended Order (Partial to Total):**
+
+*   **10:00 (e03–e07):**
+    *   Logical: Pick (e03/e04) < Pack (e06) < Pack Summary (e07).
+    *   Internal: Pick I1 (e03) and I2 (e05) are unordered; Pick I1 vs e04 are concurrent.
+*   **10:15 (e08–e10):**
+    *   Logical: Dispatch WMS (e08) < Carrier Accept (e09) < Handover (e10) (Fact 5).
+*   **12:00 (e11–e16):**
+    *   Logical: Invoice Issue (e11/e16) and Auth (e12) before Captures (e13/e14) and Summary (e15).
+    *   e13 (M1) and e14 (M2) are concurrent but ordered by object (M1 < M2 via ID).
+
+## 4. Conservative cleaning pipeline
+
+The conservative pipeline prioritizes information preservation. It removes only identical records (same source key + hash).
+
+1.  **Duplicate Check:** Identify records with identical `source_event_key` and `payload_hash`. If found (e.g., same system logged twice), drop the second.
+2.  **Harmonization Tagging:** Append source suffix to harmonized activities (e.g., Dispatch -> Dispatch (WMS), Dispatch (CARRIER)).
+3.  **Object Relations:** Ensure `e2o` table includes all original relations. If one event has richer object relations (e.g., e06 has items, e07 only order), retain both.
+4.  **Provenance:** Add a `canonical_event_id` column mapping to the original `eid`. Preserve `original_activity` and `original_source`.
+5.  **Ordering:** Apply the deterministic rules (Section 3) to add a sorting index column (e.g., `sort_index`). Do not modify the `timestamp` field.
+
+**Expected Retained Event Count:** 17 events (e01–e17).
+
+**Rationale:** e03/e04 both retained because one enriches the other. e06/e07 both retained to preserve abstraction layers. e13/e14 both retained to preserve payment granularity. No event is deleted unless technically redundant. This ensures that downstream analysis can reconstruct any view but does not artificially prune the data.
+
+## 5. Aggressive alternatives
+
+**Scenario A: Evidence-Based Semantic Merging**
+
+*   **Logic:** Merge confirmed physical observations into single canonical event.
+*   **Action:** Merge e03 (WMS) and e04 (SCANNER). Drop e04, update e03 attributes. Merge e11 (ERP) and e16 (BILLING) for Invoice V1.
+*   **Expected Count:** 15 events.
+*   **Semantic Damage:** Loss of provenance. If audit shows discrepancy between WMS and SCANNER data, the merge hides the conflict.
+*   **Payment Risk:** Avoid merging e13/e14/M
+
+**Scenario B: Mechanically Aggressive PM4Py Merging**
+
+*   **Logic:** Merge events with identical activity, timestamp, and *any* shared object.
+*   **Action:** Merge e13 and e14 (Share O1, V1, P1).
+*   **Expected Count:** 14 events (or fewer depending on implementation).
+*   **Semantic Damage:** Collapse of distinct Payment objects M1 and M2 into one. This violates Fact 7.
+*   **Damage Analysis:** `have_common_object=True` is insufficient here because O1 and V1 are shared across *all* events for this case. If logic only checks for shared objects, it conflates the two separate payments M1 and M2 into a single transaction, breaking payment performance analysis and invoice reconciliation. This is catastrophic for financial auditing.
+
+## 6. PM4Py-oriented Python implementation
+
+```python
+import pm4py
+import pandas as pd
+import copy
+
+# Assumes ocel_raw is loaded
+def safe_deduplicate(ocel, policy="conservative"):
+    ocel = copy.deepcopy(ocel)
+    events = ocel["events"]
+    
+    # Preserve original fields
+    events["original_timestamp"] = events["timestamp"].copy()
+    events["original_activity"] = events["activity"].copy()
+    events["original_source"] = events["source"].copy()
+    
+    # Pre-check for exact duplicates (source_event_key + hash)
+    dup_mask = events.duplicated(subset=["source_event_key", "payload_hash"], keep=False)
+    if dup_mask.any():
+        # Drop only the second instance
+        events = events[~events.index.duplicated(keep='first')]
+        ocel["events"] = events
+    
+    # Scenario A: Conservative (No object-based merging)
+    if policy == "conservative":
+        # Refine labels
+        events["activity"] = events["activity"] + " (" + events["source"] + ")"
+        # Sorting logic
+        events["source_seq"] = events["source_seq"].astype(int)
+        # Sort by object lifecycle logic or timestamp
+        # pm4py sorting by specific column
+        ocel = pm4py.ocel_sort_by_additional_column(ocel, "timestamp")
+        
+    # Scenario B: Aggressive Merge (Warning)
+    elif policy == "aggressive":
+        # Custom function for verified pair (e.g., e11/e16)
+        def merge_invoice_pairs(ocel):
+            # Only merge based on invoice object
+            pass 
+        # WARNING: Using library merge might incorrectly collapse payments
+        if False: 
+            pm4py.ocel_merge_duplicates(ocel, activity_col="activity")
+    
+    # Add index based time delta after ordering
+    ocel = pm4py.ocel_add_index_based_timedelta(ocel)
+    
+    # Validate integrity
+    assert ocel["events"]["original_timestamp"].isnull().sum() == 0
+    
+    return ocel
+
+# Execute scenarios
+ocel_conservative = safe_deduplicate(ocel_raw, "conservative")
+```
+
+## 7. Sensitivity analysis
+
+We compare four datasets: Raw (17), Conservative (17), Evidence-Based Merge (15), Aggressive Library Merge (14).
+
+1.  **Event Count:** Raw and Conservative retain all events. Evidence removes e04 and e16. Aggressive removes e14 (M2).
+2.  **E2O Relation Count:** Aggressive drops M2 relations, reducing cardinality for Payment object. Evidence merges Invoice relations for e11/e16.
+3.  **Order-Flattened DFG:** Conservative and Raw show more parallel branches (e.g., two Payment Capture flows). Aggressive simplifies to one.
+4.  **Item-Flattened DFG:** Evidence merge of e03/e04 reduces "Pick Item" distinct nodes from 3 to 2 (e03, e05), hiding the multi-device observation.
+5.  **Payment-Flattened DFG:** Aggressive merge destroys the distinct path for M2. Conservative retains distinct paths for M1 and M2.
+6.  **OC-DFG Edges:** Aggressive creates false "Payment -> Payment" loop if distinct payments are merged into one node.
+
+**Concrete Edge Interpretations:**
+*   `Pick Item -> Pack Package`: Frequency remains 2 in Conservative (Pick I1, Pick I2). Evidence merges I1 scan. Aggressive removes nothing here.
+*   `Capture Payment -> Issue Invoice`: If M1/M2 merged, appears as single Payment -> Invoice transition.
+*   `Dispatch (WMS) -> Dispatch (CARRIER)`: Conservative retains two steps. Aggressive might merge based on shared objects (P1, D1).
+*   `Capture M1 -> Capture M2`: Conservative shows parallel transitions. Aggressive shows self-loop or single capture.
+*   `Order -> Invoice`: Count is 2 in Raw (e11, e16). Evidence becomes 1.
+*   `Handover to Carrier`: Retained only if distinct; Aggressive might merge with Dispatch.
+
+## 8. Audit trail and reversibility
+
+Provenance Schema (JSON per Event Group):
+*   `canonical_event_id`: Unique ID for cleaned group.
+*   `source_event_ids`: List of original `eid` values (e.g., ["e03", "e04"]).
+*   `merge_rule`: ID of rule applied (e.g., "e03-e04_physical_reconcile").
+*   `reviewer`: "Auto" or User ID.
+*   `original_activity`: List of original strings.
+*   `refined_activity`: New label.
+*   `original_timestamp`: List of UTC strings.
+*   `adjusted_timestamp`: Final sorting key.
+*   `attributes_retained`: Mapping of source key to attribute.
+*   `discarded_conflicts`: List of overridden fields.
+*   `confidence_score`: 0.0 to 1.0.
+*   `reason`: Text explanation.
+
+**Reconstruction:**
+To reconstruct the raw view, an analyst expands the `source_event_ids` array. They retrieve original records from the raw `ocel_raw` using these IDs. Any merged attributes are discarded, and all original `original_timestamp` values are restored in parallel. This ensures traceability; cleaning is reversible.
+
+## 9. Failure modes and safeguards
+
+1.  **Collapsing Distinct Payments:** Merging M1 and M2 because they share Order and Invoice. *Safeguard:* Require exact `source_seq` match or different object IDs before merge.
+2.  **False Rework:** Treating Pack Detailed (e06) and Pack Summary (e07) as two Pack events in a loop. *Safeguard:* Tag "Summary" events for exclusion in DFGs.
+3.  **Ingestion Time Ordering:** Using `ingested_at` as primary key. *Safeguard:* Block this unless `timestamp` is null for all candidates.
+4.  **Shared Object Proof:** Assuming common objects imply duplicate. *Safeguard:* Validate with source lineage facts.
+5.  **Unioning Incompatible Relations:** Merging e13 and e14 into one Payment node. *Safeguard:* Enforce unique object ID per event type.
+6.  **Synthetic Microseconds:** Adding fake precision to order concurrent events. *Safeguard:* Use stable `sort_index` column instead.
+7.  **Losing Authoritative Attributes:** Overwriting ERP invoice attributes with Billing ones blindly. *Safeguard:* Define authority rules (e.g., Billing > ERP for Invoice Amount).
+8.  **Whole OCEL Duplication:** Applying `drop_duplicates` without candidate grouping. *Safeguard:* Always filter to candidate groups first.
+
+Conservative pipeline preserves data integrity while enabling structured analysis. Aggressive pipelines save storage but risk breaking financial and operational truth.
