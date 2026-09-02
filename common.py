@@ -568,6 +568,7 @@ _REASONING_MARKERS = (
     "step-",
     "trinity",
     "intellect-",
+    "ox-alpha",
 )
 
 _REASONING_PATTERNS = (
@@ -655,6 +656,7 @@ def is_large_reasoning_model(m_name):
 
     return (
         model_name.endswith("-low")
+        or model_name.endswith("high")
         or _config_enables_reasoning(_manual_model_config(m_name))
         or _qwen_reasoning_model(model_name)
         or any(marker in model_name for marker in _REASONING_MARKERS)
@@ -669,6 +671,8 @@ def force_custom_evaluation_lrm(answering_model_name):
 
     config = _manual_model_config(answering_model_name)
     if _qwen_reasoning_model(model_name):
+        return True
+    if "ox-alpha" in model_name:
         return True
     if config.get("provider") not in {"claude", "google", "openai"} and _payload_requests_reasoning(config.get("added_to_payload")):
         return True
