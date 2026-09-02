@@ -1,0 +1,337 @@
+## 1. Equivalence design space
+
+All four relations below are defined as "equality of a derived key". Equality is reflexive, symmetric and transitive, so each relation is a genuine equivalence relation; no similarity threshold is used (a threshold-based relation would lose transitivity).
+
+An execution is the set of events containing the lead Order, in timestamp order, plus the objects in those events and the O2O relations among them. An object is *external* if its identifier carries the `EXT` marker; in unmarked data the generic rule is "nearest-Order attribution": hop distance to every Order over O2O edges and E2O co-occurrence; if the lead is the unique nearest Order the object is local, if the lead ties with another Order it is *shared* (kept local, flagged), otherwise external.
+
+### Relation A — activity-sequence equivalence
+Definition: X ≡_A Y iff the sequences of activity labels of the lead-Order events are identical.
+Invariants: label order, event count, repetitions.
+Discarded: all objects, types, multiplicities, externality, E2O, O2O, qualifiers, timestamps.
+Same-time events: ties ordered by activity label; a variant A° treats a tie group as an unordered multiset step.
+Note: A is a trace variant on the Order-flattened log and is *not* object-centric; it serves only as a baseline.
+
+### Relation S — typed structural equivalence under identifier renaming
+Definition: view an execution as a bipartite graph. Event nodes carry (rank, activity); object nodes carry (type, externality flag); edges are E2O incidences. X ≡_S Y iff there is a rank- and activity-preserving bijection of events and a type- and flag-preserving bijection of objects that preserves E2O incidence.
+Invariants: multiplicity per type, event co-occurrence of objects, per-object lifecycle footprint, externality.
+Discarded: identifier strings, timestamps (only ranks), attributes, O2O edges and qualifiers.
+Same-time events: equal timestamps receive the same rank; the bijection need not respect order inside a rank group.
+
+### Relation Q — qualified structural equivalence (fourth relation)
+Definition: S plus preservation of qualified O2O triples (source, qualifier, target) by the object bijection.
+Invariants: those of S plus qualified O2O topology.
+Discarded: identifiers, timestamps, attributes.
+Same-time handling: as S. Q is the finest relation used and preserves `removed_before_dispatch` or `partially_settles` even when E2O incidence is unchanged.
+
+### Relation B — business-semantic equivalence (preferred)
+Definition: X ≡_B Y iff their coarse semantic profile is equal. The profile has four dimensions:
+- SHARE: set of business functions {ORD, LOG, FIN} in which an external object co-occurs with the lead.
+- SHIP: local Delivery count, coarsened to {single, multi}.
+- PAY: installments if more than one local Payment or a `partially_settles`/`completes_settlement` qualifier; unallocated if FIN is shared and one payment settles a multi-order invoice; else single.
+- EXC: RETURN_REWORK if a Return/Inspect activity or `repacks` qualifier exists; SUBSTITUTION if `replaces`/`removed_before_dispatch` exists or a Dispatch lists a strict subset of the items packed in the dispatched package; else NONE.
+A *full* profile additionally records packages per delivery, item count and the activity multiset as within-cluster variants, not cluster boundaries.
+Invariants: externality per business function, customer-visible shipment multiplicity, settlement mode, exception motif.
+Discarded: exact event order, item count, packaging granularity, identifiers, timestamps.
+Same-time events: irrelevant for the key; motif detection uses object-mediated order (a Return Item refers to its Delivery) rather than timestamps.
+
+## 2. Canonical signatures
+
+The scheme computes a renaming-invariant structural key (S and Q) and then the semantic profile (B). Objects are named only through type, externality flag, event footprint and qualified neighbourhood, so identifiers never enter the key.
+
+```python
+from collections import Counter, defaultdict
+
+# Execution encoding:
+#   events = [(ts, activity, {otype: [oid, ...]}), ...]  in timestamp order
+#   o2o    = [(src_oid, qualifier, tgt_oid), ...]
+LEAD = "Order"
+FUNCTION = {"Create Order": "ORD", "Add Item": "ORD",
+            "Pack Package": "LOG", "Dispatch": "LOG",
+            "Return Item": "LOG", "Inspect Return": "LOG",
+            "Issue Invoice": "FIN", "Record Payment": "FIN"}
+SUBST_QUALS = {"replaces", "removed_before_dispatch"}
+INSTALLMENT_QUALS = {"partially_settles", "completes_settlement"}
+RETURN_ACTS = {"Return Item", "Inspect Return"}
+
+def object_types(events):
+    return {o: t for _, _, d in events for t, oids in d.items() for o in oids}
+
+def adjacency(events, o2o):
+    """Undirected object graph: O2O edges plus E2O co-occurrence in the same event."""
+    adj = defaultdict(set)
+    for s, _, t in o2o:
+        adj[s].add(t); adj[t].add(s)
+    for _, _, d in events:
+        objs = [o for oids in d.values() for o in oids]
+        for o in objs:
+            adj[o].update(x for x in objs if x != o)
+    return adj
+
+def is_external(oid, otype, lead_oid, adj, otype_of):
+    if oid.startswith("EXT"):                 # explicit marker in this benchmark
+        return True
+    if otype == LEAD:
+        return oid != lead_oid
+    # generic fallback: nearest-Order attribution by hop distance
+    dist, frontier = {oid: 0}, [oid]
+    while frontier:
+        nxt = []
+        for u in frontier:
+            for v in adj[u]:
+                if v not in dist:
+                    dist[v] = dist[u] + 1; nxt.append(v)
+        frontier = nxt
+    orders = [(d, o) for o, d in dist.items() if otype_of.get(o) == LEAD]
+    if not orders:
+        return False
+    dmin = min(d for d, _ in orders)
+    return lead_oid not in {o for d, o in orders if d == dmin}   # tie => shared, treated as local
+
+def externality(events, o2o, lead_oid, otype_of):
+    adj = adjacency(events, o2o)
+    return {o: is_external(o, t, lead_oid, adj, otype_of) for o, t in otype_of.items()}
+
+def typed_structural_key(events, o2o, lead_oid, with_o2o=True):
+    """Canonical string for relation S (with_o2o=False) or Q (with_o2o=True)."""
+    otype_of = object_types(events)
+    ext = externality(events, o2o, lead_oid, otype_of)
+    # rank: equal timestamps share a rank (concurrency handling)
+    rank, prev, ranks = -1, None, []
+    for ts, _, _ in events:
+        if ts != prev:
+            rank += 1; prev = ts
+        ranks.append(rank)
+    foot = defaultdict(list)
+    for (ts, act, d), r in zip(events, ranks):
+        for oids in d.values():
+            for o in oids:
+                foot[o].append((r, act))
+    # initial label: type, externality, sorted footprint
+    lab = {o: (otype_of[o], ext[o], tuple(sorted(foot[o]))) for o in otype_of}
+    if with_o2o:                              # 1-WL refinement over qualified O2O
+        for _ in range(len(lab)):
+            new = {o: (lab[o],
+                       tuple(sorted((q, lab[t]) for s, q, t in o2o if s == o)),
+                       tuple(sorted((q, lab[s]) for s, q, t in o2o if t == o)))
+                   for o in lab}
+            if len(set(map(repr, new.values()))) == len(set(map(repr, lab.values()))):
+                break
+            lab = new
+    # objects with identical labels are interchangeable, so any tie-break yields the same string
+    order = sorted(lab, key=lambda o: repr(lab[o]))
+    name = {o: f"{otype_of[o]}{'*' if ext[o] else ''}#{i}" for i, o in enumerate(order)}
+    ev_lines = sorted((r, act, tuple(sorted(name[o] for oids in d.values() for o in oids)))
+                      for (ts, act, d), r in zip(events, ranks))
+    o2o_lines = sorted((name[s], q, name[t]) for s, q, t in o2o
+                       if s in name and t in name) if with_o2o else []
+    return repr((tuple(ev_lines), tuple(o2o_lines)))
+
+def item_dropped_before_dispatch(events):
+    packed = defaultdict(set)                 # package -> items packed into it
+    for _, act, d in events:
+        if act == "Pack Package":
+            for p in d.get("Package", []):
+                packed[p] |= set(d.get("Item", []))
+        if act == "Dispatch" and d.get("Item"):
+            for p in d.get("Package", []):
+                if set(d["Item"]) < packed[p]:
+                    return True
+    return False
+
+def semantic_profile(events, o2o, lead_oid):
+    otype_of = object_types(events)
+    ext = {o for o, e in externality(events, o2o, lead_oid, otype_of).items() if e}
+    cnt = Counter(t for o, t in otype_of.items() if o not in ext)
+    quals = {q for _, q, _ in o2o}
+    acts = [a for _, a, _ in events]
+    share = frozenset(FUNCTION[a] for _, a, d in events
+                      if any(o in ext for oids in d.values() for o in oids))
+    ship = "single" if cnt["Delivery"] <= 1 else "multi"
+    if cnt["Payment"] > 1 or quals & INSTALLMENT_QUALS:
+        pay = "installments"
+    elif "FIN" in share:
+        pay = "unallocated"
+    else:
+        pay = "single"
+    if set(acts) & RETURN_ACTS or "repacks" in quals:
+        exc = "RETURN_REWORK"
+    elif quals & SUBST_QUALS or item_dropped_before_dispatch(events):
+        exc = "SUBSTITUTION"
+    else:
+        exc = "NONE"
+    cluster_key = (tuple(sorted(share)), ship, pay, exc)          # relation B
+    full = dict(key=cluster_key, packs_per_delivery=cnt["Package"] / max(cnt["Delivery"], 1),
+                items=cnt["Item"], activity_multiset=tuple(sorted(Counter(acts).items())))
+    return cluster_key, full
+```
+
+Reproducibility: the WL refinement is a heuristic canonical form; objects still indistinguishable after refinement are automorphic within this encoding, so the string is independent of the tie-break. Adversarial graphs would need full canonical labelling (nauty) or brute force over tied groups; the eight executions here have no unresolved ties.
+
+## 3. Cluster assignments
+
+Labels: ACT-* for A, STR-* for S (Q gives the same partition on these data), SEM-* for B.
+
+Execution | Activity-sequence cluster | Typed-structural cluster | Preferred semantic cluster | Defining signature | Main reason
+--- | --- | --- | --- | --- | ---
+X1 | ACT-A | STR-1 | SEM-STD | ((), single, single, NONE); 2 Items, 1 Package, 1 Delivery, 1 Invoice, 1 Payment | Isolated, one shipment, one payment, no exceptions
+X2 | ACT-A | STR-1 | SEM-STD | identical to X1 after renaming | Identifier order of Add Item is not semantic
+X3 | ACT-B | STR-2 | SEM-STD | ((), single, single, NONE); packs_per_delivery = 2 | One customer-facing delivery; packaging granularity is a sub-variant
+X4 | ACT-C | STR-3 | SEM-SPLITPAY | ((), multi, installments, NONE) | Two deliveries, partial-then-complete settlement
+X5 | ACT-A | STR-4 | SEM-XLOG | (("LOG",), single, single, NONE); Order*, Item* in Pack/Dispatch | Package and delivery shared with another order
+X6 | ACT-A | STR-5 | SEM-XFIN | (("FIN",), single, unallocated, NONE); Order* in Invoice/Payment | Invoice bills two orders, payment unallocated
+X7 | ACT-A | STR-6 | SEM-SUBST | ((), single, single, SUBSTITUTION); Item in Dispatch; replaces, removed_before_dispatch | Item substituted before dispatch
+X8 | ACT-D | STR-7 | SEM-RETURN | ((), multi, single, RETURN_REWORK); Return Item, Inspect Return, repacks | Return loop with second package and delivery
+
+A gives 4 clusters, S/Q give 7, B gives 6. B is coarser than S only in merging X3 into SEM-STD; it is deliberately not the finest partition.
+
+## 4. Cluster interpretations
+
+### SEM-STD — {X1, X2, X3}
+Signature: no external objects; one Delivery; one Payment; no exception qualifiers.
+Behavior: standard fulfilment; items packed (in one or several packages), shipped once, invoiced once, paid once.
+Risks/opportunities: X3 reveals a packaging inefficiency (two packages, one delivery) that is a cost lever; otherwise this is the reference happy path.
+Poor flattening: Item flattening duplicates Pack/Dispatch per item (divergence) and makes X3 identical to X1 because each item trace sees exactly one Pack.
+Stability: high under O2O loss (local Delivery and Payment counts suffice); not stable under externality loss, which would pull X5 and X6 in.
+
+### SEM-SPLITPAY — {X4}
+Signature: no externals; two Deliveries; two Payments with partially_settles / completes_settlement.
+Behavior: staged shipment followed by two instalments against one invoice.
+Risks: two shipments (cost, experience); receivables exposure between M41 and M42; partial payment misread as full settlement.
+Poor flattening: Delivery flattening yields two ordinary single-delivery traces and hides the split; Payment flattening hides that both payments hit one invoice.
+Stability: high; both deliveries and both payments are structural, so qualifier loss keeps PAY = installments.
+
+### SEM-XLOG — {X5}
+Signature: external Order and Item in Pack Package and Dispatch; local Invoice/Payment.
+Behavior: consolidated packing across orders; billing stays per order.
+Risks: a delivery failure hits two orders; packing errors cross order boundaries; shipping-cost savings.
+Poor flattening: Order flattening duplicates Pack/Dispatch into both order traces (convergence) or, if EXT objects are dropped, makes X5 indistinguishable from X1.
+Stability: low under externality repair; the cluster depends entirely on recognizing EXT-OA/EXT-IA as foreign. Stable under qualifier loss.
+
+### SEM-XFIN — {X6}
+Signature: external Order in Issue Invoice and Record Payment; local logistics.
+Behavior: consolidated invoicing; one payment settles a multi-order invoice without per-order allocation.
+Risks: order-level revenue and "paid" status undefined; reconciliation and audit issues.
+Poor flattening: Invoice flattening yields a trace with two Create Order events (convergence); Order flattening without externality markers reproduces X1.
+Stability: low under externality repair; qualifier loss degrades PAY to single but SHARE = FIN keeps the cluster separate.
+
+### SEM-SUBST — {X7}
+Signature: Item present in Dispatch (strict subset of packed items); qualifiers replaces and removed_before_dispatch.
+Behavior: an item was packed, then removed and substituted before shipment.
+Risks: invoice may bill the removed item; stock inconsistency; hidden rework.
+Poor flattening: Order flattening yields exactly X1's trace; the substitution lives only in E2O/O2O.
+Stability: medium; two independent signals (E2O anomaly, qualifiers) support it, losing both moves X7 to SEM-STD.
+
+### SEM-RETURN — {X8}
+Signature: Return Item and Inspect Return; second Package and Delivery; qualifiers repacks and replaces (package).
+Behavior: item returned after delivery, inspected, repacked and re-shipped; single invoice and payment.
+Risks: rework cost, dissatisfaction, billing mismatch if the invoice was not adjusted.
+Poor flattening: Package flattening splits P81 and P82 into unrelated traces, losing the replacement link; Item flattening gives I81 a normal trace.
+Stability: high; the motif is detectable from activity labels alone.
+
+## 5. Borderline cases
+
+X1 vs X2. Equivalent under A, S, Q and B: the only difference is which item identifier appears first, and identifiers are not semantic. A definition treating identifier insertion order as a lifecycle attribute (catalogue position signalling a data-entry anomaly) would separate them; the task constraints rule that out.
+
+X1 vs X5. A merges them. S, Q and B separate them because EXT-OA and EXT-IA add two flagged typed nodes. A lead-local relation that deletes external objects before comparing would merge them; defensible when only O5's own steps matter, indefensible when logistics risk or cost allocation matters.
+
+X1 vs X6. Same pattern in the financial function. A merges; S/Q/B separate. Structurally X6 has one Payment like X1; only the O2O note motivates PAY = unallocated. A definition recognising externality but not O2O still separates X6 (SHARE = FIN) yet cannot flag the allocation problem.
+
+X1 vs X7. A merges. S separates even without O2O because X7's Dispatch contains an Item. Q adds replaces/removed_before_dispatch; B separates via EXC. A relation ignoring Item references in Dispatch (as recording artefacts) would merge X1 and X7 unless qualifiers are read; this is the "hidden by similar structure" case.
+
+X3 vs X4. A, S and Q separate them (extra events; two Deliveries and Payments vs one each). B separates them on SHIP and PAY. A "split-fulfilment" notion grouping every order with more than one Package would merge them; a customer-outcome notion does not, because X3 has one delivery and one payment. Keeping X3 with the baseline while X4 stays apart is the main disagreement between B and S.
+
+X4 vs X8. Both have two Packages, two Deliveries and repeated Pack/Dispatch. A separates them on Return Item/Inspect Return; S on the extra events and on I82 appearing in two Pack events; B on EXC and PAY. A delivery-topology-only notion ("multi-shipment orders") would merge them and be wrong operationally: X4 is planned staging, X8 is unplanned rework. Had the Return/Inspect events not been logged (a common gap), S would still separate them through the Item footprint, while B would give X8 ((), multi, single, NONE), distinct from X4 but mislabelled as a planned split shipment.
+
+## 6. Relation to `pm4py.cluster_equivalent_ocel`
+
+Preserved information. `pm4py.cluster_equivalent_ocel(ocel, object_type, max_objs)` splits the OCEL into one sub-OCEL per lead-type object using the ancestors/descendants split (the lead, objects connected to it through O2O/E2O, and all their events, bounded by `max_objs`), builds a textual description of each sub-OCEL (timestamps excluded) and uses that string as the dictionary key. The description lists events in order with activity and related objects with types and identifiers, so the key preserves event order, labels, E2O incidence, types, multiplicities and, through identifiers, the exact objects. Sub-OCELs cluster together only if descriptions are byte-identical.
+
+Why raw identifiers are too fine. X1 and X2 land in different clusters although isomorphic; in a real log every order has unique identifiers, so exact clustering degenerates towards one cluster per order. The split for X5 or X6 also pulls in the neighbour order's own events, so the key encodes the neighbour's history.
+
+Canonicalization and post-processing. For each returned sub-OCEL, identify the lead Order, restrict to events containing it, attribute externality with nearest-Order attribution, recompute `typed_structural_key` (S/Q) and `semantic_profile` (B) from Section 2, then merge exact clusters whose canonical keys coincide and report within-cluster variation of the fine features.
+
+When exact equivalence is preferable. When the same physical objects matter: detecting that two orders share a delivery or invoice, auditing a specific batch, or checking whether an anomaly recurs on the same objects. Exact clusters never merge non-isomorphic executions; coarsening afterwards is possible, the reverse is not.
+
+Effect of `max_objs` and large components. Shared invoices, consolidated shipments or batch payments connect many orders, so the closure can contain hundreds of objects. `max_objs` truncates it, bounding cost but making the truncation boundary (and traversal order) part of the key, so identical executions can receive different keys; a small value also silently removes the external objects that define SEM-XLOG and SEM-XFIN. Set it above the largest legitimate execution and re-derive externality from the truncated sub-OCEL.
+
+```python
+import sys
+from collections import defaultdict, Counter
+import pm4py
+
+LEAD = "Order"
+
+# 1. exact PM4Py clustering: key = textual description of a split sub-OCEL
+exact = pm4py.cluster_equivalent_ocel(ocel, LEAD, max_objs=200)
+print(len(exact), "exact clusters for",
+      sum(len(v) for v in exact.values()), "executions")
+
+def lead_object(sub):
+    objs = sub.objects
+    cands = objs[objs[sub.object_type_column] == LEAD][sub.object_id_column].tolist()
+    if len(cands) == 1:
+        return cands[0]
+    rel = sub.relations.merge(sub.events[[sub.event_id_column, sub.event_timestamp]],
+                              on=sub.event_id_column)
+    first = rel[rel[sub.object_id_column].isin(cands)].groupby(sub.object_id_column)[sub.event_timestamp].min()
+    return first.idxmin()                     # earliest-appearing Order is the lead
+
+def to_tuples(sub, lead_oid):
+    """Restrict to events containing the lead and convert to (events, o2o)."""
+    rel = sub.relations
+    lead_eids = set(rel[rel[sub.object_id_column] == lead_oid][sub.event_id_column])
+    ev = sub.events[sub.events[sub.event_id_column].isin(lead_eids)]
+    ev = ev.sort_values([sub.event_timestamp, sub.event_id_column])
+    per_event = defaultdict(lambda: defaultdict(list))
+    for _, r in rel[rel[sub.event_id_column].isin(lead_eids)].iterrows():
+        per_event[r[sub.event_id_column]][r[sub.object_type_column]].append(r[sub.object_id_column])
+    events = [(e[sub.event_timestamp], e[sub.event_activity], dict(per_event[e[sub.event_id_column]]))
+              for _, e in ev.iterrows()]
+    qcol = sub.qualifier if sub.qualifier in sub.o2o.columns else None
+    o2o = [(r[sub.object_id_column], r[qcol] if qcol else "o2o", r[sub.object_id_column + "_2"])
+           for _, r in sub.o2o.iterrows()]
+    return events, o2o
+
+# 2. canonicalisation: renaming-invariant structural key and semantic profile
+structural, semantic = defaultdict(list), defaultdict(list)
+for raw_key, subs in exact.items():
+    for sub in subs:
+        lead = lead_object(sub)
+        events, o2o = to_tuples(sub, lead)
+        structural[typed_structural_key(events, o2o, lead, with_o2o=True)].append(lead)
+        ckey, full = semantic_profile(events, o2o, lead)
+        semantic[ckey].append((lead, full))
+
+# 3. aggregation: cluster sizes plus within-cluster spread of the fine features
+print(len(structural), "typed-structural (Q) clusters")
+for ckey, members in sorted(semantic.items(), key=lambda kv: -len(kv[1])):
+    ppd = Counter(round(f["packs_per_delivery"], 2) for _, f in members)
+    items = Counter(f["items"] for _, f in members)
+    print(ckey, len(members), "orders | packs/delivery:", dict(ppd), "| items:", dict(items))
+```
+
+## 7. Robustness analysis
+
+Ignore all O2O qualifiers. A and S unchanged. Q collapses to S; here the partition is identical because every qualifier difference comes with an E2O or multiplicity difference. B: X4 keeps installments via payment count; X7 keeps SUBSTITUTION via the Item-in-Dispatch anomaly; X8 keeps RETURN_REWORK via activities; X6 degrades to SHARE = FIN, PAY = single but stays separate. Assignments unchanged; only the evidence behind X6 and X7 weakens.
+
+Ignore external objects. A unchanged. S/Q: X5 and X6 become isomorphic to X1/X2 (5 clusters). B: SEM-XLOG and SEM-XFIN dissolve into SEM-STD, giving {X1,X2,X3,X5,X6}, {X4}, {X7}, {X8}. This perturbation has the largest effect and hides the most risk.
+
+Collapse repeated same-label events. With consecutive collapsing A changes: X3 joins ACT-A, X4 keeps Pack-Dispatch-Pack-Dispatch but loses one Record Payment: {X1,X2,X3,X5,X6,X7}, {X4}, {X8}. With global collapsing X4 also joins the baseline. S loses some multiplicity but object counts still separate X3, X4 and X8. B: X4's PAY falls back to qualifiers; if those are also gone X4 becomes ((), multi, single, NONE), still separate through two Deliveries. Only X4's label changes.
+
+Pack/Dispatch as a partial order. Order Pack and Dispatch only by object dependency (a Dispatch follows the Pack of its Package). In A, X4's interleaving becomes equivalent to Pack-Pack-Dispatch-Dispatch, merging it with a hypothetical batch-then-ship variant; X3 stays distinct because its two Packs precede one Dispatch. S/Q merge ranks of causally independent events, changing nothing here but adding robustness to timestamp noise. B never used total order.
+
+Payment multiplicity as an amount attribute. If M41 and M42 become one Payment with amount and instalment attributes, S loses one Payment node but STR-3 stays distinct through two Deliveries. B keeps PAY = installments only if the attribute is read; otherwise X4 becomes ((), multi, single, NONE). For X6 an amount cannot be split per order, so the unallocated status becomes an attribute flag; the cluster survives through SHARE = FIN.
+
+Overall: SEM-RETURN and SEM-SPLITPAY are robust to all perturbations; SEM-SUBST survives any single one; SEM-XLOG and SEM-XFIN depend entirely on externality and are the fragile clusters.
+
+## 8. Limitations and recommendation
+
+Compliance monitoring: relation Q. Compliance is about specific deviations (item removed before dispatch, payment without allocation, invoice billing two orders). Every false merge is a missed deviation, so the finest reproducible relation is right; many small clusters are acceptable because they are checked against rules, not read by humans.
+
+Operational segmentation: relation B. Operations need a handful of segments matching distinct handling paths (standard, staged shipment, consolidated logistics, consolidated invoicing, substitution, return-rework). B drops packaging granularity and item counts, which do not change the handling path, and keeps externality and exceptions, which do.
+
+Root-cause analysis: B to define populations and hypotheses, then Q inside a semantic cluster, with the fine features of the full profile as explanatory variables. A is misleading here because it merges X1, X5, X6 and X7, which have different causes for any downstream problem.
+
+Descriptive reporting: the coarse B key, or A with the externality rate as a side statistic. Reports need few, stable, nameable categories; A is simplest but must be labelled as an Order-flattened view, not an object-centric result.
+
+No single notion serves all four purposes because they pull in opposite directions: compliance needs zero false merges and tolerates fragmentation; reporting needs few categories and tolerates false merges; segmentation needs categories aligned with handling paths, neither the finest nor the coarsest partition; root-cause work needs both levels at once. The relevant dimensions also differ: externality is critical for logistics and finance risk but noise for a customer-experience report, while packaging granularity is noise for segmentation but a cost lever. Limitations: externality was given through EXT markers, qualifiers were assumed consistently recorded, and with eight executions most semantic clusters are singletons; in a real log the B clusters would be populated and the within-cluster variance from Section 6 would become the main diagnostic.

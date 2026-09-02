@@ -28,14 +28,14 @@ from common import clean_model_name, is_completed_output
 # ---------------------------------------------------------------------------
 # Hard-coded run configuration — edit these before launching.
 # ---------------------------------------------------------------------------
-TARGET_MODEL_NAME = "gpt-5.2-xhigh"  # prefix used in answers/
+TARGET_MODEL_NAME = "claude-fable-5-1-high"  # prefix used in answers/
 # Base id passed to `agent --model`. Effort is appended as a hyphen suffix
 # (e.g. claude-opus-5-thinking-high). Cursor does not accept [effort=...]
 # overrides. You may also paste a full effort-suffixed slug here and leave
 # TARGET_REASONING_EFFORT empty. Run `agent --list-models` for current slugs.
-TARGET_MODEL = "gpt-5.2"
+TARGET_MODEL = "claude-fable-5-1"
 # none | low | medium | high | xhigh | extra-high | max | minimal; "" to omit
-TARGET_REASONING_EFFORT = "xhigh"
+TARGET_REASONING_EFFORT = "high"
 
 # Max concurrent Cursor CLI invocations. Each worker handles one question
 # end-to-end (including its own retries) independently of the others.
