@@ -27,6 +27,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | qwen3.6-35b-a3b               | **26.6** | :white_check_mark: | :white_check_mark: | 3.5                  | 2.6                  | 3.5                  | 2.4                  | 3.3                  | 3.5                  | 4.0                  | 3.8                  |
 | nemotron-3.5-lightning        | **26.0** | :white_check_mark: | :white_check_mark: | 2.8                  | 2.2                  | 3.7                  | 2.8                  | 3.2                  | 3.6                  | 4.0                  | 3.7                  |
 | qwen3.5-122b-a10b             | **25.7** | :white_check_mark: | :white_check_mark: | 3.1                  | 2.6                  | 3.3                  | 2.5                  | 2.9                  | 3.5                  | 3.9                  | 3.8                  |
+| ibm-granitegranite-4.2-8b     | **22.8** | :white_check_mark: | :white_check_mark: | 3.2                  | 2.2                  | 2.9                  | 2.1                  | 2.7                  | 3.2                  | 3.4                  | 3.2                  |
 | qwen3.5-9b                    | **21.1** | :white_check_mark: | :white_check_mark: | 2.5                  | 1.8                  | 2.8                  | 2.3                  | 2.6                  | 2.8                  | 3.4                  | 2.9                  |
 
 ### moonshotaikimi-k3   => 38.7 points
@@ -1431,6 +1432,67 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_05_disruption_resilience_recovery        | 5.9   |
 | cat08_06_digital_twin_experiments              | 5.1   |
 | cat08_07_contradictory_evidence_memo           | 5.6   |
+
+### ibm-granitegranite-4.2-8b   => 22.8 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 4.7   |
+| cat01_02_staggered_automation                  | 4.6   |
+| cat01_03_flag_mediation                        | 2.9   |
+| cat01_04_conformance_root_cause                | 8.2   |
+| cat01_05_mixed_drift_attribution               | 4.0   |
+| cat01_06_intervention_transportability         | 4.0   |
+| cat01_07_case_counterfactuals                  | 3.6   |
+| cat02_01_reconstruct_partial_queue             | 2.5   |
+| cat02_02_infer_queue_disciplines               | 4.0   |
+| cat02_03_fork_join_delay_decomposition         | 2.8   |
+| cat02_04_batching_vs_bulk_logging              | 3.3   |
+| cat02_05_nonstationary_queue_regimes           | 3.1   |
+| cat02_06_sla_survival_censoring                | 3.5   |
+| cat02_07_robust_multiskill_staffing            | 2.5   |
+| cat03_01_case_notion_tradeoffs                 | 3.9   |
+| cat03_02_relation_repair                       | 4.0   |
+| cat03_03_cross_instance_bottlenecks            | 3.6   |
+| cat03_04_incomplete_norm_conformance           | 5.1   |
+| cat03_05_execution_equivalence_clustering      | 5.0   |
+| cat03_06_compact_ocel_pipeline                 | 3.3   |
+| cat03_07_duplicate_tie_cleaning                | 4.2   |
+| cat04_01_dual_formalism_synthesis              | 2.2   |
+| cat04_02_unsound_petri_net_repair              | 3.8   |
+| cat04_03_hybrid_procedural_declarative         | 2.8   |
+| cat04_04_sparse_evidence_model_completion      | 2.5   |
+| cat04_05_behavioral_equivalence_simplification | 1.7   |
+| cat04_06_conversion_semantic_loss_audit        | 3.9   |
+| cat04_07_adversarial_model_review              | 4.1   |
+| cat05_01_norm_hierarchy_conflicts              | 3.6   |
+| cat05_02_compensating_controls                 | 4.4   |
+| cat05_03_data_aware_obligations                | 4.2   |
+| cat05_04_uncertain_temporal_conformance        | 2.6   |
+| cat05_05_delegation_resource_conformance       | 3.6   |
+| cat05_06_alignment_business_severity           | 3.6   |
+| cat05_07_normative_model_dialectic             | 4.7   |
+| cat06_01_latent_state_next_event               | 3.9   |
+| cat06_02_competing_clocks_remaining_time       | 3.3   |
+| cat06_03_censored_outcome_study                | 4.4   |
+| cat06_04_capacity_aware_early_warning          | 3.6   |
+| cat06_05_process_aware_explanation_audit       | 5.6   |
+| cat06_06_conformant_next_best_action           | 5.3   |
+| cat06_07_process_evidence_drift_diagnosis      | 5.6   |
+| cat07_01_reconcile_org_networks                | 4.7   |
+| cat07_02_formal_shadow_roles                   | 4.7   |
+| cat07_03_collusion_or_necessity                | 4.4   |
+| cat07_04_procedural_fairness_complexity        | 5.1   |
+| cat07_05_learning_fatigue_queue_pressure       | 4.7   |
+| cat07_06_dynamic_resource_assignment           | 4.4   |
+| cat07_07_restructuring_impact                  | 5.6   |
+| cat08_01_conflicting_evidence_redesign         | 4.7   |
+| cat08_02_demand_shock_robustness               | 4.9   |
+| cat08_03_automation_portfolio_dependencies     | 4.1   |
+| cat08_04_sustainability_redesign               | 4.9   |
+| cat08_05_disruption_resilience_recovery        | 4.9   |
+| cat08_06_digital_twin_experiments              | 3.6   |
+| cat08_07_contradictory_evidence_memo           | 5.1   |
 
 ### qwenqwen3.5-9b   => 21.1 points
 

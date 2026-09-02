@@ -557,6 +557,7 @@ _REASONING_MARKERS = (
     "grok-code",
     "magistral",
     "glm",
+    "granite-4.2",
     "kimi-k",
     "marco",
     "mimo-v",
