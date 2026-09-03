@@ -832,6 +832,20 @@ def _generic_api_supports_streaming(api_url):
     return not any(marker in api_url for marker in _NON_STREAMING_GENERIC_API_URL_MARKERS)
 
 
+def _generic_non_streaming_response_message(message):
+    response_message = message.get("content") or ""
+
+    if isinstance(response_message, list) and len(response_message) == 2 and isinstance(response_message[0], dict) and isinstance(response_message[1], dict):
+        if response_message[0]["type"] == "thinking" and response_message[1]["type"] == "text":
+            return "<think>\n" + response_message[0]["thinking"][-1]["text"].strip() + "\n</think>\n\n" + response_message[1]["text"].strip()
+
+    reasoning_content = message.get("reasoning_content") or ""
+    if reasoning_content:
+        return "<think>\n" + reasoning_content.strip() + "\n</think>\n\n" + response_message.strip()
+
+    return response_message
+
+
 def query_text_simple_generic(question, api_url, target_file):
     """
     Generic function to query LLM endpoints:
@@ -1011,6 +1025,11 @@ def query_text_simple_generic(question, api_url, target_file):
             dump_response(final_response, target_file)
 
         else:
+            # Non-streaming requests must not retain caller-provided streaming
+            # options; DashScope documents stream_options for streaming only.
+            payload.pop("stream", None)
+            payload.pop("stream_options", None)
+
             if Shared.PAYLOAD_REASONING_EFFORT:
                 payload["reasoning_effort"] = Shared.PAYLOAD_REASONING_EFFORT
 
@@ -1022,14 +1041,7 @@ def query_text_simple_generic(question, api_url, target_file):
             try:
                 dump_response(response, target_file)
                 message = response["choices"][0]["message"]
-
-                response_message = message["content"]
-
-                if isinstance(response_message, list) and len(response_message) == 2 and isinstance(response_message[0], dict) and isinstance(response_message[1], dict):
-                    if response_message[0]["type"] == "thinking" and response_message[1]["type"] == "text":
-                        response_message = "<think>\n" + response_message[0]["thinking"][-1]["text"].strip() + "\n</think>\n\n" + response_message[1]["text"].strip()
-                elif "reasoning_content" in message:
-                    response_message = "<think>\n" + message["reasoning_content"] + "\n</think>\n\n" + response_message.strip()
+                response_message = _generic_non_streaming_response_message(message)
 
             except Exception as e:
                 print(response)
@@ -1376,6 +1388,12 @@ def query_image_simple_generic(base64_image, api_url, target_file, text):
                         # Possibly a keep-alive or incomplete chunk
                         traceback.print_exc()
     else:
+        payload.pop("stream", None)
+        payload.pop("stream_options", None)
+
+        if Shared.PAYLOAD_REASONING_EFFORT:
+            payload["reasoning_effort"] = Shared.PAYLOAD_REASONING_EFFORT
+
         response = requests.post(complete_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
         #print(response)
         #print(response.status_code)
@@ -1385,7 +1403,8 @@ def query_image_simple_generic(base64_image, api_url, target_file, text):
         dump_response(response, target_file)
 
         try:
-            response_message = response["choices"][0]["message"]["content"]
+            message = response["choices"][0]["message"]
+            response_message = _generic_non_streaming_response_message(message)
         except Exception as e:
             print(response)
             raise Exception(e)
