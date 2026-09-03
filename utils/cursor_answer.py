@@ -28,12 +28,12 @@ from common import clean_model_name, is_completed_output
 # ---------------------------------------------------------------------------
 # Hard-coded run configuration — edit these before launching.
 # ---------------------------------------------------------------------------
-TARGET_MODEL_NAME = "claude-fable-5-1-high"  # prefix used in answers/
+TARGET_MODEL_NAME = "gemini-3.8-flash-high"  # prefix used in answers/
 # Base id passed to `agent --model`. Effort is appended as a hyphen suffix
 # (e.g. claude-opus-5-thinking-high). Cursor does not accept [effort=...]
 # overrides. You may also paste a full effort-suffixed slug here and leave
 # TARGET_REASONING_EFFORT empty. Run `agent --list-models` for current slugs.
-TARGET_MODEL = "claude-fable-5-1"
+TARGET_MODEL = "gemini-3.8-flash"
 # none | low | medium | high | xhigh | extra-high | max | minimal; "" to omit
 TARGET_REASONING_EFFORT = "high"
 
