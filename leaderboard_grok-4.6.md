@@ -16,7 +16,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | moonshotaikimi-k3              | **38.7** | :white_check_mark: | :white_check_mark: | **5.0**              | 4.2                  | **4.9**              | **5.0**              | **5.0**              | **5.0**              | 4.9                  | 4.9                  |
 | claude-opus-5-thinking-high    | **38.6** | :x:                | :white_check_mark: | 4.9                  | 4.6                  | **4.7**              | **4.9**              | **5.1**              | 4.7                  | 4.8                  | 4.9                  |
 | grok-4.5                       | **38.4** | :x:                | :white_check_mark: | 4.8                  | 4.4                  | **4.9**              | 4.8                  | 4.8                  | 4.6                  | **5.0**              | **5.0**              |
-| gpt-5.2-xhigh                  | **38.3** | :x:                | :white_check_mark: | **5.0**              | 4.8                  | **4.8**              | **4.9**              | 4.5                  | 4.7                  | **5.0**              | 4.8                  |
+| gpt-5.2-XHIGH                  | **38.3** | :x:                | :white_check_mark: | **5.0**              | 4.8                  | **4.8**              | **4.9**              | 4.5                  | 4.7                  | **5.0**              | 4.8                  |
 | gpt-5.6-terra-NONE             | **38.2** | :x:                | :x:                | 4.7                  | 4.5                  | **4.8**              | 4.4                  | 4.8                  | 4.8                  | **5.0**              | **5.2**              |
 | claude-fable-5-thinking-high   | **38.1** | :x:                | :white_check_mark: | 4.8                  | 4.6                  | 4.6                  | **4.9**              | **5.0**              | 4.7                  | 4.9                  | 4.7                  |
 | qwen3.8-max-2026-09-02         | **37.8** | :x:                | :white_check_mark: | 4.6                  | 4.6                  | **4.7**              | 4.8                  | 4.8                  | 4.8                  | 4.8                  | 4.7                  |
@@ -801,7 +801,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 7.5   |
 | cat08_07_contradictory_evidence_memo           | 7.2   |
 
-### gpt-5.2-xhigh   => 38.3 points
+### gpt-5.2-XHIGH   => 38.3 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
