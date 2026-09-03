@@ -1,0 +1,376 @@
+<think>
+Structuring a simulation design with process-mining grounding, balancing non-stationary demand, dependencies, and uncertainty constraints.Verifying PM4Py function names and adding experiment matrix details.Drafting the eight-section outline with assumptions, experiment matrix, validation, and Python skeleton.
+</think>
+# 1. Model scope and state variables
+## Boundary
+The digital twin simulates **case arrival to final decision (Issue permit / Reject application) including rework loops and post-decision appeal**, plus applicant and third-party delays. Included: portal submission, completeness loop, parallel reviews (Planning, Fire-safety, Environmental), Public-notice with latent objection process, inspection scheduling + inspection with geography, Decision drafting as join, Legal check with council calendar, rejections.
+Excluded from mechanistic simulation but represented as exogenous delays/parameters: detailed document content quality, council political deliberation, court appeals beyond municipal reject, HR hiring/firing dynamics, IT outages. Emergency fast-track cases removed from log are out of scope and must not be used to promise SLAs for them.
+
+Level of detail: **task-level discrete-event simulation with resource-constrained queues + calendars + case attributes + explicit cross-case couplings**. Not a simple replay of traces and not independent-case Monte Carlo. Resources are individual agents with shifts and skills; queues are per-activity with priority rules.
+
+## Entities
+- **Cases:** attributes `case_id, case_type {Simple, New residential, Commercial, Complex variance}, district {D1-D5+}, architect_id, application_value, requires_fire, requires_environment, requires_public_notice, prior_violations, submission_time, age, state`.
+- **Tasks / Activities:** as in process tree, including silent `tau` routings and rework tasks `Completeness rework, Inspection rework`, plus latent `Objection occurrence, Applicant response, Consultant report arrival`.
+- **Resources:** `clerk_1..5, planner_1..8, fire_1..2eq, env_1..3, inspector_1..4, scheduler_1.., legal_1..2, system (infinite), portal (infinite), applicant/third-party (infinite but with heavy-tailed delay)`.
+- **Batches / Bundles:** inspection bundles keyed by `(district, week, inspector)`, architect submission bursts keyed by `(architect_id, week)`, objection clusters keyed by `(district, neighbourhood, time-window)`.
+- **Calendars:** weekly shift calendars + exception calendar (public holidays, council-meeting weeks).
+
+## State variables
+- Global clock `t`; future event list; non-stationary arrival intensity `lambda(t, weekday, month, architect-burst-state)`.
+- Per case: `current_node, enabled_tasks, join_counters (how many of required reviews arrived), remaining_required_branches, rework_count, waiting_start, service_start, priority_score, bundle_id`.
+- Per queue: `FIFO + priority-ordered list, queue_length(t), waiting_time_sofar, starvation time`.
+- Per resource: `status {off-shift, idle, busy, travel, reserved-for-other-duties}, current_case, remaining_service, location/district, next_available_time`.
+- Per district/architect: `backlog, recent submission count, objection risk score, travel-time matrix`.
+- System: `WIP by case_type/district/activity, completed, SLA breaches, utilization integrals`.
+
+## Resources, queues, calendars
+Single pooled queues per skill with skill constraints, not one global queue:
+- Clerk queue -> 5 clerks, Mon-Fri 08-16, Mon one clerk reserved for portal support (reduced completeness capacity).
+- Planner queue -> 8 planners, Mon-Fri 09-17, 2 specialists only Simple; others handle all but with case-type-dependent service.
+- Fire queue -> capacity only Tue-Thu; models 2 FTE equivalent as 2 servers active 3/5 days.
+- Environmental queue -> 3 servers with 40% unavailability (preemptive reservation); modelled as server vacations or reduced effective capacity.
+- Inspection scheduling (office) + Site inspection (field Tue-Fri) as two-stage: schedulers batch, inspectors travel. Travel time sampled by district (D3/D5 longer) and reduced per-stop if batched.
+- Legal queue -> 2 officers, zero capacity in council-meeting weeks except `urgent==True` (Complex variance appeal, Commercial deadline).
+- System/portal infinite servers with small service.
+
+## Cross-case dependencies (must be first-class)
+1. **Architect bursts:** `architect_id` top-20 generate correlated arrivals (Hawkes / batch arrivals). Related cases share missing-document propensity and objection risk.
+2. **Objection contagion:** public-notice objections are not independent; one objection raises extension probability for temporally/spatially proximate cases. Modelled as latent district-time risk factor.
+3. **Inspection bundling:** scheduler can delay first-ready case to form district batch (trade waiting vs travel). This couples waiting times.
+4. **Join synchronization:** Decision drafting waits for max of applicable branches (Planning + optional Fire/Env/Public-notice + Inspection). This creates induced waiting even with idle drafters.
+5. **Resource contention with priority:** aging-case reservation (D6), Simple-only planners, Monday surge contention couple case types through shared queues.
+
+# 2. Parameter-estimation plan
+## PM4Py role: log/model handling only, not simulation
+Use PM4Py for parsing, discovery, conformance and descriptive statistics. Keep simulation engine separate (SimPy / custom DES) consuming estimated parameters. This separation avoids confusing replay fitness with predictive capacity under interventions and calendars.
+
+Planned PM4Py steps:
+- `pm4py.format_dataframe(df, case_id='case:concept:name', activity_key='concept:name', timestamp_key='time:timestamp')` for case notion, sorting, start/end activity analysis.
+- Variant analysis: `pm4py.get_variants()`-family / `pm4py.statistics.variants` to reproduce Variant and routing summary table, filter by `case_type` and attribute `requires_*`, compare median/p90 duration per variant group.
+- DFG discovery: `pm4py.discover_dfg(log)` for control-flow frequencies and `pm4py.discover_performance_dfg(log)` for median/mean sojourn between activities; use to calibrate branching probabilities and to locate rework arcs (Planning->Planning review, Inspection->Inspection rework, Legal->Drafting).
+- Process-tree handling: attempt `pm4py.parse_process_tree(simplified_string)`; if syntax mismatch document mapping and instead discover `pm4py.discover_process_tree_inductive(log)` and compare to nominal tree via conformance (`pm4py.conformance_diagnostics_token_replay`, alignments for selected variants). Simplified string uses `->` sequence, `X` XOR, `+` parallel, `*` loop, `tau` silent — not directly executable without loop-body semantics and guard conditions.
+- Time statistics: `pm4py.statistics.traces.pandas.case_statistics.get_median_case_duration`, case arrival rate (`case_statistics.get_cases_description`), start-activity arrival time series for non-stationary estimation.
+- Resource / performance: derive directly with pandas after formatting because only completion timestamps exist for many activities: compute inter-completion sojourns, then split into waiting vs service using external service-time priors and calendar-aware correction (see below).
+
+## Arrivals
+- Aggregate intensity: estimate hourly/daily counts by `month x weekday x case_type`. Confirm 1.7x peak (Mar-May, Sep-Nov vs Jan-Feb) and 2.2x Mon vs Wed via Poisson regression / STL decomposition on daily submissions.
+- Model as non-homogeneous Poisson process + batch component: base `lambda_0(month, weekday, hour)` fitted by maximum likelihood on counts; burst component: for each `architect_id`, estimate burstiness (Fano factor, same-week multiple submissions). Fit Hawkes or compound-Poisson: with prob `p_burst(architect_tier)` arrival generates 1-4 siblings within 7 days same district.
+- Validate against 31,200/18mo  57/day average; peak days ~90-100.
+
+## Service vs waiting split (critical: only completion times observed)
+- Do not equate sojourn to service. Strategy: (a) use activities with short service priors (Completeness 25m median, Request 10m, Issue 5m) to infer waiting = sojourn - service - off-calendar time; (b) calendar-aware subtraction: if sojourn spans weekend/holiday/off-shift, subtract non-working time using reconstructed HR calendars; (c) for human tasks without start, estimate service distribution from median/p90 table + targeted time-study assumption (lognormal/gamma), estimate waiting as residual queueing delay validated against queue-length proxies (Monday spikes).
+- Fit service: lognormal or Weibull for Planning (3.5h med, 14h p90), Fire (2.5h/9h), Env (4h/18h), Legal (3h/16h); deterministic+noise for Public-notice minimum 14d; zero service + heavy-tailed delay for Receive missing documents (5d median from request).
+- Waiting: empirical queueing delay per activity as function of WIP and calendar state; calibrate queueing parameters so simulated median waiting matches 1.5d completeness, 6d planning, 4d fire, 8d env, 8d inspection, 7d legal.
+
+## Branching / routing
+- Estimate `P(requires_fire | case_type, application_value, district)`, `P(requires_env | district, case_type)`, `P(requires_public_notice | case_type)` directly from log attributes; note missing threshold/sensitivity attributes -> add residual uncertainty and sensitivity range.
+- Estimate `P(missing docs loop | case_type, architect_tier)`, `P(legal check | case_type, variant)`, `P(reject | path)`, rework probabilities after Planning/Inspection/Legal/appeal from DFG arc frequencies conditioned on case_type. Use Laplace smoothing for rare 7% variants.
+- Decision drafting join: estimate synchronization delay as max-branch sojourn; do not model as independent activity duration.
+
+## Rework
+- Mine loop-backs via DFG + variant inspection: count `Completeness check` repetitions, `Inspection rework` occurrences (9% variants), Complex variance appeal (8% long-tail). Because rework reasons are unstructured text, treat rework probability as aggregate per exit point + rework-count-dependent (first vs second loop different), with NLP-derived sub-types only as scenario factor, not calibrated probability.
+- Distinguish municipal rework (planner/inspector/legal rework with service) vs applicant rework (Receive missing documents, readiness delay, no-show).
+
+## Calendars
+- HR calendars give prior availability; refine by observing event timestamps: infer effective capacity (e.g., no Fire completions outside Tue-Thu, no Legal completions in council weeks, no inspections Mon). Estimate env 40% reservation as random server unavailability calibrated to 8d median wait.
+- Holidays/council meetings as exception calendar overlay that blocks resource eligibility and pauses Public-notice minimum clock differently from service queues.
+
+## Dependencies
+- Inspection travel: estimate extra sojourn for D3/D5 vs others conditional on inspector; estimate batching benefit from cases with same `(district, inspection week)` close scheduling times (reduced per-case travel, increased first-case wait).
+- Objection proxy: since objection events missing, model Public-notice duration as mixture: `14d minimum + with prob p_obj(district, case_type, time) ~ extended Lognormal( up to 60d+)`. Estimate `p_obj` and extension from bimodal duration histogram, not as observed labels. Spatial correlation estimated from co-movement of long notices in same district-week.
+- Architect effect: hierarchical model with architect random effect on missing-doc prob and arrival burst; top-20 vs rest.
+
+# 3. Assumptions
+## Arrivals
+- Base arrivals follow NHPP with month and weekday multipliers as observed; within-day portal submissions concentrated 08-20h; Mon 2.2x Wed persists under baseline. Burst arrivals from same architect are correlated, not independent.
+- 18-month log covers at least one full seasonal cycle; next-year seasonality repeats shape but level has +/-15% uncertainty. Policy D7 changes weekday shape, not total volume (unless stated).
+
+## Service times
+- Service distributions are stationary conditional on `(activity, case_type, resource skill)` except when intervention changes work content (e.g., D2 removes inspection service, D8 triages env). Median/p90 table anchors fits; tails are heavy (lognormal) not exponential. Using exponential would understate p90 and SLA breach.
+- Observed sojourn = waiting + service + off-calendar + applicant delay. Where start missing, split is inferred with uncertainty, not measured. Sensitivity band +/-30% on service mean tested.
+
+## Routing
+- `requires_*` flags in log are taken as ground truth for past routing but are incomplete predictors (area threshold, env sensitivity missing). Future routing uses fitted probabilistic rules + attribute logic; Complex variance always requires public notice; Simple clean path often skips legal.
+- Parallel branches (Planning + Fire + Env) can overlap in time subject to resource availability; Decision drafting is AND-join. Simplified `+` in tree is interpreted as parallel AND, `X` as XOR, `*` as redo-loop with max 2-3 iterations (empirical truncation).
+
+## Resources/calendars
+- HR calendars approximate true availability; effective capacity lower due to meetings, sick leave, multitasking. Fire Tue-Thu only, Inspectors field Tue-Fri, Legal blocked council weeks, Clerks reduced Mon, Env 60% net. System tasks infinite capacity. Travel time district-dependent and sequence-dependent (batching reduces per-stop).
+- No overtime in baseline; interventions adding capacity (D4) respect same daily shift windows.
+
+## Rework
+- Rework probabilities conditional on case_type and loop count, not memoryless constant; Inspection rework 9% overall but higher for Commercial/Complex; Complex appeal rework creates very long tail (council-dependent). Rework service times similar to first pass but with +20% mean (context switching) unless data shows otherwise.
+- Uncoded text reasons mean root-cause-specific rework reduction cannot be calibrated; interventions affecting rework (D1, D9) modelled as relative reduction scenarios with wide intervals.
+
+## Applicant/third-party response
+- Applicant delays (Receive missing docs median 5d heavy-tailed, inspection readiness, objection response) are separate infinite-server delays, not municipal service; they do not consume municipal resources but block case progress and inflate end-to-end duration. Modelled as lognormal/Pareto with case_type/architect dependence; pre-submission checker (D1) shifts effort pre-submission (increases time-to-submit slightly) while reducing in-process applicant delay.
+- Consultant reports for env are third-party with highly variable delay folded into env waiting; triage (D8) reduces both service and external wait for low-risk.
+
+## Cross-case dependencies
+- Cases are not i.i.d. Architect bursts, objection spillover, inspection batches, and shared-queue contention induce positive correlation in waiting. Ignoring this understates peak congestion and p90. Twin explicitly simulates couplings; independent-case run is only a debug baseline, not a decision model.
+- Same-architect same-district cases have correlated quality (missing docs) and correlated objection exposure; grouped site visits couple their inspection times.
+
+## Non-stationary demand
+- Demand non-stationarity (seasonal 1.7x, weekly 2.2x, architect bursts) drives queue instability; steady-state analysis invalid. Simulation must be transient with warm-up and time-varying arrivals. Peak-month capacity (D4) only helps if queue carryover across weeks is modelled.
+- Policy/arrival interaction: smoothing (D7) and checker (D1) change arrival process itself, not just service.
+
+## Missing data
+- Missing start timestamps -> waiting/service split uncertain; missing objection events -> public-notice extension mechanism latent (proxy mixture, not observed labels); missing area/sensitivity attributes -> routing rules partially unidentified; unstructured rework reasons -> rework causes unidentified; removed emergencies -> tail slightly truncated; HR calendars not log-derived -> availability overestimated. All propagated as parameter uncertainty + structural sensitivity scenarios, not point estimates. No claim that twin is calibrated truth.
+
+# 4. Experiment matrix
+Factors: `arrival_level, case_mix, intervention, resource_level, calendar_stress, routing_rule, priority_rule, batching_rule`. Each experiment: 18-month simulated horizon + warm-up, 30+ replications, common random numbers across interventions for variance reduction.
+
+| ID | Intervention / scenario | Key factor levels | Expected trade-off / hypothesis |
+|---|---|---|---|
+| B0 | Baseline (as-is, calibrated) | Current calendars, current routing, NHPP arrivals | Reference for all deltas; shows seasonal backlog, p90 tails |
+| D1 | Pre-submission checker | P(missing loop) -30 to -50%, +0.5-2d pre-submit effort, +5% portal support load | Reduces 19% missing-doc variants (22d~14d) but shifts burden to applicant; risk: drop-off / delayed submission |
+| D2 | Simple no-inspection if value<50k & no violations | Skip scheduling+inspection for ~60-70% Simple (~27% all cases) | Large waiting cut for Simple, frees inspectors for Complex; risk: quality/missed defects, reject shift downstream |
+| D3 | District-batched inspection | Batch window 2-3d by district, travel -20-40% per stop, +1-2d first-case wait | Net gain if travel-heavy D3/D5; risk: penalizes first-ready Simple |
+| D4 | +1 temp inspector peak months only | +25% inspection capacity Mar-May, Sep-Nov, Tue-Fri | Cuts 8d inspection wait in peaks; risk: underutilized off-peak, scheduling overhead, no help for legal/env bottlenecks |
+| D5 | Parallel legal pre-check Commercial/Complex | Legal starts after Planning draft, not after Decision drafting (overlap 50-70%) | Cuts 68d/140d paths by ~5-10d; risk: wasted legal work if planning rework, extra legal load |
+| D6 | Reserve 1 planner/day for aging cases | Priority: age>30d (Simple) / >60d (others) preempts FIFO | Improves p90/fairness, may increase median slightly; risk: starvation of fresh cases |
+| D7 | Appointment slots to smooth Mon burst | Mon 2.2x1.3x Wed, spread to Tue-Thu, small applicant delay | Reduces completeness queue spike (1.5d wait); risk: applicant non-compliance, shift to Tue peak |
+| D8 | Env triage by district/attributes | Fast-track 30% env (service -50%, external wait -40%), standard rest | Targets 8d env wait + 18h p90 service; risk: misclassification if sensitivity data incomplete |
+| D9 | Objection early-warning | p(extended notice) -20%, extension mean -15%, +planner/legal upfront cost | Cuts 60d objection tail; risk: false alarms, extra work, cannot observe objections directly |
+| D10 | Combined D1+D2+D3+D4 | As above jointly | Tests complementarity (applicant + inspection capacity + batching); risk: overestimates additive benefit, implementation complexity |
+| C1 | D5+D6 combo (fairness/legal) | Parallel legal + aging priority | Addresses Commercial/Complex tails without extra hires |
+| S1 | Stress: +20% demand surge + burst architects | Arrival level +20%, burst prob x1.5 | Tests robustness; expect non-linear blow-up in planning/env/legal queues |
+| S2 | Stress: Legal/env outage (council backlog + consultant delay) | Legal capacity -50% 4 weeks, env external wait +100% | Exposes AND-join vulnerability; Decision drafting starves |
+| S3 | Stress: Inspection sick-leave + D3/D5 travel shock | Inspector 3 FTE 6 weeks, travel +50% | Tests batching (D3) and temp (D4) resilience; fairness across districts |
+| CAL | Calibration check: D2 under alternative violation prevalence | Violation rate 5% vs 15% | D2 benefit highly sensitive to eligibility; guards against over-claim |
+
+All D-runs also evaluated under S1-S3 for robustness (e.g., D10+S1). Implementation cost/effort recorded qualitatively (IT, hiring, legal change) alongside simulated benefit.
+
+# 5. Warm-up, replications, and uncertainty treatment
+## Warm-up
+- System starts empty but real system never empty; need warm-up to fill WIP and queues. Approach: (1) initialize with WIP sampled from log (open cases by activity/district) + 60-day warm-up with peak-season arrivals discarded from statistics (Welch's method on WIP and waiting); (2) sensitivity: 0/30/90-day warm-up comparison; (3) for stress scenarios, warm-up under baseline then inject stress (no re-warm) to capture transient backlog carryover.
+- Council calendar phase matters: start clock on same weekday/month as log start (Jan) to align seasonality; do not start in peak and measure immediately.
+
+## Run length
+- Horizon 18 simulated months matching log + 3-month tail to drain WIP (cases submitted near end still resolve; Complex 140d median needs drain). Report both truncated (submitted-in-window) and completed-case metrics to avoid censoring bias for long tails.
+
+## Replications and seeds
+- Minimum 30 replications per cell (50 for tails / Complex variance analysis). Independent streams per stochastic component (arrivals, service, routing, applicant delay) with seeded RNGs; common random numbers across B0 vs D* (same arrival traces, same service draws where applicable) to reduce variance of differences. Publish seed table; allow reproducibility with `numpy.random.SeedSequence`.
+- Compute paired differences per replication (D - B0 on same seed) and CI on difference, not just overlapping independent CIs.
+
+## Confidence / credible intervals
+- Report mean + median + p75/p90/p95 + SLA breach % with 95% CIs (t or bootstrap percentile, 2000 resamples) for durations; Wilson CIs for probabilities (rework, reject). For heavy tails, emphasize medians and quantiles over means; report both mean and trimmed mean.
+- Parameter uncertainty: bootstrap log cases (cluster bootstrap by architect/week to preserve bursts) to get parameter distributions; run outer Monte Carlo over 100 parameter draws x inner DES replications for key outputs (two-level uncertainty). Alternatively Bayesian posteriors for branching probs (Beta) and lognormal service (Normal-Inverse-Gamma) propagated.
+- Sensitivity: one-way tornado (service mean +/-30%, p_obj +/-50%, travel +/-50%, burst intensity x0.5/x1.5), plus Morris screening for D10 interactions. Heavy-tailed applicant/env delays: test lognormal vs Pareto; report p90 sensitivity explicitly; use median-based comparisons and quantile regression to avoid mean dominance by extremes.
+- Do not present point-optimal ranking; present intervals and probability each intervention beats baseline (e.g., P(D reduces p90 by >7d) = 80%).
+
+# 6. Validation strategy
+## Face validation
+- Walkthrough with clerks, planners, inspectors, legal officers: does sequence, parallel reviews, join at Decision drafting, council blackout, batching logic match lived process? Review animation of 20 sampled simulated traces vs P001/P002-style real traces. Challenge D2/D5 legality and D3 travel assumptions. Document disagreements as model risks.
+
+## Event-log replay validation
+- Replay log traces on model with resources infinite (control-flow check): token replay / alignments fitness should be >0.9 for top 80% variants; deviations pinpoint missing guards (area threshold, sensitivity). Then replay with finite resources/calendars to see if simulated waiting reproduces observed queue spikes (Mon completeness, peak-month planning). Failure to reproduce indicates calendar/capacity miscalibration, not proof of correctness.
+
+## Distributional validation
+- Compare simulated vs empirical distributions stratified by `case_type x variant group`: median/p90 duration table (12d/24d Simple clean through 140d/260d Complex), activity sojourn histograms, public-notice mixture (14d spike + long tail). Use QQ-plots, KS / Anderson-Darling (with heavy-tail focus), coverage of prediction intervals. Critically, validate joint distributions (e.g., Fire+public-notice 48d/95d) not just marginals, to test parallel-join logic.
+
+## Resource-utilization validation
+- Compare simulated utilization/busy-time vs HR expectations and indirect proxies: completions per FTE per week, idle gaps (no Fire completions Fri-Mon, no inspections Mon), queue lengths before Planning/Legal/Inspection. Since start times missing, validate completions-per-day and WIP, not claimed service utilization alone; show band for inferred utilization given service uncertainty. Flag if simulation needs >100% utilization to match observed waits (indicates missing capacity or mis-split).
+
+## Bottleneck validation
+- Check that model reproduces known bottlenecks: Planning queue 6d, Env 8d, Inspection 8d, Legal 7d, applicant 5d; that shifting bottleneck appears seasonally (env/legal interact for Commercial, inspection for rework variants). Use bottleneck frequency analysis (which activity has longest waiting per case) simulated vs log-derived; test intervention directionality (e.g., removing inspection should relieve inspector queue but expose legal).
+
+## Out-of-sample validation
+- Temporal holdout: calibrate on first 12 months, predict next 6 months (peak season) arrival counts, variant mix, median/p90 per case_type, backlog evolution. Success = prediction intervals cover holdout with <15% median error for high-volume types; Complex variance allowed wider. Also cross-district holdout (train without D5, predict D5) to test travel/generalization. Failed holdout triggers recalibration and widens uncertainty, not tuning to test set. Document that validation does not confer optimality; decision use requires ongoing monitoring and recalibration after policy change.
+
+# 7. Decision criteria
+Decide on **dominance under uncertainty + robustness + fairness**, not single mean optimum. All deltas reported as paired difference vs B0 with 95% CI.
+
+## Primary metrics (per case_type and overall, median and tail)
+- End-to-end duration: median and p90/p95 days (submission to Issue/Reject). Thresholds for consideration: median -5d overall or -7d for targeted type AND no p90 worsening >3d; strong candidate if p90 -10d for Commercial/Complex without median harm.
+- SLA compliance: e.g., Simple <21d, New residential <60d, Commercial <90d, Complex <180d (illustrative; municipality to confirm). Require +5pp compliance for targeted type, no type losing >2pp.
+- Backlog/WIP: average WIP and peak-month queue days; require no sustained WIP growth under S1; threshold: peak WIP -15% for capacity interventions.
+
+## Fairness
+- By district (D3/D5 vs others) and architect tier (top-20 vs small): max-min gap in median wait for Planning/Inspection and overall p90. Flag if D3/D5 p90 >1.3x best district or small architects systematically worse. D6/D3 evaluated partly on gap reduction, not just average. Reject interventions that improve mean by sacrificing a district (>5d worsening for any district).
+
+## Resource / efficiency
+- Utilization 65-85% target for human pools (sustained >90% = fragile, <50% = waste for temp hire). Overtime/urgent-legal share, inspection km-travel proxy, rework rate, applicant burden (extra pre-submit days, missing-doc loops avoided). D1/D7 must report applicant cost; D4 cost per peak-day saved.
+
+## Rework and quality guardrails
+- Rework rate, reject rate, appeal rate must not increase >1pp (D2 no-inspection watch); any time saving accompanied by reject increase is flagged as risk-shifting, not improvement.
+
+## Robustness
+- Rank by worst-case across B0+S1+S2+S3: preferred intervention has positive median benefit in baseline and non-negative in all stresses (or smallest regret). Compute minimax regret on p90 and SLA. Combined D10 must beat best single by >3d median to justify complexity/cost.
+- Decision rule: pilot if (a) paired CI excludes zero harm on primary + fairness, (b) holds under S1-S3, (c) cost/effort proportionate; otherwise monitor or redesign. Explicitly state simulation suggests candidates, does not prove optimality without pilot calibration.
+
+# 8. Python skeleton
+```python
+"""
+Digital-twin skeleton: PM4Py for log/model handling SEPARATE from DES engine.
+Conventions: pm4py.format_dataframe(case_id, activity_key, timestamp_key),
+discover_dfg / discover_performance_dfg, parse_process_tree (with fallback).
+Does NOT use non-existent pm4py.read_csv; builds pandas DataFrame directly.
+"""
+import pandas as pd
+import numpy as np
+import pm4py
+
+# ---------- 1. Build illustrative log DataFrame manually ----------
+raw = [
+    # P001 excerpt
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P001","Submit application","2026-01-02 09:12:00","portal","New residential","D3","A17",480000,"yes","no","yes"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P001","Completeness check","2026-01-03 10:45:00","clerk_2","New residential","D3","A17",480000,"yes","no","yes"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P001","Planning review","2026-01-14 14:00:00","planner_3","New residential","D3","A17",480000,"yes","no","yes"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P001","Fire-safety review","2026-01-17 10:10:00","fire_1","New residential","D3","A17",480000,"yes","no","yes"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P001","Site inspection","2026-02-07 13:00:00","inspector_2","New residential","D3","A17",480000,"yes","no","yes"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P001","Issue permit","2026-02-15 10:00:00","system","New residential","D3","A17",480000,"yes","no","yes"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P002","Submit application","2026-01-03 18:21:00","portal","Simple renovation","D1","A02",32000,"no","no","no"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P002","Planning review","2026-01-05 13:15:00","planner_1","Simple renovation","D1","A02",32000,"no","no","no"])),
+    dict(zip(["case:concept:name","concept:name","time:timestamp","org:resource","case_type","district","architect_id","application_value","requires_fire","requires_environment","requires_public_notice"],
+             ["P002","Issue permit","2026-01-12 08:30:00","system","Simple renovation","D1","A02",32000,"no","no","no"])),
+]
+df_raw = pd.DataFrame(raw)
+df_raw["time:timestamp"] = pd.to_datetime(df_raw["time:timestamp"])
+df_raw["application_value"] = df_raw["application_value"].astype(float)
+
+# ---------- 2. PM4Py formatting (correct keys) ----------
+event_log = pm4py.format_dataframe(
+    df_raw,
+    case_id="case:concept:name",
+    activity_key="concept:name",
+    timestamp_key="time:timestamp"
+)
+
+# ---------- 3. Process-tree string handling ----------
+pt_string = ("->('Submit application',* (->('Completeness check',X(tau,"
+             "->('Request missing documents','Receive missing documents'))),'Completeness rework'),"
+             "+('Planning review',X(tau,'Fire-safety review'),X(tau,'Environmental review')),"
+             "X(tau,'Public-notice period'),*(->('Inspection scheduling','Site inspection'),'Inspection rework'),"
+             "'Decision drafting',X(tau,'Legal check'),X('Issue permit','Reject application'))")
+# NOTE limitation: simplified notation (* loop, + parallel, X xor, tau silent)
+# is illustrative. pm4py.parse_process_tree expects PM4Py PT-string dialect;
+# loop needs explicit redo/do semantics and tau handling. Try parse, else fall back
+# to inductive discovery for executable model.
+try:
+    process_tree = pm4py.parse_process_tree(pt_string)
+    print(process_tree)
+except Exception as e:
+    print(f"Simplified string not directly parseable ({e}); "
+          f"map ->=sequence, X=exclusive, +=parallel, *=loop with tau=silent, "
+          f"then use pm4py.discover_process_tree_inductive(event_log) for executable tree.")
+    try:
+        process_tree = pm4py.discover_process_tree_inductive(event_log)
+    except Exception:
+        process_tree = None
+
+# ---------- 4. PM4Py descriptive analytics ----------
+# Variants
+try:
+    variants = pm4py.get_variants(event_log)  # version-dependent; alt: pm4py.statistics.variants.pandas.get.get_variants
+    print(f"Variants: {len(variants)}")
+except Exception as e:
+    print("Variant fallback:", e)
+    from pm4py.statistics.variants.pandas import get as var_get
+    variants = var_get.get_variants(event_log)
+
+# DFG + performance DFG
+dfg, start_acts, end_acts = pm4py.discover_dfg(event_log)
+perf_dfg, p_start, p_end = pm4py.discover_performance_dfg(event_log)
+print("Start:", start_acts, "End:", end_acts)
+
+# Case arrival average (from Submit application times)
+submits = df_raw[df_raw["concept:name"]=="Submit application"].sort_values("time:timestamp")
+if len(submits) >= 2:
+    span_days = (submits["time:timestamp"].max()-submits["time:timestamp"].min()).total_seconds()/86400 or 1.0
+    print(f"Arrival avg: {len(submits)/span_days:.2f} cases/day in excerpt (scale to 31200/18mo in full log)")
+    print(f"Full-log target: {31200/(18*30.44):.1f}/day avg, peak ~1.7x, Mon 2.2x Wed")
+
+# Service / waiting columns (only completion times -> sojourn; split is inferred)
+event_log = event_log.sort_values(["case:concept:name","time:timestamp"])
+event_log["sojourn_days"] = event_log.groupby("case:concept:name")["time:timestamp"].diff().dt.total_seconds()/86400
+# Placeholder split: service sampled from priors; waiting = sojourn - service - off-calendar
+# Do NOT collapse: keep both columns and document uncertainty where start missing.
+event_log["service_hours_est"] = np.nan  # fill per activity from fitted lognormal (see engine priors)
+event_log["waiting_days_est"] = event_log["sojourn_days"]  # residual after subtracting service/calendar
+print(event_log[["case:concept:name","concept:name","time:timestamp","sojourn_days"]].head(10))
+
+# ============================================================
+# SIMULATION ENGINE (separate from PM4Py layer above)
+# ============================================================
+from dataclasses import dataclass, field
+
+@dataclass
+class SimConfig:
+    horizon_days: int = 18*30 + 90
+    warmup_days: int = 60
+    n_replications: int = 30
+    base_seed: int = 42
+    intervention: str = "B0"  # B0, D1..D10, S1..S3
+    seasonal_mult: dict = field(default_factory=dict)
+    calendars: dict = field(default_factory=dict)
+
+class ArrivalGenerator:
+    """NHPP + weekday/month multipliers + architect burst batches."""
+    def __init__(self, base_rate_per_day=57.0, month_mult=None, weekday_mult=None, burst_params=None, rng=None):
+        self.base = base_rate_per_day; self.month_mult = month_mult or {}
+        self.weekday_mult = weekday_mult or {}; self.burst = burst_params or {"p_burst":0.1,"size":[1,2,3]}
+        self.rng = rng or np.random.default_rng(0)
+    def next_arrivals(self, t, dt_days=1.0):
+        # thinning placeholder: lambda(t) = base * month * weekday; bursts add siblings
+        lam = self.base * self.month_mult.get(int(t//30 % 12),1.0) * self.weekday_mult.get(int(t%7),1.0)
+        n = self.rng.poisson(lam*dt_days)
+        # architect burst: with p, clone arrival same architect/district within week
+        return n  # full version yields list of case attribute dicts
+
+class Router:
+    """Probabilistic routing with case attributes + latent objection risk."""
+    def __init__(self, branch_probs, rng=None):
+        self.p = branch_probs; self.rng = rng or np.random.default_rng(1)
+    def requires(self, case):
+        # e.g. fire if requires_fire==yes or sampled residual for missing area threshold
+        return {"fire": case.get("requires_fire")=="yes" or self.rng.random()<0.05,
+                "env": case.get("requires_environment")=="yes" or self.rng.random()<0.08,
+                "notice": case.get("requires_public_notice")=="yes"}
+    def rework(self, node, case):
+        return self.rng.random() < self.p.get(node, 0.05)
+
+class ResourceCalendar:
+    """Shift + exception calendar; eligibility check per resource pool."""
+    def __init__(self, shifts, exceptions=None):
+        self.shifts = shifts  # e.g. {"fire": [(1,3) Tue-Thu], "legal": blocked council weeks}
+        self.exceptions = exceptions or set()
+    def is_available(self, pool, t):
+        # check weekday, hour, holiday/council blackout, env 40% reservation via probabilistic vacation
+        return True  # placeholder with real calendar logic in full engine
+
+class DigitalTwinEngine:
+    def __init__(self, config: SimConfig, arrival_gen: ArrivalGenerator, router: Router, calendars: ResourceCalendar):
+        self.cfg=config; self.arr=arrival_gen; self.router=router; self.cal=calendars
+    def run_once(self, seed):
+        rng = np.random.default_rng(seed)
+        # DES loop placeholder: generate arrivals (non-stationary+batches),
+        # route through parallel join (Planning/Fire/Env/Notice), batch inspections by district,
+        # seize resources respecting calendars, sample service (lognormal) + applicant heavy-tail separately,
+        # record waiting vs service, rework loops, objection mixture (latent, not observed).
+        return pd.DataFrame([{"case_id":"sim1","end_to_end_days":20,"case_type":"Simple renovation"}])
+    def run(self):
+        outs=[]
+        for r in range(self.cfg.n_replications):
+            outs.append(self.run_once(self.cfg.base_seed+r))
+        return outs
+
+def run_experiments(matrix):
+    """Execute B0, D1-D10, stresses with common random numbers; return paired deltas + CIs."""
+    results={}
+    for exp_id, cfg in matrix.items():
+        eng = DigitalTwinEngine(cfg, ArrivalGenerator(), Router({}), ResourceCalendar({}))
+        results[exp_id]=eng.run()
+    # compute paired median/p90 differences, bootstrap CIs, fairness gaps here
+    return results
+
+# Example matrix hook
+# matrix = {"B0": SimConfig(intervention="B0"), "D2": SimConfig(intervention="D2"), ...}
+```

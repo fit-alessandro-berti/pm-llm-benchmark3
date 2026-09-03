@@ -580,6 +580,7 @@ _REASONING_PATTERNS = (
     r"(?:^|-)grok-(?:[4-9]|\d{2,})(?:[.-]|-|$)",
     r"deepseek.*(?:r\d|v[4-9]|\d{2,})",
     r"(?:^|-)gemma-?[4-9]",
+    r"muse-spark-1\.(?:1|2|3)(?:-|$)",
 )
 
 _HIDDEN_REASONING_PATTERNS = (
@@ -590,6 +591,7 @@ _HIDDEN_REASONING_PATTERNS = (
     r"(?:^|-)gpt-(?:[5-9]|\d{2,})(?:[.-]|-|$)",
     r"(?:^|-)chatgpt-(?:[5-9]|\d{2,})(?:[.-]|-|$)",
     r"(?:^|-)grok-(?:[4-9]|\d{2,})(?:[.-]|-|$)",
+    r"muse-spark-1\.(?:1|2|3)(?:-|$)",
 )
 
 
