@@ -29,6 +29,7 @@ PROVIDER_API_KEY_ENVS = {
     "google": "GOOGLE_API_KEY",
     "claude": "ANTHROPIC_API_KEY",
     "qwen": "QWEN_API_KEY",
+    "compactif": "COMPACTIF_API_KEY",
     "nvidia": "NVIDIA_API_KEY",
     "perplexity": "PERPLEXITY_API_KEY",
     "groq": "GROQ_API_KEY",
@@ -42,7 +43,6 @@ PROVIDER_API_KEY_FILES = {
     "mistral": "../api_mistral.txt",
     "google": "../api_google.txt",
     "claude": "../api_anthropic.txt",
-    "qwen": "../api_qwen.txt",
     "nvidia": "../api_nvidia.txt",
     "perplexity": "../api_perplexity.txt",
     "groq": "../api_groq.txt",
@@ -824,6 +824,14 @@ def query_text_simple_openai_new(question, api_url, target_file):
     return response["output"][-1]["content"][0]["text"]
 
 
+_NON_STREAMING_GENERIC_API_URL_MARKERS = ("dashscope", "compactif.ai")
+
+
+def _generic_api_supports_streaming(api_url):
+    api_url = (api_url or "").lower()
+    return not any(marker in api_url for marker in _NON_STREAMING_GENERIC_API_URL_MARKERS)
+
+
 def query_text_simple_generic(question, api_url, target_file):
     """
     Generic function to query LLM endpoints:
@@ -924,8 +932,10 @@ def query_text_simple_generic(question, api_url, target_file):
         dump_payload(payload, target_file)
 
         # Decide if we want streaming
-        streaming_enabled = False
-        streaming_enabled = Shared.PAYLOAD_REASONING_EFFORT is None
+        streaming_enabled = (
+            Shared.PAYLOAD_REASONING_EFFORT is None
+            and _generic_api_supports_streaming(api_url)
+        )
         if "stral" in Shared.MODEL_NAME.lower() or "mercury" in Shared.MODEL_NAME.lower() or "alpha" in Shared.MODEL_NAME.lower():
             streaming_enabled = False
 
@@ -1322,7 +1332,10 @@ def query_image_simple_generic(base64_image, api_url, target_file, text):
 
     payload.update(get_llm_specific_settings())
 
-    streaming_enabled = "healer-alpha" not in Shared.MODEL_NAME.lower()
+    streaming_enabled = (
+        "healer-alpha" not in Shared.MODEL_NAME.lower()
+        and _generic_api_supports_streaming(api_url)
+    )
 
     if streaming_enabled:
         payload["stream"] = True
@@ -1543,7 +1556,7 @@ def _read_api_key(provider):
 
 
 def insert_api_keys():
-    for provider in PROVIDER_API_KEY_FILES:
+    for provider in PROVIDER_API_KEY_ENVS:
         if provider in MODELS_DICT:
             MODELS_DICT[provider]["api_key"] = _read_api_key(provider)
 
