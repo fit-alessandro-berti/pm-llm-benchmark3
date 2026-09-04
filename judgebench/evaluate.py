@@ -60,6 +60,7 @@ JUDGE_LLMS: Sequence[Tuple[Any, ...]] = [
             "additional_payload": {"reasoning": {"effort": "medium"}},
         },
     ),
+    ("meta/muse-spark-1.3",),
 ]
 
 STRICT_EVALUATION_TEXT = (
