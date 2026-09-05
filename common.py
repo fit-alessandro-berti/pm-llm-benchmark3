@@ -484,6 +484,7 @@ _CLOSED_SOURCE_MODEL_FAMILIES = (
     "gpt-3.5",
     "gpt-4",
     "gpt-5",
+    "gpt-6",
     "chatgpt",
     "claude",
     "gemini",
