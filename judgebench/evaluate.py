@@ -60,6 +60,14 @@ JUDGE_LLMS: Sequence[Tuple[Any, ...]] = [
             "additional_payload": {"reasoning": {"effort": "medium"}},
         },
     ),
+    (
+        "gpt-6-astra",
+        {
+            "api_url": "https://api.openai.com/v1/responses",
+            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+            "additional_payload": {"reasoning": {"effort": "medium"}},
+        },
+    ),
     ("meta/muse-spark-1.3",),
 ]
 
