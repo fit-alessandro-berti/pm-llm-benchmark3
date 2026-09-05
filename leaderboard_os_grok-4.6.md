@@ -4,17 +4,18 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 
 | Model                          | Score    | OS                 | LRM                | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
 | ------------------------------ | -------- | ------------------ | ------------------ | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
-| moonshotaikimi-k3              | **38.7** | :white_check_mark: | :white_check_mark: | :mage_woman: **5.0** | **4.2**              | :mage_woman: **4.9** | :mage_woman: **5.0** | :mage_woman: **5.0** | :mage_woman: **5.0** | :mage_woman: **4.9** | :mage_woman: **4.9** |
-| deepseek-v4-pro-0813           | **36.4** | :white_check_mark: | :white_check_mark: | 4.6                  | :mage_woman: **4.3** | 4.5                  | **4.7**              | 4.6                  | 4.6                  | 4.6                  | 4.4                  |
-| qwen3.8-2.4t-a95b              | **36.3** | :white_check_mark: | :white_check_mark: | **4.7**              | 3.8                  | **4.7**              | 4.6                  | 4.5                  | **4.7**              | **4.7**              | **4.7**              |
-| qwen3.8-flash                  | **35.1** | :white_check_mark: | :white_check_mark: | 4.5                  | 3.8                  | 4.6                  | 4.3                  | 3.6                  | **4.7**              | **4.7**              | **4.7**              |
-| qwen3.8-27b                    | **34.3** | :white_check_mark: | :white_check_mark: | 4.5                  | 3.2                  | 4.5                  | 4.2                  | 4.3                  | 4.3                  | **4.7**              | 4.6                  |
+| gpt-6-astra-XHIGH              | **42.6** | :white_check_mark: | :white_check_mark: | :mage_woman: **5.3** | :mage_woman: **5.4** | :mage_woman: **5.2** | :mage_woman: **5.4** | :mage_woman: **5.4** | :mage_woman: **5.2** | :mage_woman: **5.4** | :mage_woman: **5.3** |
+| moonshotaikimi-k3              | **38.7** | :white_check_mark: | :white_check_mark: | **5.0**              | 4.2                  | **4.9**              | 5.0                  | 5.0                  | **5.0**              | 4.9                  | 4.9                  |
+| deepseek-v4-pro-0813           | **36.4** | :white_check_mark: | :white_check_mark: | 4.6                  | 4.3                  | 4.5                  | 4.7                  | 4.6                  | 4.6                  | 4.6                  | 4.4                  |
+| qwen3.8-2.4t-a95b              | **36.3** | :white_check_mark: | :white_check_mark: | 4.7                  | 3.8                  | 4.7                  | 4.6                  | 4.5                  | 4.7                  | 4.7                  | 4.7                  |
+| qwen3.8-flash                  | **35.1** | :white_check_mark: | :white_check_mark: | 4.5                  | 3.8                  | 4.6                  | 4.3                  | 3.6                  | 4.7                  | 4.7                  | 4.7                  |
+| qwen3.8-27b                    | **34.3** | :white_check_mark: | :white_check_mark: | 4.5                  | 3.2                  | 4.5                  | 4.2                  | 4.3                  | 4.3                  | 4.7                  | 4.6                  |
 | deepseek-v4-flash-0731         | **33.7** | :white_check_mark: | :white_check_mark: | 4.0                  | 3.7                  | 4.2                  | 4.3                  | 4.6                  | 4.2                  | 4.2                  | 4.4                  |
-| z-aiglm-5.3                    | **33.5** | :white_check_mark: | :white_check_mark: | **4.9**              | 2.2                  | 4.5                  | 2.9                  | 4.4                  | **4.9**              | **4.8**              | **4.8**              |
+| z-aiglm-5.3                    | **33.5** | :white_check_mark: | :white_check_mark: | 4.9                  | 2.2                  | 4.5                  | 2.9                  | 4.4                  | **4.9**              | 4.8                  | 4.8                  |
 | z-aiglm-5.2                    | **32.9** | :white_check_mark: | :white_check_mark: | 4.0                  | 3.9                  | 4.0                  | 4.1                  | 4.3                  | 4.3                  | 4.2                  | 4.2                  |
 | deepseek-v4-pro                | **32.9** | :white_check_mark: | :white_check_mark: | 4.0                  | 3.6                  | 4.1                  | 3.8                  | 4.2                  | 4.2                  | 4.5                  | 4.4                  |
-| z-aiglm-5.3-flash              | **32.4** | :white_check_mark: | :white_check_mark: | 4.6                  | 3.0                  | 4.4                  | 3.4                  | 3.9                  | 4.5                  | 3.9                  | **4.7**              |
-| tencenthy3                     | **32.4** | :white_check_mark: | :white_check_mark: | 4.2                  | **4.0**              | 3.8                  | 3.6                  | 4.1                  | 4.5                  | 4.3                  | 3.9                  |
+| z-aiglm-5.3-flash              | **32.4** | :white_check_mark: | :white_check_mark: | 4.6                  | 3.0                  | 4.4                  | 3.4                  | 3.9                  | 4.5                  | 3.9                  | 4.7                  |
+| tencenthy3                     | **32.4** | :white_check_mark: | :white_check_mark: | 4.2                  | 4.0                  | 3.8                  | 3.6                  | 4.1                  | 4.5                  | 4.3                  | 3.9                  |
 | xiaomimimo-v2.5-pro            | **31.0** | :white_check_mark: | :white_check_mark: | 3.8                  | 3.2                  | 4.0                  | 3.6                  | 4.0                  | 4.0                  | 4.3                  | 4.1                  |
 | minimaxminimax-m3              | **30.2** | :white_check_mark: | :white_check_mark: | 4.0                  | 3.5                  | 4.1                  | 2.4                  | 3.6                  | 4.0                  | 4.3                  | 4.3                  |
 | qwen3.6-27b                    | **29.8** | :white_check_mark: | :white_check_mark: | 3.8                  | 3.1                  | 4.0                  | 3.2                  | 3.7                  | 3.9                  | 4.1                  | 4.0                  |
@@ -34,6 +35,67 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | qwen3.5-9b                     | **21.1** | :white_check_mark: | :white_check_mark: | 2.5                  | 1.8                  | 2.8                  | 2.3                  | 2.6                  | 2.8                  | 3.4                  | 2.9                  |
 | ministral-3b-2512              | **19.3** | :white_check_mark: | :x:                | 2.4                  | 2.0                  | 2.3                  | 2.0                  | 2.2                  | 2.5                  | 3.0                  | 2.9                  |
 | ibm-granitegranite-4.0-h-micro | **15.8** | :white_check_mark: | :x:                | 1.8                  | 1.7                  | 2.0                  | 1.7                  | 1.8                  | 1.9                  | 2.4                  | 2.4                  |
+
+### gpt-6-astra-XHIGH   => 42.6 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 7.8   |
+| cat01_02_staggered_automation                  | 7.7   |
+| cat01_03_flag_mediation                        | 8.0   |
+| cat01_04_conformance_root_cause                | 7.5   |
+| cat01_05_mixed_drift_attribution               | 7.7   |
+| cat01_06_intervention_transportability         | 7.6   |
+| cat01_07_case_counterfactuals                  | 7.1   |
+| cat02_01_reconstruct_partial_queue             | 7.5   |
+| cat02_02_infer_queue_disciplines               | 7.6   |
+| cat02_03_fork_join_delay_decomposition         | 7.8   |
+| cat02_04_batching_vs_bulk_logging              | 7.8   |
+| cat02_05_nonstationary_queue_regimes           | 7.7   |
+| cat02_06_sla_survival_censoring                | 7.8   |
+| cat02_07_robust_multiskill_staffing            | 7.5   |
+| cat03_01_case_notion_tradeoffs                 | 7.5   |
+| cat03_02_relation_repair                       | 7.3   |
+| cat03_03_cross_instance_bottlenecks            | 7.5   |
+| cat03_04_incomplete_norm_conformance           | 7.7   |
+| cat03_05_execution_equivalence_clustering      | 7.2   |
+| cat03_06_compact_ocel_pipeline                 | 7.5   |
+| cat03_07_duplicate_tie_cleaning                | 7.2   |
+| cat04_01_dual_formalism_synthesis              | 7.5   |
+| cat04_02_unsound_petri_net_repair              | 7.8   |
+| cat04_03_hybrid_procedural_declarative         | 7.8   |
+| cat04_04_sparse_evidence_model_completion      | 7.7   |
+| cat04_05_behavioral_equivalence_simplification | 7.8   |
+| cat04_06_conversion_semantic_loss_audit        | 7.8   |
+| cat04_07_adversarial_model_review              | 7.8   |
+| cat05_01_norm_hierarchy_conflicts              | 7.7   |
+| cat05_02_compensating_controls                 | 7.2   |
+| cat05_03_data_aware_obligations                | 7.8   |
+| cat05_04_uncertain_temporal_conformance        | 8.4   |
+| cat05_05_delegation_resource_conformance       | 7.7   |
+| cat05_06_alignment_business_severity           | 7.7   |
+| cat05_07_normative_model_dialectic             | 7.7   |
+| cat06_01_latent_state_next_event               | 7.5   |
+| cat06_02_competing_clocks_remaining_time       | 7.3   |
+| cat06_03_censored_outcome_study                | 7.2   |
+| cat06_04_capacity_aware_early_warning          | 7.2   |
+| cat06_05_process_aware_explanation_audit       | 7.8   |
+| cat06_06_conformant_next_best_action           | 7.2   |
+| cat06_07_process_evidence_drift_diagnosis      | 7.9   |
+| cat07_01_reconcile_org_networks                | 7.7   |
+| cat07_02_formal_shadow_roles                   | 7.8   |
+| cat07_03_collusion_or_necessity                | 7.9   |
+| cat07_04_procedural_fairness_complexity        | 8.0   |
+| cat07_05_learning_fatigue_queue_pressure       | 7.7   |
+| cat07_06_dynamic_resource_assignment           | 7.1   |
+| cat07_07_restructuring_impact                  | 7.8   |
+| cat08_01_conflicting_evidence_redesign         | 7.5   |
+| cat08_02_demand_shock_robustness               | 7.5   |
+| cat08_03_automation_portfolio_dependencies     | 7.7   |
+| cat08_04_sustainability_redesign               | 7.2   |
+| cat08_05_disruption_resilience_recovery        | 7.6   |
+| cat08_06_digital_twin_experiments              | 7.6   |
+| cat08_07_contradictory_evidence_memo           | 7.8   |
 
 ### moonshotaikimi-k3   => 38.7 points
 
