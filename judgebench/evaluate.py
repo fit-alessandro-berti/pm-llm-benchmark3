@@ -70,6 +70,7 @@ JUDGE_LLMS: Sequence[Tuple[Any, ...]] = [
     ),
     ("meta/muse-spark-1.3",),
     ("inception/mercury-2.5",),
+    ("anthropic/claude-fable-5.1",),
 ]
 
 STRICT_EVALUATION_TEXT = (
