@@ -12,7 +12,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | mistral-medium-3-5             | **25.6** | :white_check_mark: | :x: | 3.2                  | 2.9                  | 3.0                  | 2.8                  | 3.0                  | 3.3                  | 3.7                  | 3.5                  |
 | inceptionmercury-2.5-preview   | **23.9** | :white_check_mark: | :x: | 2.9                  | 2.6                  | 2.9                  | 2.5                  | 2.9                  | 3.2                  | 3.5                  | 3.4                  |
 | mistral-small-2603             | **23.2** | :white_check_mark: | :x: | 2.9                  | 2.5                  | 3.0                  | 2.5                  | 2.8                  | 3.0                  | 3.4                  | 3.2                  |
-| ministral-14b-2512             | **22.6** | :white_check_mark: | :x: | 2.5                  | 2.4                  | 3.0                  | 2.5                  | 2.7                  | 2.9                  | 3.3                  | 3.2                  |
+| ministral-14b-2512             | **22.5** | :white_check_mark: | :x: | 2.5                  | 2.4                  | 3.0                  | 2.5                  | 2.7                  | 2.9                  | 3.3                  | 3.2                  |
 | ministral-8b-2512              | **21.7** | :white_check_mark: | :x: | 2.5                  | 2.2                  | 2.7                  | 2.5                  | 2.7                  | 2.8                  | 3.2                  | 3.1                  |
 | gpt-4o-2024-11-20              | **21.6** | :x:                | :x: | 2.4                  | 2.3                  | 2.4                  | 2.6                  | 2.3                  | 3.1                  | 3.4                  | 3.1                  |
 | ibm-granitegranite-4.1-8b      | **20.5** | :white_check_mark: | :x: | 2.6                  | 2.3                  | 2.5                  | 2.2                  | 2.5                  | 2.7                  | 2.7                  | 3.0                  |
@@ -507,7 +507,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 4.5   |
 | cat08_07_contradictory_evidence_memo           | 5.5   |
 
-### ministral-14b-2512   => 22.6 points
+### ministral-14b-2512   => 22.5 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
