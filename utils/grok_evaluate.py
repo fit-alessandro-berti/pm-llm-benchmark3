@@ -33,7 +33,7 @@ from utils.table_per_model import match_regex
 
 TARGET_MODEL = "grok-4.7"
 TARGET_REASONING_EFFORT = "high"
-MAX_WORKERS = 75
+MAX_WORKERS = 99
 DEFAULT_RETRY_DELAY_SECONDS = 17.0
 EVALUATION_FOLDER = Path("evaluation-grok-4.7")
 
