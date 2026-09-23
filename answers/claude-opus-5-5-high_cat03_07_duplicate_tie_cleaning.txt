@@ -1,0 +1,614 @@
+## 1. Duplicate-handling decision tree
+
+**Candidate generation (not yet a decision).** Two events are candidates if they share the harmonized activity, fall within a per-source-pair time tolerance (0 s here), and share at least one object. Shared objects nominate; they never prove. The questions are asked in this order.
+
+- **Q1. Same `source` and same `source_event_key`?**
+  - Yes, with identical `payload_hash` and identical E2O set → **Exact technical duplicate → DROP** all but the lowest eid, and log the dropped ids.
+  - Yes, but payload or E2O differs → **QUARANTINE** (a replay that mutated the record, or a reused key).
+  - No → Q2.
+- **Q2. Is there an object type where both events have non-empty but disjoint object sets (I1 vs I2, M1 vs M2)?**
+  - Yes → **Concurrent same-label events on different objects → RETAIN BOTH UNCHANGED.** This overrides identity evidence; if evidence still claims identity, quarantine.
+  - No → Q3.
+- **Q3. Do the pre-harmonization source codes or documented source semantics describe different business transitions?**
+  - Yes → **Harmonization collision → RETAIN BOTH WITH REFINED LABELS**, keeping `original_activity`.
+  - No or unknown → Q4.
+- **Q4. Is one event documented as generated from the other(s) and coarser than it (a subset of its object types, a status or balance update)?**
+  - Yes, a 1:1 derivation → **Summary event → RETAIN BOTH with a refined label, `abstraction_level=summary` and a `derived_from` link** (default). It is merged into the detailed event only in the evidence-based scenario.
+  - Yes, an N:1 aggregate → retain with qualifiers, or convert it into an object attribute change. Never merge it into one of its detailed members.
+  - No → Q5.
+- **Q5. Is there independent identity evidence (reconciliation report, business key such as an invoice number, scan ID), and are the E2O sets identical or nested?**
+  - Yes → **Same physical event seen by multiple systems → MERGE attributes and relations** using a per-attribute authority map.
+  - No → **Unresolved candidate → QUARANTINE FOR REVIEW.** It stays in the log flagged `dup_status=unresolved`, excluded from merges, and analyses run with and without it.
+
+## 2. Event-by-event decisions
+
+| Event(s) | Candidate relationship | Decision | Confidence | Preserved canonical eid | Attribute merge policy | Relation merge policy | Provenance retained | Main risk |
+|---|---|---|---|---|---|---|---|---|
+| e03/e04 | Same scan seen by WMS and scanner | Merge | High (reconciliation report) | e03 (WMS is system of record) | WMS wins for location; scanner wins for device, operator, seq; conflicts logged | Identical {O1,I1,P1}; WMS qualifiers | Full e04 row, S-901, seq 551, hash | Report wrong; scanner seq kept for ordering |
+| e03/e05 | Concurrent picks of different Items | Retain both unchanged | High (fact 2; I1/I2 disjoint) | e03, e05 | None | None | – | Library merge/drop via shared O1/P1 |
+| e06/e07, scenario A (conservative) | Summary derived from detail | Retain both; e07 → "Record Pack Status (ERP)", `derived_from=e06` | Medium | e06, e07 | None | e07 keeps {O1,P1}; never inherits Items | `original_activity` | Extra node; Pack counts need an abstraction filter |
+| e06/e07, scenario B (evidence) | One transition, two observations | Merge into e06 | Medium | e06 | WMS for packing detail; ERP status, record id, ingestion kept as `erp_*` | e07's set ⊂ e06's; keep e06's | Full e07 row | Wrong if ERP event is an independent confirmation; ERP latency lost |
+| e08/e09 | Harmonization collision (release vs acceptance) | Retain both; e09 → "Accept by Carrier" | High | e08, e09 | None | Unchanged | Original label, carrier code | Identical objects invite a merge; e08/e09 order uncertain |
+| e09/e10 | Distinct successive carrier events | Retain; e09 before e10 | High (fact 5) | e09, e10 | – | – | – | Tie-breaking that agrees by luck is not evidence |
+| e11/e16 | Same invoice issuance, two authorities | Merge | High (invoice number V1) | e16 (issuing system) | Billing for document fields; ERP for posting, ledger, order refs; conflicts logged | Identical {O1,V1} | Full e11 row, ER-200, ERP seq 40 | Keep-first loses ERP fields; ERP seq 40 still orders it before e15 |
+| e13/e14 | Concurrent partial captures, different Payments | Retain both unchanged | High (fact 7) | e13, e14 | – | Never union M1/M2 | – | Merging via shared O1/V1 |
+| e13/e15 | N:1 ERP balance summary of e13+e14 | Conservative: retain as "Update Invoice Balance (ERP)", `derived_from=[e13,e14]`. Evidence: V1 attribute change. Never merge into e13 | Medium | e15 | No merge | No inferred link to M1 | Full e15 row | Counted as a third capture (fake loop) |
+| e14/e15 | Same as above | Same as above | Medium | e15 | No merge | No inferred link to M2 | Full e15 row | M2's capture would inherit ERP attributes |
+| e12/e13 | Ordering pair, not a duplicate | Retain; e12 before e13 | High | – | – | – | – | Ingestion agrees only by coincidence |
+
+## 3. Timestamp-tie ordering rules
+
+Reordering happens only inside a tie group (same original timestamp at stored precision). Rules never move an event across different business timestamps. If a constraint contradicts the timestamps, the group is flagged and nothing is rewritten.
+
+Constraints become edges of a precedence graph for each group. A topological sort with a deterministic priority key then produces the total order:
+
+| Level | Rule | Kind |
+|---|---|---|
+| R1 | Domain constraints: Pick before Pack for the same Item; Authorize before Capture for the same Payment; Accept by Carrier before Handover for the same Delivery; a derived summary comes after its source event(s) (e06 before e07, e13 and e14 before e15) | Semantic, hard |
+| R2 | Within-source sequence: `source_seq` orders events only when both carry a sequence from the same source (merged events keep every source's sequence) | Semantic, but it is recording-order evidence |
+| R3 | Lifecycle constraints on shared objects: an object's creating event comes before the object's other events (Issue Invoice before other V1 events) | Semantic, medium strength |
+| R4 | Source-specific semantics: WMS release before carrier-side events on the same Package | Semantic, soft; dropped first if a cycle appears |
+| R5 | `ingested_at` | Deterministic only; used just to pick among events already allowed by R1–R4 |
+| R6 | Fixed source rank, then `source_event_key`, then eid | Deterministic only |
+
+If the graph contains a cycle, all edges of the weakest semantic class are removed and the removal is logged. A cycle made only of R1 edges sends the group to quarantine.
+
+Each event records `tie_decided_by`: `constraint` when it was the only eligible node, or `deterministic_tiebreak` when R5/R6 chose it. Events decided by a tiebreak stay analytically concurrent: the total order is a reproducible convention and does **not** prove physical order.
+
+**Why adding microseconds first tells a false story.** Offsets added to row or ingestion order become fake business evidence. With ingestion order, e16 (ingested 12:00:04) follows e13 and e14, so the Order trace reads invoicing after payment. Later rules can no longer see the tie, and concurrency such as e03 with e05 becomes an invented sequence with invented durations. Semantic order comes first; offsets come last, stored as `order_ts` beside `original_timestamp`.
+
+**Resulting orders (conservative decisions):**
+- **10:00:** e03 → e05 → e06 → e07′, from scanner seq 551 < 552, WMS seq 100 < 110, and R1. If scanner sequence is not trusted, e05 → e03 → e06 → e07′ is also admissible.
+- **10:15:** e08 → e09′ → e10 (R4, R1) is intended. e09′ → e08 → e10 is admissible if acceptance was electronic and preceded gate release; e09′ → e10 → e08 only if release is booked after handover. The e08/e09 order is low confidence.
+- **12:00:** e16* (merged invoice) → e12 → e13 → e14 → e15′. This uses R3 (invoice first), R2 (PSP 400 < 401 < 402; ERP 40 < 41) and R1. Without PSP sequence, e14 may sit anywhere between e16* and e15′. In the evidence scenario, e15 is gone and the order is e16* → e12 → e13 → e14.
+
+## 4. Conservative cleaning pipeline
+
+1. **Freeze the raw log.** Deep-copy `ocel_raw` and add `original_eid`, `original_timestamp`, `original_activity`, `source_eids`, `source_event_keys` and `source_seqs` (a dictionary from source to sequence).
+2. **Drop exact technical duplicates.** Match on (source, key, payload hash, E2O set). A matching key with a different payload goes to quarantine. No displayed row qualifies (0 of 17 removed); the step exists for replayed ingestion rows.
+3. **Pre-check candidate groups** and classify each pair using Section 1.
+4. **Apply verified-pair merges** from an evidence registry: e03←e04 (reconciliation report) and e16←e11 (invoice number). Attributes follow authority maps; E2O sets are unioned only after a compatibility check.
+5. **Refine labels where justified.** e09 → "Accept by Carrier" (source semantics). e07 → "Record Pack Status (ERP)" and e15 → "Update Invoice Balance (ERP)" (abstraction level). Original labels are kept; production rules key on (source, source activity code).
+6. **Order ties** with R1–R6. Store `tie_rank` and `tie_decided_by`, then derive `order_ts`. `original_timestamp` stays untouched, and performance is measured on it.
+7. **Validate** referential integrity and the guards (e05 and e14 survive; no Capture event links more than one Payment).
+
+**Expected count:** 17 − 2 = **15 events**, and 44 − 5 = **39 E2O relations**. The merged pairs had identical object sets, so only duplicate relation rows disappear. Abstraction-level events and legitimate concurrency (e03/e05, e13/e14) remain.
+
+## 5. Aggressive alternatives
+
+**Scenario E: evidence-based semantic merging.** Start from the conservative log, then merge e07 into e06, and move e15 out of the event table into a V1 object attribute change (`erp_balance_status`) linked to e13 and e14 in provenance.
+- Result: **13 events, 35 E2O relations, plus 1 object change.**
+- Likely damage: if e07 was an independent ERP confirmation, the "ERP knows it is packed" milestone and its latency disappear; ERP balance KPIs vanish from event views. Both steps depend on the derivation documentation being right.
+
+**Scenario A: mechanically aggressive PM4Py merging.** Run `ocel_merge_duplicates` on the whole log (default `have_common_object=False`), which groups by activity and timestamp.
+- It fuses {e03,e04,e05}, {e06,e07}, {e08,e09}, {e11,e16} and {e13,e14,e15}.
+- Result: **10 events, 28 E2O relations.**
+- Likely damage:
+  - I2's pick disappears into I1's pick, which reads as a batch pick.
+  - M1 and M2 share a single capture event carrying the attributes of an arbitrary first row, including the wrong amount.
+  - Carrier acceptance is erased.
+  - Event ids become random UUIDs, so results cannot be reproduced and lineage is lost.
+
+**Scenario D: whole-log `ocel_drop_duplicates`** (a second mechanical variant). It drops E2O rows that share (activity, timestamp, object), which removes e04, e07, e09, e15 and e16.
+- Result: **12 events, 28 relations.**
+- Likely damage: e05 silently loses O1/P1 and e14 loses O1/V1. The Order view then shows one pick and one capture, while the Item and Payment views still show two.
+
+**Why `have_common_object=True` is not enough.** The condition asks whether events share *any* object. e13 and e14 share O1 and V1, so the condition holds and they stay eligible for merging. Whether they actually fuse depends on how PM4Py assigns an event that belongs to several (object, activity, timestamp) groups, giving 10 to 12 events. An implementation detail is not a safeguard. The needed protection is a discriminating object type (never merge disjoint non-empty Payment or Item sets), which PM4Py does not offer, so the Q2 pre-check enforces it.
+
+## 6. PM4Py-oriented Python implementation
+
+```python
+import copy
+import heapq
+import json
+import warnings
+from collections import defaultdict
+
+import pandas as pd
+import pm4py
+
+EID, ACT, TS = "ocel:eid", "ocel:activity", "ocel:timestamp"
+OID, OTYPE, QUAL = "ocel:oid", "ocel:type", "ocel:qualifier"
+RULESET = "dup-order-rules v1.0"
+
+IDENTITY_COLS = {"source", "source_event_key", "source_seq", "payload_hash", "ingested_at"}
+CONTROL_COLS = {EID, ACT, TS, "original_eid", "original_timestamp", "original_activity",
+                "source_eids", "source_event_keys", "source_seqs", "dup_status", "merge_rule",
+                "reviewer", "confidence", "conflicts", "derived_from", "abstraction_level",
+                "label_rule", "tie_rank", "tie_decided_by", "order_ts"}
+SOURCE_RANK = {"ERP": 0, "BILLING": 1, "PSP": 2, "WMS": 3, "SCANNER": 4, "CARRIER": 5}
+
+
+# ---------------------------------------------------------------- preparation
+def prepare(ocel_in):
+    ocel = copy.deepcopy(ocel_in)
+    ev = ocel.events
+    ev["original_eid"] = ev[EID]
+    ev["original_timestamp"] = ev[TS]
+    ev["original_activity"] = ev[ACT]
+    if not pd.api.types.is_datetime64_any_dtype(ev["ingested_at"]):
+        # time-only technical stamps: date borrowed from the business timestamp (breaks across midnight)
+        ev["ingested_at"] = pd.to_datetime(ev[TS].dt.strftime("%Y-%m-%d ") + ev["ingested_at"].astype(str))
+    ev["source_eids"] = ev[EID].map(lambda e: json.dumps([e]))
+    ev["source_event_keys"] = ev.apply(lambda r: json.dumps([f'{r["source"]}:{r["source_event_key"]}']), axis=1)
+    ev["source_seqs"] = ev.apply(lambda r: json.dumps({r["source"]: int(r["source_seq"])}), axis=1)
+    ev["dup_status"] = "original"
+    ev["abstraction_level"] = "detail"
+    for c in ["merge_rule", "reviewer", "confidence", "conflicts", "derived_from", "label_rule"]:
+        ev[c] = None
+    return ocel
+
+
+def sync_relations(ocel):
+    m = ocel.events.set_index(EID)
+    ocel.relations[ACT] = ocel.relations[EID].map(m[ACT])
+    ocel.relations[TS] = ocel.relations[EID].map(m[TS])
+    return ocel
+
+
+def object_sets(ocel):
+    return {e: {t: set(g[OID]) for t, g in grp.groupby(OTYPE)}
+            for e, grp in ocel.relations.groupby(EID)}
+
+
+def relation_relationship(a, b):
+    """'identical' | 'subset' | 'discriminated' | 'overlap' for two {type: set(oid)} maps."""
+    if a == b:
+        return "identical"
+    types = set(a) | set(b)
+    for t in types:
+        sa, sb = a.get(t, set()), b.get(t, set())
+        if sa and sb and sa.isdisjoint(sb):
+            return "discriminated"
+    if all(a.get(t, set()) <= b.get(t, set()) for t in types) or \
+       all(b.get(t, set()) <= a.get(t, set()) for t in types):
+        return "subset"
+    return "overlap"
+
+
+# ---------------------------------------------------------------- pre-check
+def candidate_pairs(ocel):
+    objs = object_sets(ocel)
+    rows = []
+    for (act, ts), g in ocel.events.sort_values([TS, EID]).groupby([ACT, TS]):
+        recs = g.to_dict("records")
+        for i in range(len(recs)):
+            for j in range(i + 1, len(recs)):
+                a, b = recs[i], recs[j]
+                rel = relation_relationship(objs.get(a[EID], {}), objs.get(b[EID], {}))
+                same_src = a["source"] == b["source"]
+                if same_src and a["source_event_key"] == b["source_event_key"]:
+                    cls = ("exact_technical" if a["payload_hash"] == b["payload_hash"] and rel == "identical"
+                           else "key_conflict_quarantine")
+                elif rel == "discriminated":
+                    cls = "concurrent_distinct_objects"
+                elif same_src:
+                    cls = "same_source_distinct_records"
+                else:
+                    cls = "needs_evidence"
+                rows.append(dict(e1=a[EID], e2=b[EID], activity=act, timestamp=ts,
+                                 src1=a["source"], src2=b["source"], e2o=rel, cls=cls))
+    return pd.DataFrame(rows, columns=["e1", "e2", "activity", "timestamp", "src1", "src2", "e2o", "cls"])
+
+
+# ---------------------------------------------------------------- justified library drop
+def guarded_drop_exact(ocel, pairs):
+    """ocel_drop_duplicates is applied per homogeneous exact-duplicate group only,
+    never to the whole log (it would strip O1/P1 from e05 and O1/V1 from e14)."""
+    exact = pairs[pairs.cls == "exact_technical"]
+    if exact.empty:
+        return ocel, []
+    ev = ocel.events.set_index(EID)
+    members_all = sorted(set(exact.e1) | set(exact.e2))
+    dropped = []
+    for _, grp in ev.loc[members_all].groupby(["source", "source_event_key", "payload_hash"]):
+        members = sorted(grp.index)
+        sub = copy.deepcopy(pm4py.filter_ocel_events(ocel, members))
+        sub.relations = sub.relations.sort_values([EID, OID], kind="mergesort")
+        sub = pm4py.ocel_drop_duplicates(sub)
+        dropped += sorted(set(members) - set(sub.events[EID]))
+    keep = sorted(set(ocel.events[EID]) - set(dropped))
+    return pm4py.filter_ocel_events(copy.deepcopy(ocel), keep), dropped
+
+
+# ---------------------------------------------------------------- verified-pair merge
+class IncompatibleMerge(ValueError):
+    pass
+
+
+VERIFIED_STRONG = [
+    dict(canonical="e03", absorbed=["e04"], rule="R-SAME-PHYSICAL-SCAN",
+         evidence="WMS/scanner reconciliation report", reviewer="wh-data-steward", confidence="high",
+         reason="same scan; WMS enriched location",
+         authority={"location": "WMS", "device_id": "SCANNER", "operator": "SCANNER", "*": "WMS"}),
+    dict(canonical="e16", absorbed=["e11"], rule="R-SAME-INVOICE-NUMBER",
+         evidence="invoice number V1 in both records", reviewer="fin-data-steward", confidence="high",
+         reason="one issuance, two authoritative systems",
+         authority={"gl_posting_ref": "ERP", "order_ref": "ERP", "invoice_amount": "BILLING",
+                    "document_hash": "BILLING", "*": "BILLING"}),
+]
+VERIFIED_EVIDENCE = [
+    dict(canonical="e06", absorbed=["e07"], rule="R-DERIVED-STATUS-1TO1",
+         evidence="ERP status generated from WMS pack message", reviewer="wh-data-steward",
+         confidence="medium", reason="two observations of one pack transition",
+         authority={"erp_status": "ERP", "*": "WMS"}),
+]
+
+
+def merge_verified_pairs(ocel_in, specs, ts_tolerance="0s"):
+    ocel = copy.deepcopy(ocel_in)
+    ev = ocel.events.set_index(EID, drop=False)
+    objs = object_sets(ocel)
+    remap, prov = {}, []
+    for s in specs:
+        can, absorbed = s["canonical"], s["absorbed"]
+        members = [can] + absorbed
+        missing = [m for m in members if m not in ev.index]
+        if missing:
+            raise IncompatibleMerge(f"{s['rule']}: missing {missing}")
+        if ev.loc[members, ACT].nunique() > 1 and not s.get("allow_activity_mismatch"):
+            raise IncompatibleMerge(f"{s['rule']}: activities differ")
+        ts = ev.loc[members, "original_timestamp"]
+        if ts.max() - ts.min() > pd.Timedelta(ts_tolerance):
+            raise IncompatibleMerge(f"{s['rule']}: timestamps differ")
+        for a in absorbed:
+            r = relation_relationship(objs.get(can, {}), objs.get(a, {}))
+            if r in ("discriminated", "overlap"):
+                raise IncompatibleMerge(f"{s['rule']}: E2O of {can}/{a} is {r}; refusing union")
+
+        conflicts, kept_from = {}, {}
+        for col in [c for c in ev.columns if c not in CONTROL_COLS | IDENTITY_COLS]:
+            vals = {m: ev.at[m, col] for m in members if pd.notna(ev.at[m, col])}
+            if not vals:
+                continue
+            auth_src = s["authority"].get(col, s["authority"]["*"])
+            auth = [m for m in members if m in vals and ev.at[m, "source"] == auth_src]
+            chosen = auth[0] if auth else (can if can in vals else sorted(vals)[0])
+            ev.at[can, col] = vals[chosen]
+            kept_from[col] = ev.at[chosen, "source"]
+            if len({str(v) for v in vals.values()}) > 1:
+                conflicts[col] = {ev.at[m, "source"]: str(v) for m, v in vals.items()}
+
+        seqs = {}
+        for m in members:
+            seqs.update(json.loads(ev.at[m, "source_seqs"]))
+        ev.at[can, "source_eids"] = json.dumps(sorted(sum((json.loads(ev.at[m, "source_eids"]) for m in members), [])))
+        ev.at[can, "source_event_keys"] = json.dumps(sorted(sum((json.loads(ev.at[m, "source_event_keys"]) for m in members), [])))
+        ev.at[can, "source_seqs"] = json.dumps(seqs)
+        ev.at[can, "dup_status"] = "merged_canonical"
+        ev.at[can, "merge_rule"] = s["rule"]
+        ev.at[can, "reviewer"] = s["reviewer"]
+        ev.at[can, "confidence"] = s["confidence"]
+        ev.at[can, "conflicts"] = json.dumps(conflicts)
+        for a in absorbed:
+            remap[a] = can
+        prov.append(dict(
+            canonical_eid=can, source_eids=members,
+            source_event_keys=[f'{ev.at[m, "source"]}:{ev.at[m, "source_event_key"]}' for m in members],
+            merge_rule=s["rule"], rule_version=RULESET, reviewer=s["reviewer"], evidence=s["evidence"],
+            original_activities={m: ev.at[m, "original_activity"] for m in members},
+            refined_activity=ev.at[can, ACT],
+            original_timestamps={m: ev.at[m, "original_timestamp"] for m in members},
+            adjusted_timestamp=None, attributes_kept_from=kept_from, discarded_conflicts=conflicts,
+            confidence=s["confidence"], reason=s["reason"],
+            absorbed_rows=ev.loc[absorbed].to_dict("records"),
+            absorbed_e2o=ocel.relations[ocel.relations[EID].isin(absorbed)].to_dict("records")))
+
+    ocel.events = ev[~ev.index.isin(list(remap))].reset_index(drop=True)
+    rel = ocel.relations.copy()
+    rel["_canon_row"] = ~rel[EID].isin(list(remap))
+    rel[EID] = rel[EID].replace(remap)
+    rel = rel.sort_values("_canon_row", ascending=False, kind="mergesort")
+    if QUAL in rel.columns:
+        qc = rel.groupby([EID, OID])[QUAL].nunique()
+        for (e, o) in qc[qc > 1].index:
+            warnings.warn(f"qualifier conflict on ({e},{o}); canonical qualifier kept")
+    ocel.relations = rel.drop_duplicates([EID, OID], keep="first").drop(columns="_canon_row")
+    return sync_relations(ocel), pd.DataFrame(prov)
+
+
+# ---------------------------------------------------------------- label refinement / summaries
+REFINEMENTS_CONSERVATIVE = {
+    "e09": dict(label="Accept by Carrier", rule="R-SPLIT-HARMONIZED:CARRIER.ACCEPTED"),
+    "e07": dict(label="Record Pack Status (ERP)", rule="R-ABSTRACTION:ERP-STATUS",
+                abstraction="summary", derived_from=["e06"]),
+    "e15": dict(label="Update Invoice Balance (ERP)", rule="R-ABSTRACTION:ERP-BALANCE",
+                abstraction="summary", derived_from=["e13", "e14"]),
+}
+
+
+def refine_labels(ocel_in, refinements):
+    ocel = copy.deepcopy(ocel_in)
+    ev = ocel.events
+    for eid, spec in refinements.items():
+        mask = ev[EID] == eid
+        ev.loc[mask, ACT] = spec["label"]
+        ev.loc[mask, "label_rule"] = spec["rule"]
+        if "abstraction" in spec:
+            ev.loc[mask, "abstraction_level"] = spec["abstraction"]
+        if "derived_from" in spec:
+            ev.loc[mask, "derived_from"] = json.dumps(spec["derived_from"])
+    return sync_relations(ocel)
+
+
+def summary_to_object_change(ocel_in, eid, oid, field, value, derived_from):
+    ocel = copy.deepcopy(ocel_in)
+    row = ocel.events.set_index(EID).loc[eid]
+    otype = ocel.objects.set_index(OID).at[oid, OTYPE]
+    change = pd.DataFrame([{OID: oid, OTYPE: otype, TS: row["original_timestamp"], "ocel:field": field,
+                            field: value, "source_eid": eid,
+                            "source_event_key": f'{row["source"]}:{row["source_event_key"]}'}])
+    ocel.object_changes = pd.concat([ocel.object_changes, change], ignore_index=True)
+    prov = dict(canonical_eid=None, source_eids=[eid], merge_rule="R-SUMMARY-TO-OBJECT-CHANGE",
+                rule_version=RULESET, reviewer="fin-data-steward", confidence="medium",
+                reason=f"N:1 ERP summary of {derived_from}", original_activities={eid: row["original_activity"]},
+                original_timestamps={eid: row["original_timestamp"]},
+                absorbed_rows=[row.to_dict()],
+                absorbed_e2o=ocel.relations[ocel.relations[EID] == eid].to_dict("records"))
+    keep = sorted(set(ocel.events[EID]) - {eid})
+    return pm4py.filter_ocel_events(ocel, keep), prov
+
+
+# ---------------------------------------------------------------- semantic tie ordering
+DOMAIN_RULES = [  # (before, after, shared object type, basis)
+    ("Pick Item", "Pack Package", "Item", "domain"),
+    ("Authorize Payment", "Capture Payment", "Payment", "domain"),
+    ("Accept by Carrier", "Handover to Carrier", "Delivery", "domain"),
+    ("Pack Package", "Record Pack Status (ERP)", "Package", "domain"),
+    ("Capture Payment", "Update Invoice Balance (ERP)", "Invoice", "domain"),
+]
+SOFT_RULES = [("Dispatch Package", "Accept by Carrier", "Package", "source_semantics")]
+CREATION = {"Invoice": "Issue Invoice"}
+BASIS_STRENGTH = {"domain": 0, "source_seq": 1, "lifecycle": 2, "source_semantics": 3}
+
+
+def tie_group_edges(g, objs):
+    edges, recs = set(), g.to_dict("records")
+    for a in recs:
+        for b in recs:
+            if a[EID] == b[EID]:
+                continue
+            oa, ob = objs.get(a[EID], {}), objs.get(b[EID], {})
+            for before, after, otype, basis in DOMAIN_RULES + SOFT_RULES:
+                if a[ACT] == before and b[ACT] == after and oa.get(otype, set()) & ob.get(otype, set()):
+                    edges.add((a[EID], b[EID], basis))
+            for otype, creator in CREATION.items():
+                if a[ACT] == creator and b[ACT] != creator and oa.get(otype, set()) & ob.get(otype, set()):
+                    edges.add((a[EID], b[EID], "lifecycle"))
+            sa, sb = json.loads(a["source_seqs"]), json.loads(b["source_seqs"])
+            for src in set(sa) & set(sb):
+                if sa[src] < sb[src]:
+                    edges.add((a[EID], b[EID], "source_seq"))
+    return edges
+
+
+def kahn(nodes, edges, key):
+    indeg, succ = {n: 0 for n in nodes}, defaultdict(set)
+    for a, b, _ in edges:
+        if b not in succ[a]:
+            succ[a].add(b)
+            indeg[b] += 1
+    heap = [(key[n], n) for n in nodes if indeg[n] == 0]
+    heapq.heapify(heap)
+    order, decided = [], {}
+    while heap:
+        ready = len(heap)
+        _, n = heapq.heappop(heap)
+        order.append(n)
+        decided[n] = "constraint" if ready == 1 else "deterministic_tiebreak"
+        for m in sorted(succ[n]):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                heapq.heappush(heap, (key[m], m))
+    return (order, decided) if len(order) == len(nodes) else (None, None)
+
+
+def assign_semantic_order(ocel_in):
+    ocel = copy.deepcopy(ocel_in)
+    ev, objs = ocel.events, object_sets(ocel)
+    ranks, decided_by, edge_log, cycle_log = {}, {}, [], []
+    for ts, g in ev.groupby("original_timestamp", sort=True):
+        nodes = sorted(g[EID])
+        if len(nodes) == 1:
+            ranks[nodes[0]], decided_by[nodes[0]] = 0, "unique_timestamp"
+            continue
+        key = {r[EID]: (r["ingested_at"] if pd.notna(r["ingested_at"]) else pd.Timestamp.max,
+                        SOURCE_RANK.get(r["source"], 99), str(r["source_event_key"]), r[EID])
+               for r in g.to_dict("records")}
+        edges = tie_group_edges(g, objs)
+        while True:
+            order, decided = kahn(nodes, edges, key)
+            if order is not None:
+                break
+            weakest = max(BASIS_STRENGTH[b] for _, _, b in edges)
+            if weakest == 0:
+                raise ValueError(f"hard-constraint cycle at {ts}: quarantine {nodes}")
+            removed = {e for e in edges if BASIS_STRENGTH[e[2]] == weakest}
+            cycle_log.append(dict(timestamp=ts, removed=sorted(removed)))
+            edges -= removed
+        for i, e in enumerate(order):
+            ranks[e], decided_by[e] = i, decided[e]
+        edge_log += [dict(timestamp=ts, before=a, after=b, basis=bs) for a, b, bs in sorted(edges)]
+    ev["tie_rank"] = ev[EID].map(ranks).astype(int)
+    ev["tie_decided_by"] = ev[EID].map(decided_by)
+    return ocel, pd.DataFrame(edge_log), cycle_log
+
+
+def materialize_order(ocel_in):
+    ocel = pm4py.ocel_sort_by_additional_column(copy.deepcopy(ocel_in), "tie_rank")
+    ocel.events = ocel.events.reset_index(drop=True)
+    ocel = pm4py.ocel_add_index_based_timedelta(ocel)
+    ocel.events["order_ts"] = ocel.events[TS]
+    ocel.events["order_ts_bounded"] = ocel.events["original_timestamp"] + pd.to_timedelta(ocel.events["tie_rank"], unit="us")
+    sync_relations(ocel)
+    shift = (ocel.events["order_ts"] - ocel.events["original_timestamp"]).max()
+    print(f"max synthetic shift from index-based timedelta: {shift} (performance must use original_timestamp)")
+    return ocel
+
+
+def performance_view(ocel_in):
+    ocel = copy.deepcopy(ocel_in)
+    ocel.events[TS] = ocel.events["original_timestamp"]
+    return sync_relations(ocel)
+
+
+# ---------------------------------------------------------------- validation
+def validate(ocel, name, must_survive=("e05", "e14")):
+    ev, rel, ob = ocel.events, ocel.relations, ocel.objects
+    issues = []
+    if ev[EID].duplicated().any():
+        issues.append("duplicate event ids")
+    if (~rel[EID].isin(ev[EID])).any():
+        issues.append("E2O -> missing event")
+    if (~rel[OID].isin(ob[OID])).any():
+        issues.append("E2O -> missing object")
+    if rel.duplicated([EID, OID]).any():
+        issues.append("duplicate E2O pairs")
+    orphans = set(ev[EID]) - set(rel[EID])
+    if orphans:
+        issues.append(f"events without objects {sorted(orphans)}")
+    chk = rel.merge(ev[[EID, ACT, TS]], on=EID, suffixes=("", "_ev"))
+    if ((chk[ACT] != chk[ACT + "_ev"]) | (chk[TS] != chk[TS + "_ev"])).any():
+        issues.append("E2O activity/timestamp out of sync")
+    if (rel[OTYPE] != rel[OID].map(ob.set_index(OID)[OTYPE])).any():
+        issues.append("object type mismatch")
+    if len(ocel.o2o) and ((~ocel.o2o[OID].isin(ob[OID])) | (~ocel.o2o[OID + "_2"].isin(ob[OID]))).any():
+        issues.append("O2O -> missing object")
+    if len(ocel.object_changes) and (~ocel.object_changes[OID].isin(ob[OID])).any():
+        issues.append("object change -> missing object")
+    if "original_timestamp" not in ev or ev["original_timestamp"].isna().any():
+        issues.append("original timestamp lost")
+    if "original_eid" in ev:
+        lost = [e for e in must_survive if e not in set(ev["original_eid"])]
+        if lost:
+            issues.append(f"protected events lost {lost}")
+    cap = rel[(rel[ACT] == "Capture Payment") & (rel[OTYPE] == "Payment")]
+    if (cap.groupby(EID)[OID].nunique() > 1).any():
+        issues.append("one Capture linked to several Payments")
+    for p in ("M1", "M2", "I2"):
+        if p not in set(rel[OID]):
+            issues.append(f"{p} has no events")
+    print(f"[{name}] events={len(ev)} e2o={len(rel)} issues={issues or 'none'}")
+    return issues
+
+
+# ================================================================ run scenarios
+base = prepare(ocel_raw)                       # ocel_raw itself is never modified
+pairs = candidate_pairs(base)
+print(pairs.to_string())
+unsafe = pairs[~pairs.cls.isin(["exact_technical"])]
+print("groups a whole-log library call would touch without evidence:\n",
+      unsafe[["e1", "e2", "cls", "e2o"]].to_string())
+print("share an object yet discriminated (have_common_object=True does NOT protect):\n",
+      pairs[pairs.cls == "concurrent_distinct_objects"][["e1", "e2"]].to_string())
+
+# Scenario C: conservative (expected 15 events / 39 E2O)
+cons = copy.deepcopy(base)
+cons, dropped_tech = guarded_drop_exact(cons, pairs)
+cons, prov_c = merge_verified_pairs(cons, VERIFIED_STRONG)
+cons = refine_labels(cons, REFINEMENTS_CONSERVATIVE)
+cons, order_edges_c, cycles_c = assign_semantic_order(cons)
+cons_ordered = materialize_order(cons)
+cons_perf = performance_view(cons_ordered)
+prov_c["adjusted_timestamp"] = prov_c["canonical_eid"].map(cons_ordered.events.set_index(EID)["order_ts"])
+
+# Scenario E: evidence-based semantic merge (expected 13 events / 35 E2O / 1 object change)
+evid = copy.deepcopy(base)
+evid, _ = guarded_drop_exact(evid, pairs)
+evid, prov_e = merge_verified_pairs(evid, VERIFIED_STRONG + VERIFIED_EVIDENCE)
+evid = refine_labels(evid, {"e09": REFINEMENTS_CONSERVATIVE["e09"]})
+evid, prov_e15 = summary_to_object_change(evid, "e15", "V1", "erp_balance_status",
+                                          "updated_after_payments", ["e13", "e14"])
+prov_e = pd.concat([prov_e, pd.DataFrame([prov_e15])], ignore_index=True)
+evid, order_edges_e, cycles_e = assign_semantic_order(evid)
+evid_ordered = materialize_order(evid)
+
+# Scenario A: mechanically aggressive library merge -- sensitivity bound only
+lineage_A = base.events.groupby([ACT, TS])[EID].apply(sorted)   # only record of what gets fused
+warnings.warn("ocel_merge_duplicates fuses every event sharing activity+timestamp: e03/e04/e05 and "
+              "e13/e14/e15 collapse, eids become random UUIDs, attributes come from an arbitrary first row. "
+              "Never use this log for conclusions.")
+aggr = pm4py.ocel_merge_duplicates(copy.deepcopy(base))
+aggr_common = pm4py.ocel_merge_duplicates(copy.deepcopy(base), have_common_object=True)
+
+# Scenario D: whole-log drop, to show relation-level damage
+mech_drop = pm4py.ocel_drop_duplicates(copy.deepcopy(base))
+
+for name, o in [("raw", base), ("conservative", cons_ordered), ("evidence", evid_ordered),
+                ("aggressive_merge", aggr), ("aggressive_merge_common_obj", aggr_common),
+                ("whole_log_drop", mech_drop)]:
+    validate(o, name)
+    for ot in ["Order", "Item", "Payment"]:
+        flat = pm4py.ocel_flattening(o, ot)
+        dfg, _, _ = pm4py.discover_dfg(flat)
+        print(name, ot, sorted(dfg.items()))
+
+assert len(base.events) == len(ocel_raw.events)  # raw untouched
+```
+
+## 7. Sensitivity analysis
+
+| Aspect | Raw | Conservative | Evidence merge | Aggressive library merge |
+|---|---|---|---|---|
+| Events / E2O | 17 / 44 | 15 / 39 | 13 / 35 (+1 object change) | 10 / 28 |
+| Order DFG | Self-loops on Pick, Pack, Dispatch and Capture; edges depend on arbitrary tie order | One genuine Pick→Pick (two items) and one genuine Capture→Capture (two payments); summary nodes visible | Pack→Dispatch; Capture→Confirm Delivery | Linear and "clean"; hides two picks and two payments |
+| Item DFG | I1: Pick→Pick→Pack (false rework) | I1 and I2: Pick→Pack | Same as conservative | Same edges, but I1 and I2 share one Pick event |
+| Payment DFG | M1: Authorize→Capture; M2: Capture | Unchanged | Unchanged | Same edges; one event carries both captures |
+| OC-DFG | Event frequency and object frequency both inflated | Event frequency for Pick = 2, for Capture = 2 | Pack node frequency 1 | Event frequency 1 vs object frequency 2 on Pick and Capture |
+| ET–OT | Pick–Item 3; Issue Invoice–Invoice 2; Capture–Invoice 3 | 2; 1; 2 | 2; 1; 2 | 1 event with 2 Items; 1; 1 |
+| OTG / object graph | Correct | Correct | Correct | New M1–M2 co-occurrence (Payment–Payment interaction) |
+| Rework / loops | Fake: re-invoicing, repeated dispatch, repeated pack | Only real repetitions | Only real repetitions | None visible, including real ones |
+| Lifecycle / performance | Duplicate starts; invoice "issued twice" | 0-second ties kept on `original_timestamp` | ERP latency lost | Arbitrary attributes; M2 amount wrong |
+
+The whole-log drop variant (12 events, 28 E2O) matches the aggressive merge in the Order view but keeps e05 and e14 in the Item and Payment views, so the object types disagree.
+
+Concrete edges and patterns whose interpretation changes:
+1. **Item I1, Pick→Pick.** Raw only: false rework from the e04 double observation.
+2. **Order, Pick→Pick.** Raw 2, conservative 1 (real: two items), aggressive 0.
+3. **Pack→Pack vs Pack→Record Pack Status (ERP) vs Pack→Dispatch.** Read as rework, as an abstraction step, and as a direct flow.
+4. **Delivery, Dispatch→Dispatch vs Dispatch→Accept by Carrier→Handover vs Dispatch→Handover.** The aggressive merge erases carrier acceptance.
+5. **Order, Capture→Capture.** Raw 2, conservative 1 (two partial payments), aggressive 0, implying one full payment.
+6. **Order, Capture→Issue Invoice.** Appears only under ingestion ordering: a fake invoice-after-payment loop.
+7. **Invoice V1 lifecycle.** Raw shows Issue Invoice twice (apparent re-invoicing).
+8. **Payment co-occurrence M1–M2.** Aggressive only; it falsely suggests one settlement of both payments.
+9. **Authorize→Capture duration.** 0 s on original timestamps, but non-zero under `ocel_add_index_based_timedelta`, so performance uses `performance_view`.
+
+## 8. Audit trail and reversibility
+
+A provenance table holds one row per merge, drop, relabel or conversion. The event table carries the matching compact columns.
+
+| Field | Content |
+|---|---|
+| `canonical_eid` | Surviving eid (null if the event was converted to an object change) |
+| `source_eids`, `source_event_keys` | Every contributing eid and source:key |
+| `merge_rule`, `rule_version` | e.g. R-SAME-INVOICE-NUMBER, "dup-order-rules v1.0" |
+| `reviewer`, `evidence` | Steward or automated rule; the document reference |
+| `original_activities`, `refined_activity` | Per source eid; the final label |
+| `original_timestamps`, `adjusted_timestamp` | Business time per source; `order_ts`, plus `tie_rank` and `tie_decided_by` |
+| `attributes_kept_from` | Attribute → winning source |
+| `discarded_conflicts` | Attribute → {source: value} for losing values |
+| `absorbed_rows`, `absorbed_e2o` | Full original event rows and E2O rows, including qualifiers |
+| `confidence`, `reason` | high/medium/low and a free-text justification |
+
+Separately, an ordering log records every precedence edge with its basis and every edge removed to break a cycle.
+
+**Reconstructing the raw view:**
+1. Re-insert `absorbed_rows` and `absorbed_e2o`.
+2. For canonical events, restore overwritten attributes from `discarded_conflicts`, reset `ACT` to `original_activity` and `TS` to `original_timestamp`, and remove union-added E2O rows.
+3. Turn object changes that carry `source_eid` back into events.
+4. Drop the added columns.
+
+The result is verified by row hash against the immutable raw snapshot. The aggressive library scenario cannot be reversed from its own output (UUIDs, first-row attributes); only `lineage_A` and the raw snapshot remain.
+
+## 9. Failure modes and safeguards
+
+1. **Collapsing distinct partial payments (e13/e14).** Safeguard: the Q2 disjoint-object check, and a validation that no Capture links more than one Payment.
+2. **Turning abstraction-level updates into false rework** (e07 or e15 counted as a second Pack or third Capture). Safeguard: refined labels plus `abstraction_level`.
+3. **Ordering by ingestion time.** It is right for e12/e13 but wrong for e16 versus the captures. Safeguard: ingestion is only the R5 tiebreak, flagged `deterministic_tiebreak`.
+4. **Treating shared objects as proof of duplication** (every event shares O1). Safeguard: shared objects only nominate candidates; merging requires Q5 evidence.
+5. **Unioning incompatible E2O relations** (e15 linked to M1/M2; a Pick linking I1 and I2). Safeguard: `IncompatibleMerge` for discriminated or overlapping sets.
+6. **Changing durations through synthetic microseconds.** Index-based offsets grow with row position. Safeguard: offsets come after semantic ordering, live in `order_ts`, and performance uses `original_timestamp`.
+7. **Losing source-authoritative attributes** through keep-first merging. Safeguard: authority maps, logged conflicts, and full absorbed rows.
+8. **Running duplicate functions on the whole OCEL without inspecting candidate groups** (a whole-log drop strips O1/P1 from e05). Safeguard: the mandatory `candidate_pairs` pre-check; library calls only on homogeneous exact groups.
+9. **Merging harmonization collisions** (e08/e09). Safeguard: Q3 compares source codes first.
+10. **Treating the total order as physical truth.** Safeguard: `tie_decided_by`, and sensitivity runs over the admissible orders.
