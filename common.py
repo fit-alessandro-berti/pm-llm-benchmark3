@@ -531,10 +531,17 @@ _OPEN_SOURCE_MODEL_EXCEPTIONS = (
     "mimo-v2.6",
 )
 
+# Vendor prefix, matched on the normalized name (slashes become hyphens).
+_CLOSED_SOURCE_MODEL_PREFIXES = (
+    "stealth",
+)
+
 
 def is_open_source(m_name):
     model_name = _model_name_for_matching(m_name)
     if not model_name:
+        return False
+    if model_name.startswith(_CLOSED_SOURCE_MODEL_PREFIXES):
         return False
     if any(marker in model_name for marker in _OPEN_SOURCE_MODEL_EXCEPTIONS):
         return True
