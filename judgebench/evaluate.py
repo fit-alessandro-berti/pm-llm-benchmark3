@@ -91,6 +91,8 @@ JUDGE_LLMS: Sequence[Tuple[Any, ...]] = [
     ("meta/muse-spark-1.3",),
     ("inception/mercury-2.5",),
     ("anthropic/claude-fable-5.1",),
+    ("anthropic/claude-sonnet-5.5",),
+    ("openai/gpt-6.1-sol",),
 ]
 
 STRICT_EVALUATION_TEXT = (

@@ -590,10 +590,11 @@ _REASONING_PATTERNS = (
     r"deepseek.*(?:r\d|v[4-9]|\d{2,})",
     r"(?:^|-)gemma-?[4-9]",
     r"muse-spark-1\.(?:1|2|3)(?:-|$)",
+    r"(?:^|-)claude-sonnet-5\.5(?:-|$)",
 )
 
 _HIDDEN_REASONING_PATTERNS = (
-    r"(?:^|-)claude-",
+    r"(?:^|-)claude-(?!sonnet-5\.5(?:-|$))",
     r"(?:^|-)gemini-",
     r"(?:^|-)gemma",
     r"(?:^|-)o\d+(?:-|$)",
