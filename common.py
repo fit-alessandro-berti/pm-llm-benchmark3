@@ -591,11 +591,13 @@ _REASONING_PATTERNS = (
     r"(?:^|-)gemma-?[4-9]",
     r"muse-spark-1\.(?:1|2|3)(?:-|$)",
     r"(?:^|-)claude-sonnet-5\.5(?:-|$)",
+    r"haiku-5\.5(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
 )
 
 _HIDDEN_REASONING_PATTERNS = (
     r"(?:^|-)claude-(?!sonnet-5\.5(?:-|$))",
+    r"haiku-5\.5(?:-|$)",
     r"(?:^|-)gemini-",
     r"(?:^|-)gemma",
     r"(?:^|-)o\d+(?:-|$)",
