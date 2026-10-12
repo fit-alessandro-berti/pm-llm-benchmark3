@@ -71,9 +71,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: 0.032 
-- Linear fit: y = 0.333x + 2.3
-- P-value: 0.7789
+- Correlation: 0.014 
+- Linear fit: y = 0.152x + 2.5
+- P-value: 0.9000
 - N samples: 78
 
 ------------------------------------------------------------
@@ -87,9 +87,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: 0.090 
-- Linear fit: y = 1.306x + 5.9
-- P-value: 0.4322
+- Correlation: 0.087 
+- Linear fit: y = 1.288x + 5.9
+- P-value: 0.4476
 - N samples: 78
 
 **Model Size (B):**
@@ -133,9 +133,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: -0.084 
-- Linear fit: y = -1.728x + 20.9
-- P-value: 0.4629
+- Correlation: -0.063 
+- Linear fit: y = -1.319x + 20.6
+- P-value: 0.5832
 - N samples: 78
 
 **Model Size (B):**
@@ -155,9 +155,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: 0.162 
-- Linear fit: y = 1.333x + 1.3
-- P-value: 0.1560
+- Correlation: 0.144 
+- Linear fit: y = 1.211x + 1.4
+- P-value: 0.2073
 - N samples: 78
 
 **Model Size (B):**
@@ -211,9 +211,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: 0.034 
-- Linear fit: y = 1.444x + 30.6
-- P-value: 0.7687
+- Correlation: 0.035 
+- Linear fit: y = 1.529x + 30.5
+- P-value: 0.7603
 - N samples: 78
 
 ------------------------------------------------------------
@@ -245,9 +245,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: 0.032 
-- Linear fit: y = 0.333x + 2.3
-- P-value: 0.7789
+- Correlation: 0.014 
+- Linear fit: y = 0.152x + 2.5
+- P-value: 0.9000
 - N samples: 78
 
 ------------------------------------------------------------
@@ -261,9 +261,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: 0.090 
-- Linear fit: y = 1.306x + 5.9
-- P-value: 0.4322
+- Correlation: 0.087 
+- Linear fit: y = 1.288x + 5.9
+- P-value: 0.4476
 - N samples: 78
 
 **Model Size (B):**
@@ -307,9 +307,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: -0.084 
-- Linear fit: y = -1.728x + 20.9
-- P-value: 0.4629
+- Correlation: -0.063 
+- Linear fit: y = -1.319x + 20.6
+- P-value: 0.5832
 - N samples: 78
 
 **Model Size (B):**
@@ -329,9 +329,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: 0.162 
-- Linear fit: y = 1.333x + 1.3
-- P-value: 0.1560
+- Correlation: 0.144 
+- Linear fit: y = 1.211x + 1.4
+- P-value: 0.2073
 - N samples: 78
 
 **Model Size (B):**
@@ -381,9 +381,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: -0.020 
-- Linear fit: y = -0.061x + 0.6
-- P-value: 0.8609
+- Correlation: -0.034 
+- Linear fit: y = -0.106x + 0.6
+- P-value: 0.7656
 - N samples: 78
 
 ------------------------------------------------------------
@@ -409,9 +409,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: 0.087 
-- Linear fit: y = 0.567x + 1.0
-- P-value: 0.4503
+- Correlation: 0.072 
+- Linear fit: y = 0.482x + 1.1
+- P-value: 0.5293
 - N samples: 78
 
 **Days Since 2024-01-01:**
@@ -449,26 +449,26 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: -0.043 
-- Linear fit: y = -0.172x + 0.7
-- P-value: 0.7090
+- Correlation: -0.055 
+- Linear fit: y = -0.224x + 0.8
+- P-value: 0.6347
 - N samples: 78
 
 ------------------------------------------------------------
 ### Correlations with: 2a_concept_fabrication
 ------------------------------------------------------------
 
+**Is Reasoning Model:**
+- Correlation: 0.125 
+- Linear fit: y = 0.396x + 0.9
+- P-value: 0.2764
+- N samples: 78
+
 **Model Size (B):**
 - Correlation: -0.094 
 - Linear fit: y = -0.000x + 1.3
 - P-value: 0.4845
 - N samples: 57
-
-**Is Reasoning Model:**
-- Correlation: 0.080 
-- Linear fit: y = 0.250x + 1.0
-- P-value: 0.4845
-- N samples: 78
 
 **Benchmark Score:**
 - Correlation: 0.056 
@@ -517,9 +517,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: 0.055 
-- Linear fit: y = 0.733x + 4.7
-- P-value: 0.6334
+- Correlation: 0.038 
+- Linear fit: y = 0.521x + 4.8
+- P-value: 0.7401
 - N samples: 78
 
 ------------------------------------------------------------
@@ -545,9 +545,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: 0.178 
-- Linear fit: y = 0.322x + 0.3
-- P-value: 0.1193
+- Correlation: 0.201 
+- Linear fit: y = 0.371x + 0.2
+- P-value: 0.0779
 - N samples: 78
 
 **Days Since 2024-01-01:**
@@ -579,9 +579,9 @@
 - N samples: 78
 
 **Is Reasoning Model:**
-- Correlation: -0.060 
-- Linear fit: y = -1.033x + 16.3
-- P-value: 0.6045
+- Correlation: -0.025 
+- Linear fit: y = -0.440x + 15.9
+- P-value: 0.8291
 - N samples: 78
 
 **Model Size (B):**
@@ -600,16 +600,16 @@
 - P-value: 0.0900
 - N samples: 57
 
+**Is Reasoning Model:**
+- Correlation: -0.159 
+- Linear fit: y = -0.896x + 4.8
+- P-value: 0.1637
+- N samples: 78
+
 **Benchmark Score:**
 - Correlation: -0.158 
 - Linear fit: y = -0.055x + 5.9
 - P-value: 0.1680
-- N samples: 78
-
-**Is Reasoning Model:**
-- Correlation: -0.129 
-- Linear fit: y = -0.711x + 4.6
-- P-value: 0.2603
 - N samples: 78
 
 **Is Open Source:**
@@ -653,9 +653,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: 0.062 
-- Linear fit: y = 0.017x + 0.0
-- P-value: 0.5872
+- Correlation: 0.060 
+- Linear fit: y = 0.016x + 0.0
+- P-value: 0.6008
 - N samples: 78
 
 ------------------------------------------------------------
@@ -663,9 +663,9 @@
 ------------------------------------------------------------
 
 **Is Reasoning Model:**
-- Correlation: 0.156 
-- Linear fit: y = 0.756x + 0.1
-- P-value: 0.1725
+- Correlation: 0.149 
+- Linear fit: y = 0.735x + 0.1
+- P-value: 0.1938
 - N samples: 78
 
 **Is Open Source:**
@@ -709,9 +709,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: 0.114 
-- Linear fit: y = 0.606x + 1.1
-- P-value: 0.3193
+- Correlation: 0.095 
+- Linear fit: y = 0.512x + 1.2
+- P-value: 0.4097
 - N samples: 78
 
 **Days Since 2024-01-01:**
@@ -755,9 +755,9 @@
 - N samples: 57
 
 **Is Reasoning Model:**
-- Correlation: -0.032 
-- Linear fit: y = -0.028x + 0.1
-- P-value: 0.7803
+- Correlation: -0.040 
+- Linear fit: y = -0.036x + 0.1
+- P-value: 0.7255
 - N samples: 78
 
 ================================================================================
