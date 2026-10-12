@@ -1,0 +1,726 @@
+# 1. Source-Semantics Baseline
+
+The POWL model is the authoritative source. The table below restates its intended semantics as testable invariants. Witness traces use these abbreviations: **R** = Register Change, **A** = Assess Risk, **P** = Prepare Evidence, **L** = Legal Review, **C** = Configure Trial, **I** = Inspect Trial, **D** = Correct Defect, **X** = Release Change, **Z** = Archive Change, **** = the silent skip. Witness IDs (P1–P4, N1–N9) match the harness in Section 5.
+
+| Invariant ID | Invariant | Positive witness | Negative witness | Observable after hiding tau? |
+|---|---|---|---|---|
+| I1 Register first | R precedes every other activity | P1 (`R A P C I L X Z`) | N9 (`A R P C I X Z`) | Yes. The visible order of R relative to all other labels is in the trace language. |
+| I2 Assess  Prepare, both orders allowed | A and P are unordered after R, and both orders must be accepted | P1 (A before P), P2 (P before A) | None for order itself. Missing P is covered by N7. | Partly. Both orders are visible as traces. True concurrency (both enabled at the same marking) is not visible in traces, only in the net or partial order. |
+| I3 Legal optional | L may be skipped through a silent XOR branch | P2 (no L), P1 (with L) | None for absence. Misplaced L is covered by N6. | Presence and absence are visible. The  branch itself leaves no label. |
+| I4 Legal only after Assess | L requires A to have completed | P1, P4 | Not covered by a harness witness. Recommended addition: `L A ...`. | Yes, as ordering of L relative to A. |
+| I5 Verification waits for Assess and Prepare | The first C requires both A and P to have completed | P1, P2 | N1 (C/I before A), N7 (P never occurs) | Yes, as ordering of C relative to A and P. |
+| I6 Legal  verification, no edge | L and the loop may overlap and interleave | P4 (`R A P C L I X Z`) | None at trace level. A model with a false Lloop edge would reject P4, so P4 is the discriminator. | Only as interleaving. "May overlap" is not a must-order statement, so it cannot be fully read off a finite trace set. |
+| I7 Configure before Inspect | Within each iteration, C precedes I | P1 | N3 (`R A P I C X Z`) | Yes. |
+| I8 Loop scope and repetition | The body {C, I} repeats, and each repeat is preceded by D | P3 (`... C I D C I ...`) | N4 (`C I C I` with no D), N8 (trailing D) | Yes. The repetition count and D separators are visible. |
+| I9 Minimum iteration count | At least one body execution | P1 | N2 (`R A P X Z`, no verification) | Yes. |
+| I10 Release waits for both branches | X occurs only after the optional-legal branch and the verification loop have both completed | P1 | N2 (X without verification), N6 (L after X) | Yes, as ordering. |
+| I11 Archive after release | Z follows X | P1 | N5 (`... Z X`) | Yes. |
+| I12 Finality | The process ends at the exact final marking, and no activity follows Z | P1 ends at Z with the final marking reached | Activity after Z (e.g., `... Z D`), or a residual token leaving the net stuck short of the final marking | Trace-level: only "nothing after Z". Exact final-marking equality is a net-level property that is not visible in traces. |
+
+Notes:
+
+- The witness set is a finite sample. Each row is a constraint on the language, not a full specification.
+- Every POWL loop is read as do-redo: **A (B A)\***, where A is `trial_body` and B is `correct_defect`. This is the binary-loop reading that makes I8 and I9 hold.
+
+---
+
+# 2. Candidate Conversion Pipelines
+
+| Pipeline | PM4Py calls | Expected benefit | Expected risk | Failure condition |
+|---|---|---|---|---|
+| **P1 (primary): POWL  accepting Petri net  BPMN** | `convert_to_petri_net(source_powl)`  `convert_to_bpmn(net, im, fm)`  `convert_to_petri_net(bpmn)` for the round trip | Keeps the partial-order semantics, since the Petri net represents concurrency directly, and yields a stakeholder-readable BPMN view. Does not require a block-structured intermediate. | BPMN gateway and silent-task encoding may not match the net's causal structure. Loop encoding may be visually misleading. The BPMNPetri round trip may change the marking structure. | A null or empty `im` or `fm` at any stage. A net that is not a workflow net or not sound. A round-trip net whose bounded language or co-enabledness pattern differs from the reference. BPMN export raising an exception. |
+| **P2 (diagnostic): POWL  accepting Petri net  process tree  BPMN  accepting Petri net** | P1 steps, plus `convert_to_process_tree(net, im, fm)` in `try/except`, then `convert_to_bpmn(tree)` and `convert_to_petri_net(bpmn_tree)` | If it succeeds, gives a block-structured, readable model with explicit operator nodes. | Process trees are block-structured. This source is not, so any tree is either an exception or an approximation that adds or removes behavior. | `convert_to_process_tree` raises (expected). Or the tree is produced but its language differs from the reference. Such a tree must be rejected even though it is a "successful" conversion. |
+| **P3 (validation-only control): no conversion** | `convert_to_petri_net(source_powl)`, `check_soundness`, `discover_footprints`, `convert_to_reachability_graph`, `get_enabled_transitions` | Provides the reference net and its behavioural evidence without introducing any derivative artifact. | Does not test any representation change. | Reference net is unsound or has null markings. This would invalidate every derivative. |
+
+**Primary pipeline: P1.** It is the only pipeline required to succeed.
+
+**Why P2 is expected to fail.** The partial order restricted to {A, P, L, V}, where V is the verification loop, has edges AL, AV, and PV. The pairs PA and LV are unordered. Take the four elements as a = P, b = A, c = V, d = L. Then a<c, b<c, and b<d, while ab, ad, and cd. This is the forbidden N-shape. Series-parallel posets exclude N, and process-tree operators are series, parallel, and choice, with loops as the other operator. A tree could in principle generate the same language without matching this poset, so this is strong evidence rather than proof. The harness tests the outcome rather than assuming it.
+
+---
+
+# 3. Conversion Code
+
+The harness is split into two files. `conversion_pipeline.py` (below) starts from `source_powl`, produces derivatives, handles exceptions, and writes artifacts. `roundtrip_validation.py` is in Section 5.
+
+```python
+# conversion_pipeline.py
+"""
+Derivative-generation harness. Starts from the authoritative source_powl.
+Exceptions are recorded in FAILURES and printed, never silently discarded.
+Derived artifacts are never treated as sources.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pm4py
+from pm4py.objects.powl.obj import (
+    StrictPartialOrder,
+    OperatorPOWL,
+    Transition,
+    SilentTransition,
+)
+from pm4py.objects.process_tree.obj import Operator
+
+# ---------------------------------------------------------------------------
+# Authoritative source (verbatim from the task definition)
+# ---------------------------------------------------------------------------
+register = Transition(label="Register Change")
+assess_risk = Transition(label="Assess Risk")
+prepare_evidence = Transition(label="Prepare Evidence")
+
+legal_review = Transition(label="Legal Review")
+skip_legal = SilentTransition()
+optional_legal = OperatorPOWL(
+    operator=Operator.XOR,
+    children=[legal_review, skip_legal],
+)
+
+configure_trial = Transition(label="Configure Trial")
+inspect_trial = Transition(label="Inspect Trial")
+trial_body = StrictPartialOrder(nodes=[configure_trial, inspect_trial])
+trial_body.order.add_edge(configure_trial, inspect_trial)
+
+correct_defect = Transition(label="Correct Defect")
+verification_loop = OperatorPOWL(
+    operator=Operator.LOOP,
+    children=[trial_body, correct_defect],
+)
+
+release_change = Transition(label="Release Change")
+archive_change = Transition(label="Archive Change")
+
+source_powl = StrictPartialOrder(
+    nodes=[
+        register,
+        assess_risk,
+        prepare_evidence,
+        optional_legal,
+        verification_loop,
+        release_change,
+        archive_change,
+    ]
+)
+
+source_powl.order.add_edge(register, assess_risk)
+source_powl.order.add_edge(register, prepare_evidence)
+source_powl.order.add_edge(assess_risk, optional_legal)
+source_powl.order.add_edge(assess_risk, verification_loop)
+source_powl.order.add_edge(prepare_evidence, verification_loop)
+source_powl.order.add_edge(optional_legal, release_change)
+source_powl.order.add_edge(verification_loop, release_change)
+source_powl.order.add_edge(release_change, archive_change)
+
+# ---------------------------------------------------------------------------
+# Harness utilities
+# ---------------------------------------------------------------------------
+OUT_DIR = Path("artifacts")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+FAILURES: list[dict] = []
+
+
+def _tokens(m) -> int:
+    """Total token count. None-safe, so a missing marking counts as zero."""
+    return sum(m.values()) if m is not None else 0
+
+
+def _accepting(im, fm) -> bool:
+    """A marking is usable only if it exists and carries at least one token."""
+    return _tokens(im) > 0 and _tokens(fm) > 0
+
+
+def _fail(stage: str, exc: BaseException) -> None:
+    """Record and print a failure. The failure is kept in the report, not hidden."""
+    rec = {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
+    FAILURES.append(rec)
+    print(f"[FAILED] {stage}: {rec['type']}: {rec['message']}")
+
+
+def _save(stage: str, save_fn, filename: str, *args) -> None:
+    path = OUT_DIR / filename
+    try:
+        save_fn(*args, str(path))
+        print(f"[saved] {path}")
+    except Exception as exc:
+        _fail(f"save:{stage}", exc)
+
+
+def _bpmn_to_net(name: str, bpmn, nets: dict) -> None:
+    """BPMN -> accepting Petri net, with explicit handling of missing markings."""
+    try:
+        net, im, fm = pm4py.convert_to_petri_net(bpmn)
+    except Exception as exc:
+        _fail(f"{name}:bpmn->petri", exc)
+        return
+    if not _accepting(im, fm):
+        _fail(f"{name}:markings",
+              ValueError("BPMN->Petri returned null or empty initial/final marking"))
+        return
+    nets[name] = (net, im, fm)
+    _save(name, pm4py.save_vis_petri_net, f"03_{name}.svg", net, im, fm)
+
+
+def diagnose(name: str, net, im, fm) -> dict:
+    """Workflow-net and soundness diagnostics. Errors are recorded in the result."""
+    d = {"net": name}
+    try:
+        d["workflow_net"] = bool(pm4py.check_is_workflow_net(net))
+    except Exception as exc:
+        d["workflow_net"] = f"ERROR {type(exc).__name__}: {exc}"
+    try:
+        res = pm4py.check_soundness(net, im, fm, print_diagnostics=True)
+        d["sound"] = bool(res[0] if isinstance(res, tuple) else res)
+    except Exception as exc:
+        d["sound"] = f"ERROR {type(exc).__name__}: {exc}"
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Pipelines
+# ---------------------------------------------------------------------------
+def run() -> dict:
+    nets: dict[str, tuple] = {}
+    bpmns: dict[str, object] = {}
+    trees: dict[str, object] = {}
+
+    _save("source", pm4py.save_vis_powl, "00_source_powl.svg", source_powl)
+
+    # ---- P1 (primary): POWL -> accepting Petri net -> BPMN -> accepting Petri net
+    net_from_powl, im_from_powl, fm_from_powl = pm4py.convert_to_petri_net(source_powl)
+    if not _accepting(im_from_powl, fm_from_powl):
+        raise RuntimeError("POWL->Petri produced null or empty markings; primary pipeline rejected")
+    nets["powl_petri"] = (net_from_powl, im_from_powl, fm_from_powl)
+    _save("powl_petri", pm4py.save_vis_petri_net, "01_petri_from_powl.svg",
+          net_from_powl, im_from_powl, fm_from_powl)
+
+    bpmn_from_net = pm4py.convert_to_bpmn(net_from_powl, im_from_powl, fm_from_powl)
+    bpmns["bpmn_from_powl_petri"] = bpmn_from_net
+    _save("bpmn_from_powl_petri", pm4py.save_vis_bpmn, "02_bpmn_from_powl_petri.svg",
+          bpmn_from_net)
+    _bpmn_to_net("bpmn_roundtrip_of_powl_petri", bpmn_from_net, nets)
+
+    # ---- P2 (diagnostic): POWL -> Petri -> process tree -> BPMN -> Petri
+    tree = None
+    try:
+        tree = pm4py.convert_to_process_tree(net_from_powl, im_from_powl, fm_from_powl)
+    except Exception as exc:
+        # Expected for this source: the partial order contains an N-shape (Section 2).
+        # Recorded as a pipeline outcome, not as a harness error.
+        _fail("petri->process_tree", exc)
+
+    if tree is None:
+        print("[info] No process tree produced. Tree-based BPMN and round trips are not generated.")
+    else:
+        trees["from_powl_petri"] = tree
+        _save("tree", pm4py.save_vis_process_tree, "04_tree_from_powl_petri.svg", tree)
+
+        # Tree -> accepting Petri net. Success here does NOT prove language equality.
+        try:
+            net_t, im_t, fm_t = pm4py.convert_to_petri_net(tree)
+            if _accepting(im_t, fm_t):
+                nets["tree_direct_roundtrip"] = (net_t, im_t, fm_t)
+                _save("tree_direct", pm4py.save_vis_petri_net,
+                      "05_petri_from_tree.svg", net_t, im_t, fm_t)
+            else:
+                _fail("tree->petri:markings",
+                      ValueError("tree->Petri returned null or empty markings"))
+        except Exception as exc:
+            _fail("tree->petri", exc)
+
+        try:
+            bpmn_t = pm4py.convert_to_bpmn(tree)
+            bpmns["bpmn_from_tree"] = bpmn_t
+            _save("bpmn_from_tree", pm4py.save_vis_bpmn, "06_bpmn_from_tree.svg", bpmn_t)
+            _bpmn_to_net("bpmn_roundtrip_of_tree", bpmn_t, nets)
+        except Exception as exc:
+            _fail("tree->bpmn", exc)
+
+    # ---- Diagnostics on every accepting net
+    diagnostics = [diagnose(name, *triple) for name, triple in nets.items()]
+    for d in diagnostics:
+        print(d)
+
+    report = {"failures": FAILURES, "diagnostics": diagnostics}
+    (OUT_DIR / "conversion_report.json").write_text(json.dumps(report, indent=2, default=str))
+    return {"nets": nets, "bpmns": bpmns, "trees": trees, "report": report}
+
+
+if __name__ == "__main__":
+    run()
+```
+
+---
+
+# 4. Preservation and Loss Audit
+
+**Status convention.** The cells below are pre-execution expectations, not measured results. A cell moves from `expected preserved` to `validated preserved` only after the Section 5 harness runs and its output is recorded. Where a trace-level test cannot establish a property, the cell says so.
+
+| Source invariant | POWLPetri | PetriBPMN | PetriTree | BPMN round trip | Evidence or uncertainty |
+|---|---|---|---|---|---|
+| I1 Register first | expected preserved | expected preserved | conversion failed | expected preserved | P1, N9. Ordering is visible in the trace language. |
+| I2 Assess  Prepare (true concurrency) | expected preserved | expected preserved (AND split/join) | conversion failed | ambiguous | Traces cannot separate concurrency from interleaving. Evidence is `concurrent_pair` with disjoint presets. The footprint parallel relation is interleaving-based. |
+| I3 Legal optional (silent XOR) | expected preserved | approximated (empty  branch drawn as a gateway path or silent task) | conversion failed | expected preserved | Presence and absence are checked (P1, P2). The skip leaves no label to count. |
+| I4 Legal only after Assess | expected preserved | expected preserved | conversion failed | expected preserved | Not covered by a harness witness. Use `not tested` until a witness such as `L A ...` is added. |
+| I5 Verification waits for A and P | expected preserved | expected preserved | conversion failed | expected preserved | N1, N7, N9. |
+| I6 Legal  verification (no edge) | expected preserved | expected preserved, but layout can suggest sequence | conversion failed (N-shape, and overlap is incompatible with a sequential tree) | ambiguous | P4 is the discriminator. A false sequencing edge would reject P4 and lose behaviour. |
+| I7 Configure before Inspect | expected preserved | expected preserved | conversion failed | expected preserved | N3. |
+| I8 Loop scope and do-redo | expected preserved | approximated (BPMN loop encoded through gateways, not a loop marker) | conversion failed | ambiguous | P3, N4, N8. Loop encoding is the main visual-misreading risk. |
+| I9 At least one iteration | expected preserved | expected preserved | conversion failed | expected preserved | N2. |
+| I10 Release waits for both branches | expected preserved | expected preserved | conversion failed | expected preserved | P1, N2, N6. |
+| I11 Archive after release | expected preserved | expected preserved | conversion failed | expected preserved | N5. |
+| I12 Finality, exact final marking | expected preserved | approximated (end-event structure can differ from a single final place) | conversion failed | ambiguous | Only the net-level exact-marking test checks this. Traces cannot. |
+| Activity-label uniqueness | expected preserved | expected preserved | conversion failed | ambiguous | Duplicated BPMN task nodes could create label collisions. Check label counts per round trip. |
+| Silent optional behaviour | expected preserved | approximated | conversion failed | ambiguous |  transitions may be re-created as extra invisible nodes. Language-level equality is preserved only if bounded traces match. |
+
+**Note on the PetriTree column.** `conversion failed` is the expected pipeline-level outcome. If `convert_to_process_tree` succeeds, the cells must be re-audited, and each one should be `validated preserved` only if the tree's bounded language matches the reference.
+
+### Discussion
+
+**True concurrency versus arbitrary interleaving.** A POWL partial order with AP and LV is not the same as the set of its interleavings. Two nets can share the same trace language while one has true concurrency and the other enforces a choice between two orders. Trace-level tests cannot distinguish them. The harness therefore uses `concurrent_pair`, which requires both transitions to be enabled at the same reachable marking with disjoint presets. Disjoint presets are required because two transitions that share an input place are in conflict, and that is not concurrency. `discover_footprints` gives a parallel relation derived from observed behaviour, so it confuses interleaving with concurrency and cannot serve as concurrency evidence.
+
+**The lack of an edge between Optional Legal Review and verification.** This absence is the intended semantics, not an omission. A converter that adds an edge, for example by sequencing the legal review before verification, produces a model that loses P4. A converter that drops the join semantics and allows Legal to proceed independently can admit traces where Release follows Legal without the loop, which N2 and N6 catch.
+
+**Silent optional behaviour.** The XOR of Legal and  collapses, at trace level, to "Legal may or may not appear". The silent transition is not observable, so a bounded trace comparison cannot confirm that the skip path is represented as a branch and not as a loop or a dead-end. Only the reachability structure or the co-enabledness pattern confirms the choice point. Hiding  is also what makes "all traces of length  n" a coarse comparison.
+
+**Binary-loop semantics.** POWL `LOOP(do=trial_body, redo=correct_defect)` denotes A (B A)\*. This satisfies I8 and I9 only if the converter preserves both the minimum of one `do` execution and the rule that every `redo` is followed by `do`. A common failure is a loop encoding that allows exit after `redo`, which is N8. Another is one that allows zero `do` executions, which is N2.
+
+**The join before Release Change.** Release must wait for both the optional-legal branch and the verification loop. In a Petri net this is a synchronising transition. In BPMN it is a parallel join gateway. A converter that replaces it with an exclusive gateway, or that lets one incoming branch trigger release, admits N2 or N6.
+
+**Activity-label uniqueness.** Every visible label in the source is unique as a label. Multiple transitions can still carry the same label after conversion, for instance when the loop body is duplicated in BPMN. This does not affect the trace-language comparison, but it affects `concurrent_pair`, which selects transitions by label. The harness should therefore count transitions per label in every candidate and reject duplicates that were not in the reference.
+
+**Initial and final markings.** The primary pipeline checks that `im` and `fm` are non-null and non-empty, but that does not establish that `fm` is the intended end state. Exact final-marking equality is tested in Section 5 by requiring that a completed trace reaches a marking equal to `fm` with no residual tokens. BPMN end-event structure may create multiple end places. If the BPMNPetri round trip produces a final marking with several tokens across places, it fails the exact-equality test even when the trace language looks the same.
+
+**Gateway and routing-node ambiguity in BPMN.** A Petri place with several outgoing transitions is a choice. A transition with several input places is a synchronisation. A BPMN export must map these to XOR and AND gateways, and the mapping can be inexact. A silent routing node in BPMN may be a  transition, a gateway, or a pass-through, and these can round-trip differently. This is treated in Section 6.
+
+---
+
+# 5. Round-Trip Validation Code
+
+```python
+# roundtrip_validation.py
+"""
+Round-trip comparison against the reference net net_from_powl.
+
+Verdicts are bounded. A PASS means "no difference found within the stated bounds",
+never "proven equivalent". Search caps raise BoundExceeded, which yields INCONCLUSIVE.
+"""
+from __future__ import annotations
+
+import json
+from collections import deque
+
+import pm4py
+from pm4py.objects.petri_net.obj import Marking
+
+from conversion_pipeline import OUT_DIR, run
+
+ITER_LABEL = "Configure Trial"   # first activity of each verification iteration
+MAX_VISIBLE = 12                 # maximum visible trace length
+MAX_ITER = 3                     # maximum loop iterations (occurrences of ITER_LABEL)
+SEARCH_CAP = 200_000             # cap on explored states; hitting it -> INCONCLUSIVE
+
+# Positive witnesses: must be accepted by the reference and every candidate.
+POSITIVE = {
+    "P1_legal_before_release": ("Register Change", "Assess Risk", "Prepare Evidence",
+                                "Configure Trial", "Inspect Trial", "Legal Review",
+                                "Release Change", "Archive Change"),
+    "P2_skip_legal_prepare_first": ("Register Change", "Prepare Evidence", "Assess Risk",
+                                    "Configure Trial", "Inspect Trial",
+                                    "Release Change", "Archive Change"),
+    "P3_two_iterations": ("Register Change", "Assess Risk", "Prepare Evidence",
+                          "Configure Trial", "Inspect Trial", "Correct Defect",
+                          "Configure Trial", "Inspect Trial",
+                          "Release Change", "Archive Change"),
+    "P4_legal_overlaps_loop": ("Register Change", "Assess Risk", "Prepare Evidence",
+                               "Configure Trial", "Legal Review", "Inspect Trial",
+                               "Release Change", "Archive Change"),
+}
+
+# Negative witnesses: must be rejected by the reference and every candidate.
+NEGATIVE = {
+    "N1_loop_before_assess": ("Register Change", "Prepare Evidence", "Configure Trial",
+                              "Inspect Trial", "Assess Risk",
+                              "Release Change", "Archive Change"),
+    "N2_release_without_verification": ("Register Change", "Assess Risk", "Prepare Evidence",
+                                        "Release Change", "Archive Change"),
+    "N3_inspect_before_configure": ("Register Change", "Assess Risk", "Prepare Evidence",
+                                    "Inspect Trial", "Configure Trial",
+                                    "Release Change", "Archive Change"),
+    "N4_repeat_without_correction": ("Register Change", "Assess Risk", "Prepare Evidence",
+                                     "Configure Trial", "Inspect Trial",
+                                     "Configure Trial", "Inspect Trial",
+                                     "Release Change", "Archive Change"),
+    "N5_archive_before_release": ("Register Change", "Assess Risk", "Prepare Evidence",
+                                  "Configure Trial", "Inspect Trial",
+                                  "Archive Change", "Release Change"),
+    "N6_legal_after_release": ("Register Change", "Assess Risk", "Prepare Evidence",
+                               "Configure Trial", "Inspect Trial",
+                               "Release Change", "Legal Review", "Archive Change"),
+    "N7_prepare_missing": ("Register Change", "Assess Risk", "Configure Trial",
+                           "Inspect Trial", "Release Change", "Archive Change"),
+    "N8_trailing_correction": ("Register Change", "Assess Risk", "Prepare Evidence",
+                               "Configure Trial", "Inspect Trial", "Correct Defect",
+                               "Release Change", "Archive Change"),
+    "N9_assess_before_register": ("Assess Risk", "Register Change", "Prepare Evidence",
+                                  "Configure Trial", "Inspect Trial",
+                                  "Release Change", "Archive Change"),
+}
+
+# Pairs that must be concurrently enabled (disjoint presets) in the reference.
+CONCURRENT_PAIRS = [
+    ("Assess Risk", "Prepare Evidence"),
+    ("Legal Review", "Prepare Evidence"),
+    ("Legal Review", "Configure Trial"),
+    ("Legal Review", "Inspect Trial"),
+]
+# Controls that must never be concurrently enabled.
+NON_CONCURRENT_CONTROLS = [
+    ("Assess Risk", "Configure Trial"),
+    ("Prepare Evidence", "Configure Trial"),
+    ("Legal Review", "Release Change"),
+]
+
+
+class BoundExceeded(RuntimeError):
+    """A search cap was reached. The result is INCONCLUSIVE, never PASS."""
+
+
+# ---------------------------------------------------------------------------
+# Primitives over raw markings (dict: place -> tokens)
+# ---------------------------------------------------------------------------
+def preset(t) -> set:
+    return {a.source for a in t.in_arcs}
+
+
+def mkey(m) -> frozenset:
+    """Exact marking key. Equality of keys is exact-marking equality."""
+    return frozenset((p, n) for p, n in m.items() if n > 0)
+
+
+def fire(t, m) -> dict:
+    new = dict(m)
+    for a in t.in_arcs:
+        new[a.source] = new.get(a.source, 0) - a.weight
+    for a in t.out_arcs:
+        new[a.target] = new.get(a.target, 0) + a.weight
+    return {p: n for p, n in new.items() if n > 0}
+
+
+def enabled(net, m) -> list:
+    return list(pm4py.get_enabled_transitions(net, Marking(m)))
+
+
+def silent_closure(net, m) -> list:
+    """All markings reachable by silent (label None) transitions only.
+    The visited set makes silent cycles terminate."""
+    seen = {mkey(m): m}
+    stack = [m]
+    while stack:
+        cur = stack.pop()
+        for t in enabled(net, cur):
+            if t.label is None:
+                nxt = fire(t, cur)
+                k = mkey(nxt)
+                if k not in seen:
+                    if len(seen) >= SEARCH_CAP:
+                        raise BoundExceeded("silent closure cap reached")
+                    seen[k] = nxt
+                    stack.append(nxt)
+    return list(seen.values())
+
+
+def bounded_language(net, im, fm) -> dict:
+    """Visible traces that reach exactly fm, plus dead non-final markings.
+    'pruned' is True if the length or iteration bound cut at least one branch."""
+    fk = mkey(fm)
+    complete, deadlocks = set(), set()
+    pruned = False
+    visited = {(mkey(im), ())}
+    queue = deque([(dict(im), ())])
+    while queue:
+        m, trace = queue.popleft()
+        for c in silent_closure(net, m):
+            en = enabled(net, c)
+            if mkey(c) == fk:
+                complete.add(trace)          # exact final-marking equality
+            elif not en:
+                deadlocks.add(trace)         # stuck without reaching fm
+            for t in en:
+                if t.label is None:
+                    continue
+                nt = trace + (t.label,)
+                if len(nt) > MAX_VISIBLE or nt.count(ITER_LABEL) > MAX_ITER:
+                    pruned = True
+                    continue
+                nm = fire(t, c)
+                key = (mkey(nm), nt)
+                if key not in visited:
+                    if len(visited) >= SEARCH_CAP:
+                        raise BoundExceeded("bounded search cap reached")
+                    visited.add(key)
+                    queue.append((nm, nt))
+    return {"complete": complete, "deadlocks": deadlocks, "pruned": pruned}
+
+
+def concurrent_pair(net, im, a: str, b: str) -> bool:
+    """True if a reachable marking enables a-labelled and b-labelled transitions
+    whose presets are disjoint. Shared presets mean conflict, not concurrency."""
+    start = dict(im)
+    seen = {mkey(start)}
+    stack = [start]
+    while stack:
+        m = stack.pop()
+        en = enabled(net, m)
+        for x in (t for t in en if t.label == a):
+            for y in (t for t in en if t.label == b):
+                if preset(x).isdisjoint(preset(y)):
+                    return True
+        for t in en:
+            nm = fire(t, m)
+            k = mkey(nm)
+            if k not in seen:
+                if len(seen) >= SEARCH_CAP:
+                    raise BoundExceeded("concurrency search cap reached")
+                seen.add(k)
+                stack.append(nm)
+    return False
+
+
+def footprint_sets(net, im, fm):
+    fp = pm4py.discover_footprints(net, im, fm)
+    if not isinstance(fp, dict):
+        raise TypeError(f"unexpected footprint type {type(fp).__name__}")
+    seq = {tuple(x) for x in fp.get("sequence", [])}
+    par = {frozenset(x) for x in fp.get("parallel", [])}
+    return seq, par
+
+
+def rg_summary(net, im, fm) -> dict:
+    rg = pm4py.convert_to_reachability_graph(net, im, fm)
+    return {
+        # Visible labels only. Silent transitions are excluded (name None; verify in your version).
+        "visible_labels": sorted({t.name for t in rg.transitions if t.name is not None}),
+        "n_states": len(rg.states),  # informational only: state encodings differ between nets
+    }
+
+
+def soundness(net, im, fm) -> bool:
+    res = pm4py.check_soundness(net, im, fm, print_diagnostics=False)
+    return bool(res[0] if isinstance(res, tuple) else res)
+
+
+def cross_playout(src_net, src_im, src_fm, tgt_lang: dict, n: int = 100) -> dict:
+    """Sample complete traces from the source and check membership in the target's bounded language.
+    Sampling is not exhaustive."""
+    try:
+        log = pm4py.play_out(src_net, src_im, src_fm)
+        traces = [tuple(ev["concept:name"] for ev in tr) for tr in log][:n]
+    except Exception as exc:
+        return {"status": f"ERROR {type(exc).__name__}: {exc}"}
+    checked, skipped, not_in_target = 0, 0, []
+    for tr in traces:
+        if len(tr) > MAX_VISIBLE or tr.count(ITER_LABEL) > MAX_ITER:
+            skipped += 1
+            continue
+        checked += 1
+        if tr not in tgt_lang["complete"]:
+            not_in_target.append(tr)
+    return {"checked": checked, "skipped_out_of_bound": skipped,
+            "not_in_target": not_in_target[:5]}
+
+
+def witness_table(ref_lang: dict, cand_lang: dict) -> list:
+    rows = []
+    for kind, table, expected in (("positive", POSITIVE, True), ("negative", NEGATIVE, False)):
+        for name, tr in table.items():
+            assert len(tr) <= MAX_VISIBLE and tr.count(ITER_LABEL) <= MAX_ITER, name
+            r = tr in ref_lang["complete"]
+            c = tr in cand_lang["complete"]
+            rows.append({"witness": name, "kind": kind, "expected": expected,
+                         "ref": r, "cand": c, "agree": (r == expected and c == expected)})
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Main comparison
+# ---------------------------------------------------------------------------
+def main() -> None:
+    art = run()
+    nets = art["nets"]
+    ref_name = "powl_petri"
+    rnet, rim, rfm = nets[ref_name]
+
+    ref_lang = bounded_language(rnet, rim, rfm)
+    ref_fp = footprint_sets(rnet, rim, rfm)
+    all_pairs = CONCURRENT_PAIRS + NON_CONCURRENT_CONTROLS
+    ref_conc = {pair: concurrent_pair(rnet, rim, *pair) for pair in all_pairs}
+
+    report = {
+        "bounds": {"max_visible": MAX_VISIBLE, "max_iter": MAX_ITER,
+                   "iteration_label": ITER_LABEL},
+        "reference": {"name": ref_name, "sound": soundness(rnet, rim, rfm),
+                      "pruned": ref_lang["pruned"],
+                      "n_complete_traces": len(ref_lang["complete"]),
+                      "deadlocks": len(ref_lang["deadlocks"])},
+        "candidates": {},
+    }
+
+    for name, (net, im, fm) in nets.items():
+        if name == ref_name:
+            continue
+        try:
+            lang = bounded_language(net, im, fm)
+            only_ref = sorted(ref_lang["complete"] - lang["complete"])
+            only_cand = sorted(lang["complete"] - ref_lang["complete"])
+            witnesses = witness_table(ref_lang, lang)
+            sound = soundness(net, im, fm)
+
+            s_cand, p_cand = footprint_sets(net, im, fm)
+            fp_seq_diff = sorted(sorted(x) for x in (ref_fp[0] ^ s_cand))
+            fp_par_diff = sorted(sorted(x) for x in (ref_fp[1] ^ p_cand))
+
+            conc_rows = []
+            for pair in all_pairs:
+                cand_val = concurrent_pair(net, im, *pair)
+                conc_rows.append({"pair": list(pair),
+                                  "expected": pair in CONCURRENT_PAIRS,
+                                  "ref": ref_conc[pair], "cand": cand_val,
+                                  "ok": cand_val == (pair in CONCURRENT_PAIRS)})
+
+            entry = {
+                "sound": sound,
+                "only_in_reference": only_ref,
+                "only_in_candidate": only_cand,
+                "deadlocks_equal": ref_lang["deadlocks"] == lang["deadlocks"],
+                "pruned_candidate": lang["pruned"],
+                "witnesses": witnesses,
+                "footprint_sequence_diff": fp_seq_diff,
+                "footprint_parallel_diff": fp_par_diff,
+                "concurrency": conc_rows,
+                "reachability": rg_summary(net, im, fm),
+                "playout_ref_sample_in_candidate": cross_playout(rnet, rim, rfm, lang),
+                "playout_candidate_sample_in_ref": cross_playout(net, im, fm, ref_lang),
+            }
+            ok = (sound and not only_ref and not only_cand and entry["deadlocks_equal"]
+                  and all(w["agree"] for w in witnesses)
+                  and all(r["ok"] for r in conc_rows)
+                  and not fp_seq_diff and not fp_par_diff
+                  and not entry["playout_ref_sample_in_candidate"].get("not_in_target")
+                  and not entry["playout_candidate_sample_in_ref"].get("not_in_target"))
+            entry["verdict"] = ("PASS (bounded; not exhaustive over the full loop language)"
+                                if ok else "REJECT")
+        except BoundExceeded as exc:
+            entry = {"verdict": f"INCONCLUSIVE: {exc}"}
+        except Exception as exc:
+            entry = {"verdict": f"REJECT (error: {type(exc).__name__}: {exc})"}
+        report["candidates"][name] = entry
+
+    out_path = OUT_DIR / "roundtrip_report.json"
+    out_path.write_text(json.dumps(report, indent=2, default=str))
+    print(json.dumps(report, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### Exhaustiveness under the chosen bound
+
+- **Exhaustive within the bound.** For traces of length  12 with at most 3 `Configure Trial` occurrences, `bounded_language` enumerates every visible trace the net accepts, because the search is breadth-first over (marking, trace) pairs and silent closure is computed completely. A `BoundExceeded` exception would make the result INCONCLUSIVE, not PASS.
+- **Not exhaustive over the full language.** The verification loop is unbounded, so the full language is infinite. The `pruned` flag will be `True` for the reference, which is the expected result. Every PASS verdict is therefore labelled "bounded; not exhaustive".
+- **Silent cycling.** The silent closure uses a visited set of markings, so -cycles terminate without an iteration limit.
+- **Exact completion.** A trace counts as complete only when the marking equals `fm` exactly, with no residual tokens. Non-final dead markings are recorded separately as deadlocks.
+- **Witnesses.** All witnesses are within bounds, so their membership or non-membership is exact for the bounded fragment.
+- **Concurrency checks.** `concurrent_pair` searches all reachable markings, so it is exhaustive for a bounded net. It is blocked by `SEARCH_CAP` only if the state space is larger than the cap.
+
+---
+
+# 6. Visual-Semantics Review
+
+A BPMN diagram can be read incorrectly even when the net it was derived from behaves correctly. The diagram's semantics come from gateway types, token-flow conventions, and layout, and a reader applies conventions the diagram does not state.
+
+- **Parallel gateways (AND).** A parallel split means both branches are started, and a parallel join means both branches must complete. Readers often treat the diagram order from top to bottom as the execution order, which implies that the top branch runs first. For Assess Risk and Prepare Evidence, the diagram should show both as enabled after Register Change, with no implied order. The join before Release Change should be labelled so that it is not misread as an OR-join.
+- **Exclusive gateways (XOR).** An XOR split next to an empty path reads as "Legal Review is optional", which is correct. It can also be read as "one of two activities happens", with no skip path, if the empty path is not labelled. An XOR join after the optional branch can be misread as a synchronisation, but it is a merge. The XOR does not wait for the other branch, so it does not impose the join semantics the source requires.
+- **Loop visualization.** A BPMN loop marker or a loop-back arrow from the end of the body to its start suggests that Configure Trial repeats as a whole. It does not show that Correct Defect is the separator, or that the body must run at least once. Either the loop is drawn as a gateway cycle, in which case the minimum-one-iteration rule is not visible, or as a loop marker, in which case the redo activity may be hidden in the arrow. Both need explicit annotation.
+- **Silent routing nodes.** An unnamed gateway or an empty task is a  node. Readers may think it is a real activity with a missing label, or they may think it is a dead end. A label such as "skip (no action)" on the empty branch removes this ambiguity.
+- **Apparent ordering from layout.** Diagram position is not semantics. Placing Legal Review to the right of Assess Risk, and above the verification loop, suggests that Legal Review happens before verification. The source says it may overlap with verification, so the layout actively contradicts I6. Placing the loop left of Legal Review suggests the reverse. Stakeholders should be told that layout is not ordering, and that only the arrows and gateways carry semantics.
+
+### Annotations and documentation to reduce ambiguity
+
+1. Add a legend stating that parallel gateways mean "all branches run, in any order", and that exclusive gateways mean "exactly one branch runs". For the optional branch, state explicitly that the empty path means "no legal review".
+2. Label the loop: "Verification: at least 1 iteration. Each repeat is preceded by Correct Defect. Each iteration runs Configure Trial, then Inspect Trial."
+3. Add a text annotation on the join: "Release Change waits for Legal Review (or its skip) AND for verification completion."
+4. Add a text annotation on the overlap: "Legal Review may run before, during, or after the verification loop, provided Assess Risk has completed. There is no ordering constraint against the loop."
+5. Attach invariant IDs (I1–I12) to the diagram as a legend, so a reviewer can connect each visual element to a checked property.
+6. State on every diagram: "Derived view. Authoritative semantics are in the POWL source at [path, commit hash]. Layout carries no semantic weight."
+7. Use stable activity IDs in the BPMN and map them to the labels in the documentation, so renaming a label does not silently break the round-trip comparison.
+
+---
+
+# 7. Rejection Criteria
+
+A conversion result is rejected or quarantined if any of the following holds.
+
+1. **Null or empty markings.** `im` or `fm` is `None`, has no tokens, or is not the marking the converter intended. Checked in `_accepting`.
+2. **Unsoundness or failed workflow-net check.** `check_is_workflow_net` returns False or raises, or `check_soundness` returns False. The `diagnose` results must all be True.
+3. **Failed exact final-marking test.** A complete trace reaches a marking that is not exactly `fm`, or a dead non-final marking exists (non-empty `deadlocks`).
+4. **Loss of a required interleaving.** P4 (Legal overlapping with the loop) is rejected, or `concurrent_pair` returns False for `(Legal Review, Configure Trial)`. This is a loss of behaviour the source explicitly permits.
+5. **Admission of release before verification.** N2 is accepted. This is a loss of the join semantics.
+6. **Admission of loop violations.** N4 or N8 is accepted, or N2 is accepted through a zero-iteration loop.
+7. **Collapse of optional behaviour.** P2 (no Legal) is rejected, or Legal becomes mandatory. This is a loss of the XOR-with-skip semantics.
+8. **Admission of activity after archive.** Any witness with activity after `Archive Change` is accepted. This is a finality violation.
+9. **Unexpected bounded-language difference.** `only_in_reference` or `only_in_candidate` is non-empty.
+10. **Spurious concurrency or conflict.** A control pair such as (Assess Risk, Configure Trial) becomes concurrently enabled, or an expected concurrent pair becomes conflicting.
+11. **Process-tree success with language mismatch.** A process tree is produced, its BPMN and Petri round trips are generated, but its bounded language differs from the reference. The tree must be quarantined even though the conversion did not raise.
+12. **Silent conversion fallback.** A process-tree conversion failure is replaced by a fallback model, for example a flower model, without a recorded failure and a new audit.
+13. **Label drift.** Activity labels are renamed, duplicated, or split across transitions in a way the reference does not contain.
+14. **Pruned status misreported.** A result is described as exhaustive or equivalent while `pruned` is True, or while a `BoundExceeded` exception was raised.
+15. **Playout counterexample.** A sampled trace from one model is absent from the other model's bounded language.
+
+---
+
+# 8. Canonical Representation Recommendation
+
+**Canonical (authoritative) model: `source_powl`.** It is the only representation that encodes the partial order, the loop semantics, and the optional skip directly, and it is the one the invariants are written against. It should be stored as version-controlled Python code, alongside its invariant table (Section 1) and witness suite (Section 5). Each release should be tagged with the commit hash.
+
+**Stakeholder visualization: BPMN, derived.** BPMN is the most accessible representation for business readers. It is a derivative and should be regenerated from the canonical POWL, never edited directly.
+
+**Derivative artifacts and required evidence.**
+
+| Artifact | Status | Evidence required to accompany it |
+|---|---|---|
+| Petri net from POWL (`net_from_powl`) | Derivative, machine-checked | Workflow-net check, soundness check, bounded-language equality with the canonical reference (trivially the same net), concurrency controls, and the witness suite. |
+| BPMN from the Petri net | Derivative, stakeholder view | BPMNPetri round trip with the same evidence as above, exact final-marking test, label-count check, and the annotations from Section 6. |
+| Process tree | **Not allowed as a stored artifact** for this source, unless it passes | Exact bounded-language equality with the reference, a recorded `convert_to_process_tree` result, and a re-audit under Section 4. Given the N-shape, the expected and recommended outcome is that it is not generated. |
+| Visualizations (SVG or PNG) | Derivative, presentation only | Generation timestamp, source commit hash, and the legend from Section 6. Visualizations carry no evidence of behaviour. |
+
+**Should a process-tree intermediate be allowed?** Not in the storage path. The tree is a lossy or failing intermediate for this source. It may be produced as a diagnostic, and a failed attempt should be logged as a finding. A successful tree is admissible only if it passes the same behavioural tests as the other derivatives. Even then, it should not replace the POWL as the source.
+
+**Avoiding round-trip drift in future edits.**
+
+1. Edit only the POWL source. Any change to BPMN or the Petri net is a process violation.
+2. After each POWL edit, regenerate all derivatives with the harness, and run the witness suite. Update the witness suite when intended semantics change, and record the change in the invariant table.
+3. Pin the pm4py version. Conversion behaviour can change between versions, and drift can come from the library rather than the model.
+4. Store a hash of the canonical POWL and of each derivative. A mismatch between a derivative and its expected hash, given the same source hash, signals drift.
+5. Add CI gates: every POWL change must pass the witness suite, the soundness checks, and the concurrency controls before the derivatives are regenerated and published.
+6. Treat any BPMN edited by hand as quarantined. Re-importing it requires a fresh round-trip audit, and the diff is reviewed as a semantic change, not a layout change.
+7. Keep derivatives out of the review path for semantics. Reviewers review the POWL and its invariant table.
+
+---
+
+# 9. Residual Uncertainty
+
+The proposed validation cannot establish the following, even if every test passes.
+
+1. **Full language equivalence.** The loop makes the language infinite. The bounded comparison covers traces up to length 12 and up to 3 iterations. It cannot exclude a difference that appears only at higher iteration counts or longer traces.
+2. **Concurrency beyond the tested pairs.** The concurrency checks cover the listed pairs. They do not establish that no other pair has spurious conflict or spurious concurrency, although a full pairwise check is feasible for this small model and should be added if the model grows.
+3. **Intent versus specification.** The tests verify that the converters preserve the POWL as written. They cannot verify that the POWL expresses the business's intent. A sequencing error in the source would pass every converter test.
+4. **Stakeholder interpretation.** Passing tests do not show that stakeholders read the BPMN the way the source intends. Visual misreading is measured only by review, not by these tests.
+5. **Library behaviour under other versions or inputs.** The results describe the pinned pm4py version. Conversion internals can change, and a passing result is evidence about one version only.
+6. **Trace-level observability of concurrency and .** Any trace-based comparison treats concurrency as interleaving and cannot count silent steps. Concurrency and  structure are checked only through the net-level tests, and those are bounded by the reachable marking space.
+7. **Data, time, and resources.** The source model has no data conditions, timing, or resource constraints. The validation says nothing about them, and a model that adds them later needs new witnesses.
+8. **Completeness of the witness suite.** Witnesses are a finite sample chosen from the invariants. A behaviour outside the chosen witnesses but inside the bound is covered only by the bounded comparison, and an invariant without a witness (I4 in the current suite) is untested.
+9. **Playout coverage.** `play_out` samples traces and is not exhaustive. A failed sample is a counterexample, but a passing sample establishes nothing about traces it did not draw.
+10. **The absence of a process tree is not a proof of impossibility.** The N-shape argument is strong evidence that no block-structured tree preserves this partial order. The harness observes what the converter does. It does not prove that no tree with the same language exists.
