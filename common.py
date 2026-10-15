@@ -590,6 +590,8 @@ _REASONING_PATTERNS = (
     r"deepseek.*(?:r\d|v[4-9]|\d{2,})",
     r"(?:^|-)gemma-?[4-9]",
     r"muse-spark-1\.(?:1|2|3)(?:-|$)",
+    r"muse-wonder(?:-|$)",
+    r"gemini-4-argon(?:-|$)",
     r"(?:^|-)claude-sonnet-5\.5(?:-|$)",
     r"haiku-5\.5(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
@@ -605,6 +607,8 @@ _HIDDEN_REASONING_PATTERNS = (
     r"(?:^|-)chatgpt-(?:[5-9]|\d{2,})(?:[.-]|-|$)",
     r"(?:^|-)grok-(?:[4-9]|\d{2,})(?:[.-]|-|$)",
     r"muse-spark-1\.(?:1|2|3)(?:-|$)",
+    r"muse-wonder(?:-|$)",
+    r"gemini-4-argon(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
 )
 
