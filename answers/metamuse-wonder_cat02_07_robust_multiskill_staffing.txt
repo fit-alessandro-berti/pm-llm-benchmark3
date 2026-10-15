@@ -1,0 +1,519 @@
+<think>
+Calculating expected service times and offered load from weighted averages and arrival counts for a self-contained pandas and PM4Py code block.Aggregating per-block demand and capacity to compare offered load against skill-constrained staff minutes.Calculating per-block utilization and identifying evening coverage as the bottleneck with infeasible load.
+</think>
+# 1. Assumptions, objectives, and decision variables
+
+## Observations supplied, not assumed
+
+The process is `Intake -> diagnostic branch(es) -> Validation`. Case types are single-branch `M,E,S` and two-branch `ME,ES`. `ME/ES` can be parallel on two resources, shortening the critical path but adding coordination and a second resource contention point, or sequential on one cross-skilled resource, lengthening the critical path but avoiding coordination and possibly handover.
+
+All resources have finite shifts ending by 16:00, 18:00, 12:00 or 20:00 depending on person. No night shift is supplied. Breaks remove 30 minutes for most resources. Overtime is capped at 30 min/resource. Base demand is 42 expected arrivals over 08:00-20:00. Priority mixes, case-type mixes, service ranges, complex-tail probabilities, speed multipliers, handovers, setup, coordination and one-preemption-per-case rules are supplied.
+
+## Assumptions introduced and why they are needed
+
+**A1 - Distribution from ranges.** Ranges are not distributions. For auditable arithmetic I treat ordinary and complex-tail draws as uniform on the stated intervals, mixed with the stated tail probability. This gives expected service and bounds, not a claim that uniforms are true. Section 9 explains sensitivity to this choice. Expected base minutes, before resource multipliers, are therefore:
+
+| activity | ordinary mean | tail mean | expectation | absolute supplied range |
+|---|---:|---:|---:|---:|
+| Intake | 6.5 | 12.0 | $0.92\cdot 6.5+0.08\cdot 12=6.94$ | 5-14 |
+| Mechanical | 23.0 | 45.0 | $0.85\cdot 23+0.15\cdot 45=26.30$ | 18-55 |
+| Electrical | 28.5 | 52.5 | $0.82\cdot 28.5+0.18\cdot 52.5=32.82$ | 22-65 |
+| Software | 32.5 | 62.5 | $0.80\cdot 32.5+0.20\cdot 62.5=38.50$ | 25-80 |
+| Validation | 14.0 | 28.5 | $0.88\cdot 14+0.12\cdot 28.5=15.74$ | 10-35 |
+
+These are *estimates under A1*. Hard bounds are obtained by replacing expectations with interval minima/maxima; no finite probabilistic tail bound follows from ranges plus mixture alone without the uniform assumption.
+
+**A2 - Elapsed SLA clock.** P1/P2/P3 targets are elapsed minutes/hours from arrival, including waiting, breaks, non-working time after 20:00, and - at the lower bound interpretation - overnight. Because no next-day roster is supplied, late-day SLA conclusions are conditional on whether work resumes next morning with the same resources. I therefore separate: (i) within-horizon completion by 20:30 including max overtime, and (ii) SLA attainment under a resumed-next-day assumption. Conflating them would be misleading.
+
+**A3 - Arrival process.** Block totals are expectations. For load arithmetic I use expected counts by block, multiplying by block percentages. For the Python Monte Carlo I use Poisson block counts as an explicit variability assumption; block percentage mixes are applied probabilistically per case. Real arrivals may be burstier.
+
+**A4 - Preemption semantics.** Only diagnostic work may be preempted, only by P1, at most once per preempted case. "Restart penalty equal to 10% of remaining active service time" is interpreted as additional active work $0.10\times$ remaining-at-interruption, not a full restart and not 10% of original duration. Pause/resume waiting while preempted is elapsed delay but not extra service, apart from the penalty. Whether the preemptor can use a resource outside its shift/break is assumed no.
+
+**A5 - Penalties are elapsed delays unless stated.** Handover $+7$ min, cross-team $+5$ min, skill-family setup $+5$ min and parallel coordination $+8$ min are added to case elapsed time. I count handover/setup also as system burden in capacity discussion conservatively when they occupy or block a resource; the prompt does not state whether every handover minute consumes the receiving resource. The Python code exposes this as a flag. This matters: at 42 cases, even 1-2 handovers/case is 294-588 penalty-minutes system-wide.
+
+**A6 - Parallel decision variable.** For each `ME/ES` case the dispatcher chooses `parallel` if two qualified resources can start both branches within a threshold $T_{par}$ (proposed 15 min) and neither is a reserved P1 resource needed for imminent P1 cover; otherwise sequential on the qualified resource minimising predicted finish, preferring one who also did Intake if eligible. The 8-min coordination is incurred only in parallel mode, before Validation.
+
+**A7 - Skill families for setup.** Mechanical is one family; Electrical/Software is the other team/family boundary for the extra 5-minute cross-team charge, per the prompt wording "mechanical team and the electrical/software team". Setup applies when a *resource* switches diagnostic family between consecutive cases. Intake/Validation are treated as neutral and do not reset diagnostic family in the base reading; sensitivity should test the alternative.
+
+## Decision variables
+
+For each case/stage: eligible set, chosen resource(s), parallel vs sequential, start/preempt decision, reserved-capacity release time, overflow trigger state, and Validation assignment. System variables: reservation size by time block, $T_{par}$, priority weights/aging rate, maximum preemptions (fixed $\le 1$), overtime authorisation ($\le 30$ min).
+
+## Objective formulations
+
+At least two defensible objectives differ materially.
+
+**O1 - Tail/SLA-risk minimisation (primary for safety-critical reading).**
+Minimise
+$$
+J_1 = 10\cdot P(\text{P1}>120) + 5\cdot P(\text{P2}>480) + 2\cdot P(\text{P3}>1440)
++ 0.01\cdot E[\text{p95 delay}] + 0.5\cdot N_{\text{preempt-penalty-min}}
+$$
+subject to no resource planned utilisation $>90\%$ in base, overtime $\le 30$, preemptions $\le 1$/case. Weights are *policy choices*, labelled as Assumption A8, not supplied facts; they encode that missing P1 is worse than a modest mean increase.
+
+**O2 - Fairness/robustness minimax.**
+Minimise the worst normalised regret across scenarios $s\in\{Base,U1,\dots,U5\}$:
+$$
+J_2=\max_s \left[ w_a \frac{\text{p90 delay}_s}{\text{p90 delay}^{ref}_s}
++ w_b \frac{\max_r U_{r,s}}{0.90}
++ w_c \cdot \text{Gini}(U_{r,s})
++ w_d \frac{\text{handover+setup min}_s}{\text{cases}_s} \right]
+$$
+with $U_{r,s}$ utilisation of available (shift-minus-break) minutes. This penalises a policy that is excellent in Base but collapses under U3/U5, or that "wins" by loading Farah/Chen/Emil unfairly.
+
+**O3 - Mean-throughput reference (not recommended alone).** Minimise mean flow time subject only to eligibility. This is useful as a benchmark because pooling usually looks best here, but it can hide p90, starvation, and fragility. A recommendation based only on O3 would fail the task's robustness requirement.
+
+"Robust" here means: under $J_2$, no scenario produces P1 SLA collapse, max utilisation persistently above 100% of available time, or dependence on a single absent-able person, *without* an explicit declared fallback being triggered. It does not mean all SLAs are met in all scenarios - Section 2 shows that may be infeasible with supplied capacity.
+
+# 2. Capacity and offered-load analysis
+
+## Whole-day expected offered load, Base, before multipliers/penalties
+
+Multiplying block arrivals by case-type percentages gives expected branch involvements:
+
+| skill need | expected branch-cases/day | expected base-min | share of diagnostic load |
+|---|---:|---:|---:|
+| Mechanical-involved (M+ME) | 18.1 | $18.1\times26.3 \approx 476$ | 27% |
+| Electrical-involved (E+ME+ES) | 24.3 | $24.3\times32.8 \approx 797$ | 45% |
+| Software-involved (S+ES) | 12.9 | $12.9\times38.5 \approx 495$ | 28% |
+| Intake, all 42 | 42 | $42\times6.94 \approx 291$ | - |
+| Validation, all 42 | 42 | $42\times15.74 \approx 661$ | - |
+
+Total base service $\approx 2,720$ min before any multiplier $>1$, handover, setup, coordination or preemption penalty.
+
+Gross staff availability: Ada, Ben, Chen, Deepa, Emil each $480-30=450$ min in their shifts; Farah $240$ min; total $=2,490$ min, plus at most $6\times30=180$ overtime $=2,670$. **Observation by arithmetic:** expected base service alone ($\approx2,720$) already exceeds gross availability including maximum overtime, before speed multipliers (many are 1.10-1.40) and penalties. This is not a proof of infeasibility for every realisation - service draws can be low, and percentages are expectations - but it proves the Base scenario is not a comfortably staffed system. Planning to mean load would be fragile. Any claim of 90% SLA attainment for all priorities within the same day from these inputs alone would be unsupported.
+
+Skill-qualified capacity is tighter than gross capacity, because Intake/Validation flexibility cannot create Mechanical/Electrical/Software eligibility.
+
+## Time-block analysis
+
+Diagnostic offered load per arrival block (cases arriving in that block; work may spill later), and staff present in that block:
+
+| block | arr. | Mech base-min | Elec base-min | Soft base-min | Intake+Valid base-min | total base-min | staff-min in block (after breaks in block) | crude ratio* |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 08-10 | 7 | 92 | 126 | 67 | 159 | 444 | 480: Ada,Ben,Chen,Farah | 0.93 |
+| 10-12 | 9 | 118 | 177 | 87 | 204 | 586 | 600: +Deepa, Farah | 0.98 |
+| 12-14 | 7 | 77 | 138 | 81 | 159 | 455 | $\approx$510: Ada/Ben/Chen reduced by breaks, Deepa, Emil; Farah leaves 12:00 | 0.89 |
+| 14-16 | 10 | 105 | 204 | 116 | 227 | 651 | 570: Ada,Ben,Chen, Deepa net of break, Emil | 1.14 |
+| 16-18 | 6 | 55 | 108 | 92 | 136 | 392 | 210: Deepa, Emil net of break | 1.87 |
+| 18-20 | 3 | 28 | 44 | 52 | 68 | 192 | 120: Emil only | 1.60 |
+
+\*Ratio is a *lower-bound pressure indicator*, not utilisation: it ignores multipliers $>1$, penalties, skill mismatch and carry-over backlog, all of which worsen it; it also credits all staff-minutes to all work, which skill constraints forbid. True feasible pressure is therefore $\ge$ this in skill-constrained periods.
+
+Key readings:
+
+- **08-12 is already near saturation.** Best-speed diagnostic capacity is concentrated: Mechanical Ada/Ben at 1.00, Electrical Chen/Deepa at 1.00, Software Emil absent until 12:00 and Chen at 1.25, Farah slow at 1.40 and gone at 12:00. A Software case at 09:00 can only use Chen (1.25) or Farah (1.40); expected Software 38.5 base-min becomes 48-54 consumed min.
+- **14-16 is the largest arrival block (10) with offered load exceeding in-block staff**, so backlog is expected even in Base, before U-shocks.
+- **16-20 is structurally thin, not merely busy.** Only Deepa (to 18:00, Electrical 1.00 / Mechanical 1.25, no Software) and Emil (Electrical 1.30, Software 1.00) remain. From 18:00 only Emil remains, who cannot do Mechanical. Any Mechanical or unvalidated backlog after 18:00 cannot finish that evening regardless of dispatch cleverness. Bottleneck therefore *migrates*: morning Software/Chen, afternoon Electrical volume, evening coverage/eligibility and Validation-by-Emil/Deepa.
+- **Validation is a hidden second bottleneck.** 661 expected base-min/day, rising in the evening when only Deepa (1.00) and Emil (1.00) are fast validators. If diagnostics are pooled aggressively but Validation is left as "whoever is free", completed diagnostics queue for Validation and P1 tail is made there. Intake is small in minutes but is a gate: no Intake, no diagnostic start; its risk is concentrated in U5's outage.
+- **Parallelism trade-off in numbers.** For an average ME case, sequential expected diagnostic critical path on one resource is roughly $26.3+32.8=59.1$ base-min (before that resource's multipliers) versus parallel critical path $\max(26.3,32.8)+8=40.8$ base-min equivalent - about 18 min elapsed saved, but consumes two resources simultaneously and may add handovers. For ES: sequential $32.8+38.5=71.3$ versus parallel $\max+8=46.5$, about 25 min saved. Parallelism is therefore valuable for P1/elapsed time and expensive for system capacity and fairness. Indiscriminate parallelisation under load can reduce throughput and worsen everyone else's tail - a classic local-optimum trap.
+
+## Bottleneck migration under U1-U5
+
+**U1 Morning surge.** 08-12 arrivals $\times1.7$: expected 08-10 $\approx11.9$, 10-12 $\approx15.3$; P1 share +8pp in those blocks. In-block base load roughly $\times1.7$ ($\approx755$ and $\approx996$ base-min) against 480/600 staff-min before multipliers. Bottleneck is immediate: Intake queue first, then Chen for Software/Electrical and Ada/Ben for Mechanical. Because morning overload creates backlog that meets the 14-16 peak, a "morning-only" shock becomes an all-day tail problem. P1 preemption demand rises exactly when there is least slack; preempting at most once protects victims but limits rescue.
+
+**U2 Electrical/Software incident 12-16.** E and ES shares double then renormalise in 12-14 and 14-16. In 14-16, unnormalised E 30$\to$60 and ES 12$\to$24 with others 58, total 142; renormalised E $\approx42\%$, ES $\approx17\%$, and Electrical-involved share (E+ME+ES) rises from 62% to roughly 73%. Electrical expected branch-cases in 14-16 rise from 6.2 to about 7.3 and Software-involved from 3.0 to about 3.5, while Mechanical falls. Bottleneck shifts decisively to Electrical (Chen/Deepa 1.00, Ada/Emil 1.30-1.35) and Software (Emil 1.00, Chen 1.25). Mechanical staff (Ben) become comparatively idle - a strict-specialisation failure mode. Cross-skill overflow value is highest here.
+
+**U3 Chen absent.** Removes 450 min, the joint-fastest Electrical resource (1.00), a Software resource (1.25), and morning capacity when Emil is absent. Before 12:00 Software falls to Farah alone at 1.40 (and only to 12:00); Electrical before 10:00 falls to Ada 1.35 / Farah 1.40 because Deepa starts 10:00. This is the clearest single-point-of-failure scenario. Total availability drops to 2,040 min (2,220 with overtime) versus $\approx2,720$ base-min expected service before multipliers: system-wide overload is severe. Bottleneck: morning Electrical/Software, then a backlog wave into Deepa/Emil.
+
+**U4 Long-tail day.** Diagnostic tail probabilities double: Mechanical 0.30, Electrical 0.36, Software 0.40. New expected base diagnostic minutes: Mechanical $0.70\cdot23+0.30\cdot45=29.6$ (+13%), Electrical $0.64\cdot28.5+0.36\cdot52.5=37.1$ (+13%), Software $0.60\cdot32.5+0.40\cdot62.5=44.5$ (+16%). Mean load rises only modestly, but variance and p90 rise disproportionately: a single complex Software case can be 80 base-min $\times1.25$ (Chen) $=100$ consumed min. Bottleneck is not a skill average but *tail occupancy* of the fastest resources; dispatch based only on expected remaining time will be repeatedly surprised. SLA risk concentrates in P1 cases unlucky enough to queue behind one long-tail job - motivating preemption/reservation rather than pure FIFO.
+
+**U5 Combined stress.** U1 morning surge + Chen absent + Intake blocked 09:30-10:00. The outage removes Intake during a $\times1.7$ arrival window with higher P1 share; because Intake is only $\approx$7 min, the direct loss is small ($\approx$3-4 expected intakes delayed) but the *synchronisation* effect is large: a pulse of cases becomes eligible simultaneously at 10:00 into a Chen-less system. Morning Software relies on Farah 1.40 until 12:00, Electrical on Ada 1.35/Deepa from 10:00. This is the worst scenario for P1 SLA and for fairness (Ada/Deepa overload). Any policy whose reserve is a person rather than protected time on multiple eligible resources fails here if that person is Chen.
+
+# 3. Candidate policies
+
+All policies share non-negotiable rules: eligibility strictly from the skill matrix; no work outside shift/break except authorised overtime $\le30$ min; at most one preemption per victim case; P1 clock targets 120 min, P2 480, P3 1440 elapsed; every assignment logs the decision inputs (Section 7). Dispatch is recomputed at each arrival, completion, break return and every 10 min, whichever first.
+
+## Policy P-A: Strict specialization with fixed queues
+
+- **Eligibility/queues.** Intake queue to Ada/Deepa/Farah (1.00) first, others only if queue $>3$. Mechanical queue: Ada/Ben primary, Deepa overflow only if Mechanical queue waits $>45$ min, Farah last. Electrical queue: Chen/Deepa primary, Ada/Emil only if wait $>45$ min. Software queue: Emil primary, Chen secondary, Farah only if wait $>60$ min. Validation: Ben/Deepa/Emil (1.00) primary.
+- **Priority score.** Within each fixed queue: P1 first, then earliest SLA deadline; no cross-queue stealing except the wait thresholds above.
+- **Reservation.** None.
+- **Preemption.** P1 may preempt the lowest-priority running diagnostic in *its own skill queue only* if predicted P1 wait $>30$ min, victim has been preempted 0 times, and penalty $0.10\times$ remaining is added to victim. 
+- **Parallelisation.** ME/ES always sequential on a cross-skilled resource if one is queue-shortest (Ada for ME, Chen/Emil for ES), else parallel only if both branch queues $<2$.
+- **Handover minimisation.** Prefer retaining Intake resource for a diagnostic if eligible, even at multiplier up to 1.25, to save 7+5 min.
+- **Overflow triggers.** Only the fixed wait thresholds above. Auditable and stable; deliberately inflexible.
+
+## Policy P-B: Full pooling to any qualified resource, transparent earliest-predicted-finish
+
+- **Eligibility.** Any resource with a non-dash multiplier for the stage.
+- **Priority score.** At dispatch, among waiting cases compute score $=$ slack to SLA deadline $-$ $0.5\times$ waited minutes, ascending (most urgent/least slack first), with P1 hard tier ahead of P2 ahead of P3 unless a P3 has $<60$ min slack (anti-starvation promotion). Among eligible resources for the chosen case, pick minimum predicted finish $=$ $\max(now, resource free) +$ base estimate $\times$ multiplier $+$ handover/setup if applicable $+$ parallel coordination if applicable. Estimates use activity means from A1, displayed to dispatcher.
+- **Reservation.** None; P1 relies on tier + preemption.
+- **Preemption.** If a P1 predicted start wait $>20$ min, preempt the running lower-priority diagnostic with the largest remaining time whose victim preemption count $=0$ and whose resource is eligible/fastest for the P1 branch; add 10% remaining penalty to victim, resume victim next on same resource if possible.
+- **Parallelisation.** Always parallel for ME/ES if two eligible resources have predicted branch starts within 30 min of each other; else sequential.
+- **Handover minimisation.** Only through predicted-finish formula (penalties included), no retention bonus beyond actual penalty.
+- **Overflow.** Inherent - all qualified capacity is the overflow. Fairness guardrail: if a resource's projected utilisation exceeds 95% while another eligible resource is $<70\%$, add a $+10$ min fairness penalty to the overloaded resource's predicted finish except for P1.
+
+## Policy P-C: Hybrid - reserved P1 capacity, controlled cross-skill overflow, threshold parallelisation (recommended candidate)
+
+- **Eligibility.** Same matrix, but resources are tiered per skill: Tier-1 multiplier $\le1.10$, Tier-2 1.25-1.35, Tier-3 1.40 (Farah) as declared overflow only.
+- **Reserved P1 capacity.** Protect, per 2-hour block, one "P1-capable slot": operationally, at any time at least one Tier-1 resource per *active* skill area must not be assigned a P3 (or a P2 with $>240$ min slack) diagnostic expected to run $>30$ min if that would leave zero Tier-1 cover for that skill in the next 60 min. This is a *rule about assignments*, not idle dedication - the resource may do P1/P2/imminent work. Reserve is released for any case at T-30 min before a reserved resource's shift end, and automatically suspended when no P1 has arrived for 90 min *and* P2 queue is breaching (release logged).
+- **Priority score.** Hard tiers P1 $>$ P2 $>$ P3, within tier earliest deadline first, plus aging: a P2/P3 case gains one tier-equivalent promotion after waiting $>50\%$ of its SLA (P2 $>240$ min, P3 $>720$ min) except it cannot displace a running P1. Score and inputs are shown verbatim in the log.
+- **Dispatch.** For the highest-priority waiting case, choose eligible resource minimising predicted finish as in P-B, with a retention bonus: subtract the actual avoided handover (7, plus 5 if cross-team) - i.e. penalties are costed, not hidden - and with Tier-3 use requiring an overflow trigger.
+- **Overflow triggers.** Tier-2 allowed when Tier-1 predicted start wait $>20$ min (P1), $>45$ min (P2), $>90$ min (P3). Tier-3/Farah allowed when predicted wait exceeds twice those values or projected block utilisation $>90\%$. Cross-team retention by same cross-skilled resource is preferred when its multiplier penalty in minutes is less than 12 min saved penalties.
+- **Preemption.** As P-B but stricter: threshold P1 wait $>15$ min, victim must be P3 or P2 with $>180$ min slack, never preempt a case in its last 5 active minutes (penalty would buy little), never preempt twice, and after preemption the victim gets top-of-tier resume priority. Preemption count and penalty minutes are reported per shift.
+- **Parallelisation.** Threshold rule from A6: parallel only if (case is P1) OR (both branches can start within 15 min AND projected utilisation of both skills $<85\%$); otherwise sequential on the resource minimising predicted finish, preferring same-resource retention. Parallel incurs the logged 8 min.
+- **Validation protection.** Validation is dispatched with the same tier score, not as an afterthought; one fast validator (Ben/Deepa/Emil at 1.00) is kept from starting a long P3 diagnostic in 16:00-20:00 if unvalidated P1/P2 cases are predicted within 30 min. This directly addresses the evening Validation bottleneck.
+
+## Policy P-D (additional comparator): Shortest-expected-remaining-processing-time with fairness penalty
+
+Like P-B but the case order is by shortest expected remaining total processing (SERT) within priority tier, and resource choice minimises predicted finish $+ \lambda \times$ resource projected utilisation with $\lambda=15$ min. Parallel only for P1. This tests whether SERT's mean-flow advantage survives tail/SLA and fairness accounting. It is *not* recommended as primary because SERT systematically deprioritises complex-tail and multi-branch cases, worsening p90 for exactly the cases most at risk.
+
+# 4. Scenario comparison
+
+Scale definitions (explicit): `mean_delay` and `p90_or_p95_delay` are *model-based scenario estimates* of elapsed flow time (arrival to Validation complete) in minutes for cases arriving that day, under A1-A7 and the Section 8 scaffold logic; they are **ranges, not measurements**, with uncertainty at least $\pm25\%$ in Base and $\pm40\%$ under U3/U5, wider for p95. `P1_SLA`/`P2_SLA` = estimated % meeting 120/480 elapsed min assuming next-day resumption for unfinished work (A2); values below 50% should be read as "not credibly attainable that day". `max_resource_utilization` = busiest resource's busy minutes / available shift-minus-break minutes (can exceed 100% only via backlog carried into overtime, capped +30, after which it indicates unmet demand - reported as $>100\%^*$). `utilization_fairness` = qualitative from spread/Gini across available resources: Good = max-min $\le20$pp, Fair 20-35pp, Poor $>35$pp or a person pinned at cap while an eligible peer is idle. `handover_or_setup_burden` = penalty minutes per case. `resilience` = High/Moderate/Low judgement under $J_2$: ability to keep P1 service and fairness when the named shock hits, without heroic overtime. P3 SLA is discussed in text: given Section 2 overload, 24h attainment depends entirely on next-day capacity not supplied, so ranking policies by P3 alone is not identifiable from the prompt.
+
+| policy $\times$ scenario | mean_delay (min) | p90_or_p95_delay (min) | P1_SLA | P2_SLA | max_resource_utilization | utilization_fairness | handover_or_setup_burden | resilience | main_failure_mode |
+|---|---|---|---|---|---|---|---|---|---|
+| P-A Strict, Base | 240-360 | p90 600-900 | 35-55% | 45-65% | 95-100%* (Chen/Ben) | Poor: Farah/Emil idle windows vs Chen saturated | Low: 5-10/case | Low | Fixed queues strand Software on Chen/Farah mornings, Mechanical idle capacity cannot help Electrical peak |
+| P-B Pooling, Base | 180-260 | p90 480-780 | 50-70% | 60-80% | 92-100%* | Fair | High: 14-22/case | Moderate | Handover/setup churn and always-parallel ME/ES consume the capacity pooling creates; Validation queue at 16-20 |
+| P-C Hybrid, Base | 190-280 | p90 450-720 | 60-78% | 62-82% | 88-97% | Fair-Good | Medium: 9-15/case | Moderate-High | Reserve occasionally idles Tier-1 minutes in quiet gaps; evening thin cover still binds |
+| P-D SERT, Base | 160-240 | p95 650-1000 | 45-65% | 55-75% | 92-100%* | Fair-Poor | High: 13-20/case | Moderate | Best mean, worst tail for complex/multi-branch cases; estimate-gaming incentive strongest |
+| P-A Strict, U1 | 420-650 | p90 1000+ | 15-30% | 25-45% | $>100\%^*$ | Poor | Low 5-10 | Low | Morning queues calcify; backlog hits 14-16 peak; no mechanism to borrow |
+| P-B Pooling, U1 | 320-500 | p90 850-1200 | 30-50% | 40-60% | $>100\%^*$ | Fair | High 16-24 | Moderate | Preemption thrash and parallel branch contention in surge |
+| P-C Hybrid, U1 | 330-520 | p90 800-1150 | 40-60% | 42-62% | 98-$>100\%^*$ | Fair | Medium 10-16 | High (relative) | Even reserved cover is overwhelmed by 1.7$\times$ volume; P1 improves, P2/P3 sacrifice is explicit |
+| P-D SERT, U1 | 300-480 | p95 1000+ | 28-45% | 38-58% | $>100\%^*$ | Poor | High | Moderate-Low | Long/complex P2s starved behind short jobs all day |
+| P-A Strict, U2 | 380-560 | p90 900-1200 | 25-40% | 35-55% | $>100\%^*$ Chen/Deepa | Poor: Ben underused | Low | Low | Electrical/Software incident cannot use Mechanical slack - designed-in failure |
+| P-B Pooling, U2 | 260-400 | p90 650-950 | 45-65% | 55-75% | 95-$>100\%^*$ | Fair | High | Moderate-High | Ada/Emil at 1.30-1.35 become slow Electrical overflow; coordination load |
+| P-C Hybrid, U2 | 260-410 | p90 620-920 | 52-70% | 57-77% | 92-100%* | Fair-Good | Medium | High | Controlled Tier-2 overflow works; bottleneck becomes Validation late afternoon |
+| P-D SERT, U2 | 240-380 | p95 800-1200 | 42-60% | 52-70% | 95-$>100\%^*$ | Fair-Poor | High | Moderate | ES cases (long remaining) deprioritised precisely in an ES incident |
+| P-A Strict, U3 (no Chen) | 500-800 | p90 1200+ | 10-25% | 20-40% | $>100\%^*$ Deepa | Poor | Low | Low | Morning Software = Farah 1.40 only; Electrical loses its joint-fastest resource |
+| P-B Pooling, U3 | 380-600 | p90 1000-1400 | 25-40% | 32-52% | $>100\%^*$ | Fair-Poor | High | Moderate | Pooling redistributes an absolute shortage; Ada 1.35 Electrical becomes de facto primary |
+| P-C Hybrid, U3 | 390-620 | p90 950-1350 | 32-48% | 35-55% | $>100\%^*$ Deepa/Emil | Fair | Medium | Moderate-High | Reserve cannot reserve an absent person; gain is triage transparency, not capacity |
+| P-D SERT, U3 | 360-580 | p95 1200+ | 22-38% | 30-50% | $>100\%^*$ | Poor | High | Low-Moderate | Short-job bias hides collapse of complex Electrical/Software tail |
+| P-A Strict, U4 | 300-450 | p95 800-1200 | 28-45% | 40-60% | 98-$>100\%^*$ | Poor | Low | Low | One complex case blocks a fixed queue for 60-100 min with no bypass |
+| P-B Pooling, U4 | 230-350 | p95 700-1100 | 40-58% | 52-70% | 95-$>100\%^*$ | Fair | High | Moderate | Predicted-finish uses means, repeatedly blindsided by tail draws |
+| P-C Hybrid, U4 | 240-360 | p95 680-1050 | 48-65% | 54-72% | 92-100%* | Fair-Good | Medium | High (relative) | Preemption + reserve specifically protect P1 from behind-tail-queue risk; victims' penalty bounded by once-only rule |
+| P-D SERT, U4 | 210-330 | p95 900-1400 | 35-52% | 48-66% | 95-$>100\%^*$ | Poor | High | Low-Moderate | SERT is maximally exposed: tail cases are always "longest remaining" |
+| P-A Strict, U5 | 650-950 | p90 1400+ | 5-15% | 12-28% | $>100\%^*$ | Poor | Low | Low | Outage pulse + surge + no Chen compounds in fixed queues; P1 effectively unprotected after 10:00 |
+| P-B Pooling, U5 | 480-750 | p90 1200-1600 | 18-32% | 25-42% | $>100\%^*$ | Poor | Very high 18-26 | Moderate-Low | Pooling without reserve spends Deepa/Ada on P2/P3 before the post-outage P1 pulse lands |
+| P-C Hybrid, U5 | 500-780 | p90 1150-1550 | 28-42% | 28-45% | $>100\%^*$ | Fair-Poor | Medium 11-17 | Moderate (best available) | Absolute capacity deficit dominates; policy limits damage and keeps audit trail, cannot meet targets |
+| P-D SERT, U5 | 460-720 | p95 1400+ | 15-30% | 22-40% | $>100\%^*$ | Poor | High | Low | Mean looks least-bad while P1 and complex-case tails fail - the exact trap O3 sets |
+
+Interpretation cautions: (1) No policy credibly reaches the stated 90% SLA targets under U5, and probably not in Base for P1 within-day, given Section 2's arithmetic; the table ranks *damage limitation*, not compliance. (2) P-B wins or ties on mean in most rows; P-C wins on P1_SLA, p90, fairness and resilience - that divergence is the central finding, and which one is "better" is determined by choosing O1/O2 over O3, explicitly. (3) P-A's low handover burden is real but is purchased with idle eligible capacity; burden per case is a bad standalone KPI.
+
+# 5. Robust recommendation
+
+## Primary recommendation: Policy P-C (hybrid), operated in two modes
+
+Adopt P-C as the primary policy under objectives O1+O2. It does not dominate P-B on mean delay - P-B is typically 5-10% faster on mean in the table - and I do not claim dominance in the strict sense. It offers the best defensible trade-off: near-pooling mean performance, materially better P1 tail protection, lower handover churn than full pooling, explicit fairness guardrails, and graceful degradation because its reserve is a *rule over Tier-1 assignments* rather than dependence on one named individual. Under U2 and U4, the scenarios most likely to occur in milder form on ordinary bad days, P-C is first or tied-first on the criteria that matter. Under U3/U5 no policy succeeds; P-C fails most transparently and triages deliberately rather than by queue accident.
+
+## Fallback / surge mode and switching triggers
+
+Switch from P-C Normal to **P-C Surge** (a tightened variant, not a different philosophy) when any trigger fires, checked every 15 min by the dispatcher on duty with the trigger logged:
+
+- **T1 Volume:** arrivals in rolling 60 min $\ge 1.4\times$ block expectation, or Intake queue $\ge5$.
+- **T2 P1 risk:** any P1 predicted to breach 120 min, or $\ge2$ P1 waiting.
+- **T3 Skill saturation:** projected utilisation for any skill in the next 2 hours $>90\%$, or Tier-1 wait for Electrical/Software $>30$ min.
+- **T4 Absence/outage:** any Tier-1 resource absent, or Intake blocked $>15$ min (U3/U5 detector).
+
+In Surge mode: parallelisation restricted to P1 only; Tier-3 (Farah-type 1.40) overflow pre-authorised rather than trigger-by-trigger; P3 diagnostics are *visibly deferred* (dispatcher records deferral, P3s retain aging promotion); preemption threshold drops to P1 wait $>10$ min with the same once-only and no-last-5-minutes protections; Validation protection becomes absolute for predicted P1. Exit Surge when all triggers are clear for 60 consecutive minutes, to avoid oscillation.
+
+Escalation beyond dispatch: if T3/T4 persists $>2$ hours, the honest recommendation is capacity escalation (call-in, extending a shift beyond the 30-min overtime cap requires changing a supplied constraint, or diverting P3 demand to next day with customer notification). No routing policy can manufacture the missing $\approx$230+ min/day, and pretending otherwise in an SLA report would be a governance failure.
+
+## When another policy would be preferable
+
+- If leadership explicitly chooses O3 (mean only) and accepts tail/fairness consequences in writing, P-B is preferable and simpler to explain as "earliest predicted finish wins".
+- If audit/regulatory constraints forbid dynamic reprioritisation and preemption, P-A is preferable despite worse performance, because its behaviour is trivially predictable - but then SLA targets should be renegotiated, since P-A misses them by the widest margin.
+- P-D is preferable only as a short-horizon throughput experiment in a period with no P1 exposure; its tail behaviour disqualifies it as a standing policy.
+
+# 6. Secondary effects and implementation risks
+
+**Gaming of estimates.** Any predicted-finish or SERT rule creates incentive to understate case complexity at Intake (to jump queues) or overstate it (to claim a fast resource). Mitigations: estimates generated from the A1 table by activity/type, not free-text by the handler; log estimated vs actual per case (Section 7); audit resources/teams whose actual/estimated ratio drifts; never use individual estimate accuracy punitively or gaming will go underground.
+
+**Starvation of P3 work.** Hard tiers plus Surge deferral can strand P3s indefinitely on repeated bad days, converting a 24h SLA into a fiction and storing up a aged-case bulge. The aging promotion ($>50\%$ of SLA) and protected exit-from-Surge criteria are therefore load-bearing, not decorative. Monitor oldest-P3 age as a first-class indicator.
+
+**Skill erosion and the Farah trap.** Tier-3 labelling (1.40 everywhere) risks Farah never receiving developmental work, while Tier-1 staff never cross-train because pooling always picks the fastest. Conversely, aggressive pooling can deskill specialists through constant family switching (also taxed by the 5-min setup). Mitigation: reserve a small, explicit fraction (e.g. 10%) of *low-priority* work for supervised cross-training, counted in utilisation fairness, and rotate it. Note Farah's 08:00-12:00 shift also means any policy depending on her for afternoon overflow is invalid by construction.
+
+**Excessive preemption.** Each preemption costs the victim 10% of remaining time plus re-immersion not fully modelled, and costs trust. The once-only rule, no-preemption in the last 5 active minutes, and victim resume priority bound this; a per-shift preemption budget (suggest $\le4$, dispatcher-logged exceptions) prevents P1 protection becoming routine P2/P3 abuse. In U1/U5 the temptation to exceed the budget will be strongest exactly when penalties hurt most.
+
+**Coordination overhead creep.** Parallel ME/ES looks attractive case-by-case while taxing the system 8 min plus dual contention. If parallel share drifts above ~40% of multi-branch cases, audit whether the threshold rule is being bypassed informally ("just grab someone"). Coordination minutes should be a logged activity cost, not absorbed invisibly.
+
+**New bottlenecks at Validation and Intake.** Optimising diagnostics in isolation displaces the queue. Evening Validation (Deepa/Emil only) and the U5 Intake gate are the two named risks; P-C's Validation protection and Intake-queue trigger T1 address them, but a Validation-specific utilisation indicator is required because case-level "waiting time" from PM4Py will otherwise misattribute Validation queueing to diagnostic stages (see Section 7 coding caution).
+
+**Fairness and human interpretability.** Utilisation fairness is not cosmetic: a policy that routinely pins Deepa (10:00-18:00, both fast skills) while Ben is idle will produce absence - the U3 scenario - as an endogenous outcome. Dispatchers must be able to answer "why this resource?" in one sentence from logged score components. If the score cannot be explained at the desk, operators will shadow-override it, and the event log will then describe a policy nobody is actually running. That interpretability constraint is a genuine argument for P-C's tier-plus-threshold structure over a black-box optimiser.
+
+# 7. Monitoring and process-mining design
+
+## Event attributes to capture (per event/stage, interval log)
+
+Identity/context: `case:concept:name`, case type (M/E/S/ME/ES), priority, arrival timestamp, SLA deadline, scenario/shock flag (Base/U1..U5/unknown), policy version and mode (Normal/Surge). Stage: `concept:name` (Intake, Mathematical/Mechanical, Electrical, Software, Validation, plus explicit Handover, Setup, Coordination, Pause/Resume pseudo-events or attributes), `start_timestamp`, `time:timestamp` (complete), `org:resource`, assigned skill used. Decision audit: queue-entry timestamp, eligible-resource set at decision, each candidate's predicted finish, chosen-resource predicted finish, priority score components, reservation state, overflow trigger fired, parallel/sequential decision and branches' resource pair. Execution truth: planned/estimated service, actual active service, waiting before start, pause start/end with preemptor case id, preemption penalty minutes, handover from/to resource with 7/5-min components, setup minutes and previous family, coordination minutes, break/shift/overtime flags, completion and SLA outcome.
+
+Without queue-entry and eligible-set attributes, process mining can describe what happened but cannot distinguish a bad policy from a bad day - conformance checking against the *decision rule* becomes impossible.
+
+## Indicators ( reviewed daily, by block and priority)
+
+P1/P2/P3 SLA attainment and p50/p90 flow time; queue length and wait by stage $\times$ skill $\times$ block; utilisation by resource against available (not clock) minutes and its spread; handover+setup+coordination minutes per case and as % of total; parallel share of ME/ES and their elapsed saving vs sequential matches; preemption count, penalty minutes, and victim outcomes; estimate bias (actual/estimated) by activity and resource; oldest P3 age; Validation queue wait specifically; Surge trigger frequency/duration.
+
+## PM4Py analyses and what each reveals
+
+- `pm4py.format_dataframe` to build the log with separate start/complete timestamps, preserving interval semantics.
+- `pm4py.insert_case_service_waiting_time` + `pm4py.get_service_time`: gives **case-level** aggregate service vs waiting across the whole case. Label it exactly that. It must *not* be reported as stage waiting: a case's waiting is the sum over Intake, diagnostic and Validation queues. Stage-specific waits are computed separately by grouping the interval dataframe by `concept:name` and differencing stage start minus previous stage complete (minus logged handover/coordination). Conflating these is the most likely analytical error in this deployment.
+- `pm4py.discover_handover_of_work_network` (and social-network metrics): reveals actual handover burden and whether it concentrates on Chen/Deepa/Emil; compare against the handover minutes *charged* - divergence indicates unlogged informal handovers.
+- Process discovery (e.g. Inductive Miner via `pm4py.discover_process_tree_inductive`) per policy version/scenario flag: reveals drift from the designed `Intake -> branch(es) -> Validation` flow, illicit parallelism, skipped Validation, and loop/rework not in the supplied model.
+- Performance DFG / stage duration aggregation: bottleneck migration over time (morning Software vs afternoon Electrical vs evening Validation) by filtering on block/scenario attributes.
+- Conformance against the dispatch rule cannot be done by process discovery alone; implement it as dataframe checks on logged eligible-set/score attributes (was the chosen resource argmin among eligible? was Tier-3 use preceded by a trigger?) and use PM4Py alignments only for control-flow conformance to the stage model.
+- Drift detection: rolling 7-day comparisons of service-time distributions by activity (actual vs A1 table), handover-network density, and parallel share, segmented by policy version; a step change after a policy release is deployment effect, a gradual change is behaviour/skill drift.
+
+# 8. Reproducible Python
+
+Exactly one code block follows. It implements a transparent scenario-capacity approximation plus a lightweight greedy Monte-Carlo dispatch simulator for P-A/P-B/P-C (P-D is described in text; the scaffold's `policy` switch can be extended). Preemption is modelled as an explicit bounded penalty/reserve approximation, not a true interrupt-resume event simulation, and parallel branches on one resource are summed while branches on two resources take the max plus coordination - both simplifications are printed by the code.
+
+```python
+"""
+Transparent scaffold: capacity approximation + greedy dispatch Monte Carlo.
+Simplifications (explicit): (1) greedy forward assignment, so preemption is a
+bounded penalty/reserve approximation, not true interrupt-resume; (2) handover/
+setup minutes are added to case elapsed time and, if OCCUPY=True, to resource
+busy time; (3) unfinished-at-horizon cases are flagged, SLA uses elapsed clock
+with next-day resumption NOT simulated (reported as horizon-censored).
+Requires: pandas, pm4py (numpy optional-free; uses stdlib random).
+"""
+import random, math
+import pandas as pd
+import pm4py
+
+# ---------------- Tables encoded in memory ----------------
+# activity: (ord_lo, ord_hi, tail_lo, tail_hi, tail_prob)
+SERVICE = {
+    "Intake":     (5, 8, 10, 14, 0.08),
+    "Mechanical": (18, 28, 35, 55, 0.15),
+    "Electrical": (22, 35, 40, 65, 0.18),
+    "Software":   (25, 40, 45, 80, 0.20),
+    "Validation": (10, 18, 22, 35, 0.12),
+}
+def svc_mean(a, tail_double=False):
+    lo, hi, tlo, thi, p = SERVICE[a]
+    p = min(1.0, p * (2 if tail_double else 1)) if a in ("Mechanical","Electrical","Software") else p
+    return (1 - p) * (lo + hi) / 2 + p * (tlo + thi) / 2
+def svc_draw(a, rng, tail_double=False):
+    lo, hi, tlo, thi, p = SERVICE[a]
+    p = min(1.0, p * 2) if (tail_double and a in ("Mechanical","Electrical","Software")) else p
+    return rng.uniform(tlo, thi) if rng.random() < p else rng.uniform(lo, hi)
+
+# resource: {activity: multiplier or None}, shift (min from 08:00), break
+RES = {
+    "Ada":   ({"Intake":1.00,"Mechanical":1.00,"Electrical":1.35,"Software":None,"Validation":1.15}, 0,   480, (255,285)),
+    "Ben":   ({"Intake":1.10,"Mechanical":1.00,"Electrical":None,"Software":None,"Validation":1.00}, 0,   480, (240,270)),
+    "Chen":  ({"Intake":1.10,"Mechanical":None,"Electrical":1.00,"Software":1.25,"Validation":1.10}, 0,   480, (270,300)),
+    "Deepa": ({"Intake":1.00,"Mechanical":1.25,"Electrical":1.00,"Software":None,"Validation":1.00}, 120, 600, (360,390)),
+    "Emil":  ({"Intake":1.10,"Mechanical":None,"Electrical":1.30,"Software":1.00,"Validation":1.00}, 240, 720, (480,510)),
+    "Farah": ({"Intake":1.00,"Mechanical":1.40,"Electrical":1.40,"Software":1.40,"Validation":1.20}, 0,   240, None),
+}
+# demand blocks: (start_min, expected_arrivals, P1,P2,P3 %, M,E,S,ME,ES %)
+BLOCKS = [
+    (0,   7,  (10,55,35), (30,25,15,20,10)),
+    (120, 9,  (15,55,30), (25,25,15,25,10)),
+    (240, 7,  (12,58,30), (22,28,18,20,12)),
+    (360, 10, (18,52,30), (20,30,18,20,12)),
+    (480, 6,  (10,50,40), (20,25,25,15,15)),
+    (600, 3,  (5,45,50),  (25,20,30,10,15)),
+]
+BRANCHES = {"M":["Mechanical"], "E":["Electrical"], "S":["Software"],
+            "ME":["Mechanical","Electrical"], "ES":["Electrical","Software"]}
+FAMILY = {"Mechanical":"MECH", "Electrical":"ELEC_SOFT", "Software":"ELEC_SOFT"}
+HANDOVER, CROSS_TEAM, SETUP, COORD = 7.0, 5.0, 5.0, 8.0
+PREEMPT_PENALTY_RATE, MAX_PREEMPT = 0.10, 1   # 10% of remaining, at most once
+OCCUPY_PENALTIES = True
+SLA = {"P1":120, "P2":480, "P3":1440}
+
+def scenario_cases(scn, rng):
+    """Generate case list [(arrival_min, priority, type)] for a scenario."""
+    cases = []
+    for (start, exp_arr, pri, mix) in BLOCKS:
+        arr, p1 = exp_arr, pri[0]
+        block_2h = start // 120
+        if scn in ("U1","U5") and start < 240:
+            arr *= 1.7; p1 += 8
+        pri2 = (p1, pri[1] - 4, 100 - p1 - (pri[1] - 4))  # keep P2/P3 split simple, labelled approx
+        m = list(mix)
+        if scn == "U2" and 240 <= start < 480:  # double E and ES, renormalise
+            m = [mix[0], mix[1]*2, mix[2], mix[3], mix[4]*2]
+        tot = sum(m); m = [x / tot * 100 for x in m]
+        n = rng.poisson(arr) if hasattr(rng, "poisson") else max(0, int(round(arr + rng.gauss(0, 1))))
+        for _ in range(n):
+            at = start + rng.uniform(0, 120)
+            if scn == "U5" and 90 <= at < 120:  # Intake outage 09:30-10:00 delays eligibility
+                at = 120.0
+            r = rng.uniform(0, 100)
+            pr = "P1" if r < pri2[0] else ("P2" if r < pri2[0] + pri2[1] else "P3")
+            r2, acc, typ = rng.uniform(0, 100), 0, "S"
+            for name, pct in zip(["M","E","S","ME","ES"], m):
+                acc += pct
+                if r2 <= acc: typ = name; break
+            cases.append((at, pr, typ))
+    return sorted(cases)
+
+def capacity_table():
+    rows = []
+    for (start, exp_arr, pri, mix) in BLOCKS:
+        mech = exp_arr * (mix[0] + mix[3]) / 100 * svc_mean("Mechanical")
+        elec = exp_arr * (mix[1] + mix[3] + mix[4]) / 100 * svc_mean("Electrical")
+        soft = exp_arr * (mix[2] + mix[4]) / 100 * svc_mean("Software")
+        other = exp_arr * (svc_mean("Intake") + svc_mean("Validation"))
+        staff = 0
+        for _, (_, s, e, brk) in RES.items():
+            lo, hi = max(start, s), min(start + 120, e)
+            if hi > lo:
+                staff += hi - lo
+                if brk and brk[0] < hi and brk[1] > lo:
+                    staff -= min(hi, brk[1]) - max(lo, brk[0])
+        rows.append({"block_start_min": start, "arrivals": exp_arr, "Mech_min": round(mech),
+                     "Elec_min": round(elec), "Soft_min": round(soft), "IntakeValid_min": round(other),
+                     "total_base_min": round(mech + elec + soft + other), "staff_min": staff,
+                     "lower_bound_pressure": round((mech + elec + soft + other) / staff, 2)})
+    return pd.DataFrame(rows)
+
+class PyRNG:  # stdlib-backed shim with poisson approximation
+    def __init__(self, seed): self.r = random.Random(seed)
+    def random(self): return self.r.random()
+    def uniform(self, a, b): return self.r.uniform(a, b)
+    def gauss(self, m, s): return self.r.gauss(m, s)
+    def poisson(self, lam):
+        L, k, p = math.exp(-lam), 0, 1.0
+        while True:
+            p *= self.r.random()
+            if p <= L: return k
+            k += 1
+
+def eligible(act, scn):
+    return [r for r, (m, *_ ) in RES.items()
+            if m[act] is not None and not (scn in ("U3","U5") and r == "Chen")]
+
+def simulate(scn, policy, seed):
+    rng = PyRNG(seed)
+    tail2 = (scn == "U4")
+    free = {r: RES[r][1] for r in RES}          # next free minute
+    busy = {r: 0.0 for r in RES}
+    last_family = {r: None for r in RES}
+    events, results = [], []
+    def avail_from(r, t):  # respect break coarsely: if inside break, start at break end
+        _, s, e, brk = RES[r]
+        t = max(t, s)
+        if brk and brk[0] <= t < brk[1]: t = brk[1]
+        return t
+    def run_stage(cid, act, at, prev_res, pri, allow_parallel_peer=None):
+        cands = eligible(act, scn)
+        if policy == "P-A":  # strict: fastest-primary fixed preference lists
+            pref = {"Mechanical":["Ada","Ben","Deepa","Farah"], "Electrical":["Chen","Deepa","Ada","Emil","Farah"],
+                    "Software":["Emil","Chen","Farah"], "Intake":["Ada","Deepa","Farah","Chen","Ben","Emil"],
+                    "Validation":["Ben","Deepa","Emil","Chen","Ada","Farah"]}[act]
+            cands = [c for c in pref if c in cands] or cands
+        best = None
+        for r in cands:
+            mult = RES[r][0][act]
+            if policy == "P-C" and mult >= 1.40 and scn not in ("U1","U5"):
+                pass  # Tier-3 scaffold: still allowed but penalised below
+            start = avail_from(r, max(at, free[r]))
+            pen = 0.0
+            if prev_res is not None and prev_res != r:
+                pen += HANDOVER + (CROSS_TEAM if FAMILY.get(act) != FAMILY.get(prev_act[0]) else 0.0)
+            if act in FAMILY and last_family[r] not in (None, FAMILY[act]): pen += SETUP
+            if policy == "P-C" and mult >= 1.40: pen += 20.0  # Tier-3 reluctance, explicit
+            if policy == "P-B" and busy[r] > 400: pen += 10.0  # fairness guardrail, explicit
+            finish = start + pen * (1 if OCCUPY_PENALTIES else 0) + svc_mean(act, tail2) * mult
+            # NOTE: predicted finish uses means (transparent); actual duration drawn below.
+            if best is None or finish < best[0]: best = (finish, r, start, pen)
+        _, r, start, pen = best
+        dur = svc_draw(act, rng, tail2) * RES[r][0][act]
+        end = start + (pen if OCCUPY_PENALTIES else 0) + dur
+        free[r] = end; busy[r] += dur + (pen if OCCUPY_PENALTIES else 0)
+        if act in FAMILY: last_family[r] = FAMILY[act]
+        base = pd.Timestamp("2024-01-01 08:00")
+        events.append({"case:concept:name": cid, "concept:name": act,
+                       "start_timestamp": base + pd.Timedelta(minutes=float(start)),
+                       "time:timestamp": base + pd.Timedelta(minutes=float(end)), "org:resource": r})
+        return end, r, pen
+    prev_act = ["Intake"]  # mutable holder for cross-team check (scaffold)
+    for i, (at, pri, typ) in enumerate(scenario_cases(scn, rng)):
+        cid = f"{scn}-{policy}-{seed}-{i}"
+        t, r, pen_tot = at, None, 0.0
+        prev_act[0] = "Intake"
+        t, r, p = run_stage(cid, "Intake", t, r, pri); pen_tot += p
+        branches = BRANCHES[typ]
+        # parallel only per policy; two-resource case approximated by max of branch ends
+        do_par = len(branches) == 2 and ((policy == "P-B") or (policy == "P-C" and pri == "P1"))
+        if do_par:
+            ends = []
+            for b in branches:
+                prev_act[0] = b
+                e2, r2, p2 = run_stage(cid, b, t, r, pri); ends.append(e2); pen_tot += p2
+            t = max(ends) + COORD; pen_tot += COORD
+        else:
+            for b in branches:
+                prev_act[0] = b
+                t, r, p = run_stage(cid, b, t, r, pri); pen_tot += p
+        prev_act[0] = "Validation"
+        t, r, p = run_stage(cid, "Validation", t, r, pri); pen_tot += p
+        # Preemption approximation: P1 cases record a bounded expected penalty exposure.
+        preempt_pen = PREEMPT_PENALTY_RATE * svc_mean(branches[0], tail2) if pri == "P1" else 0.0
+        results.append({"scenario": scn, "policy": policy, "priority": pri, "type": typ,
+                          "flow_min": t - at, "penalty_min": pen_tot, "preempt_pen_approx": preempt_pen,
+                          "censored_at_horizon": t > 720 + 30})
+    res = pd.DataFrame(results)
+    ev = pd.DataFrame(events)
+    def sla(p): 
+        s = res[res.priority == p]; return round(100 * (s.flow_min <= SLA[p]).mean(), 1) if len(s) else float("nan")
+    summary = {"scenario": scn, "policy": policy, "n": len(res),
+               "mean_delay": round(res.flow_min.mean(), 0), "p90_delay": round(res.flow_min.quantile(0.90), 0),
+               "P1_SLA%": sla("P1"), "P2_SLA%": sla("P2"),
+               "max_util_note": "see busy dict in full run; capped by horizon in scaffold",
+               "penalty_per_case": round(res.penalty_min.mean(), 1),
+               "censored%": round(100 * res.censored_at_horizon.mean(), 1)}
+    return summary, res, ev, busy
+
+print("=== Base capacity approximation (A1 means, before multipliers/penalties) ===")
+print(capacity_table().to_string(index=False))
+
+all_rows, last_log = [], None
+for scn in ["Base", "U1", "U2", "U3", "U4", "U5"]:
+    for pol in ["P-A", "P-B", "P-C"]:
+        reps = [simulate(scn, pol, seed=100 + k) for k in range(3)]  # repeated seeds
+        agg = pd.DataFrame([r[0] for r in reps]).mean(numeric_only=True)
+        row = {"scenario": scn, "policy": pol, "mean_delay": round(agg.mean_delay, 0),
+               "p90_delay": round(agg.p90_delay, 0), "P1_SLA%": round(agg["P1_SLA%"], 1),
+               "P2_SLA%": round(agg["P2_SLA%"], 1), "penalty_per_case": round(agg.penalty_per_case, 1),
+               "censored%": round(agg["censored%"], 1)}
+        all_rows.append(row)
+        if scn == "Base" and pol == "P-C": last_log = reps[0][2]
+print("\n=== Policy x scenario (mean of 3 seeds; scaffold estimates, not measurements) ===")
+print(pd.DataFrame(all_rows).to_string(index=False))
+
+# ---------------- PM4Py post-analysis on emitted interval log ----------------
+log_df = pm4py.format_dataframe(last_log, case_id="case:concept:name", activity_key="concept:name",
+                                timestamp_key="time:timestamp", start_timestamp_key="start_timestamp")
+log_df = pm4py.insert_case_service_waiting_time(log_df)  # CASE-LEVEL service/waiting only
+print("\nCase-level service time (whole case, NOT stage-level):", pm4py.get_service_time(log_df))
+# Stage-specific waits computed separately (correct granularity):
+d = last_log.sort_values(["case:concept:name", "start_timestamp"]).copy()
+d["prev_complete"] = d.groupby("case:concept:name")["time:timestamp"].shift(1)
+d["stage_wait_min"] = (d["start_timestamp"] - d["prev_complete"]).dt.total_seconds() / 60
+print("\nStage-specific mean wait (min), computed separately from the interval log:")
+print(d.groupby("concept:name")["stage_wait_min"].mean().round(1).to_string())
+print("\nHandover-of-work network (social):")
+print(pm4py.discover_handover_of_work_network(log_df))
+print("\nOMITTED from scaffold: true interrupt-resume preemption events, break-internal"
+      " pause handling, next-day resumption, P-D SERT comparator, overtime authorisation workflow.")
+```
+
+# 9. Limits and validation plan
+
+## What cannot be concluded from the supplied information
+
+- **True SLA attainability.** Expected arrivals and ranges cannot identify arrival burstiness, within-block timing, correlation between case type and complexity, day-to-day variation, or next-day roster - all of which drive p90 and SLA. Section 2 proves tightness/overload at mean load, but exact SLA percentages in Section 4 are scenario estimates with stated uncertainty, not forecasts.
+- **Distribution shape.** Uniform-within-range (A1) is arbitrary; triangular, truncated-normal or bimodal draws with the same ranges change p90/p95 materially while leaving many means similar. U4 is precisely a warning that tail assumptions dominate conclusions.
+- **Whether penalties consume resource time**, whether setup resets on Intake/Validation, whether preemption penalty is on remaining-at-interruption (A4) or on restart-from-scratch, and whether parallel branches must synchronise before Validation in real work - each changes both capacity and the parallel/sequential threshold.
+- **Human factors**: fatigue within shift, learning, interruption cost beyond 10%, informal helping not captured as handovers, and absence probability (U3 is treated as a scenario, not a likelihood).
+- **Optimality.** No policy here is proven optimal; the greedy/transparent rules are auditable heuristics. A full stochastic optimisation might beat P-C on a chosen objective while being less interpretable and possibly less robust to misspecification.
+
+## Pilot / backtest design that distinguishes the policies without endangering P1
+
+**Phase 0 - Backtest on historical log (if available).** Replay at least 4-6 weeks of timestamped cases through the Section 8 scaffold calibrated per-activity (replace A1 uniforms with empirical distributions). Pre-register the comparison: primary endpoint P1 SLA and p90 flow under O1, secondary mean, fairness spread, handover minutes/case. A policy that only wins in-sample on mean is rejected at this gate.
+
+**Phase 1 - Shadow mode (2 weeks).** Run P-B and P-C scoring in parallel with the incumbent process, logging what *would* have been assigned (eligible set, predicted finishes) without affecting real dispatch. This measures estimate bias, predicted-vs-actual finish error, and how often P-C's reserve would have bound, with zero patient/case risk. It also reveals missing event attributes before they matter.
+
+**Phase 2 - Guarded live pilot (4 weeks, stepped-wedge by time block).** Apply P-C only in 10:00-16:00 blocks first (where capacity exists to absorb mistakes), retaining incumbent dispatch 08:00-10:00 and after 16:00 as concurrent control, then expand if gates pass. P1 protection overrides the experiment: any P1 predicted to breach is dispatched by the best available rule regardless of pilot arm, and that override is logged and analysed by intention-to-treat. Hard stopping rules: P1 SLA in pilot blocks falls $>10$pp vs control for 3 consecutive days; any resource exceeds agreed utilisation cap with no Surge trigger logged; preemptions exceed budget twice in a week; oldest P3 age doubles. Stopping reverts to incumbent immediately, not at a review meeting.
+
+**Phase 3 - Stress drills.** Tabletop plus simulated U3 (Chen absence) and U5 (outage) exercises before live reliance: the question is not whether SLA holds - Section 2 says it may not - but whether triggers fire, deferrals are explicit, and communication to P2/P3 requesters happens. Drill findings feed trigger thresholds T1-T4.
+
+**Decision rule for adoption.** Adopt P-C permanently only if, in Phases 1-2, it improves P1 SLA/p90 versus incumbent with no statistically credible worsening of fairness spread or P3 oldest-age beyond pre-agreed bounds. If only mean improves, the honest conclusion is that the organisation's stated objective is O3, and that choice - with its tail consequences - should be recorded as a governance decision rather than discovered after the next U5 day.
