@@ -592,7 +592,7 @@ _REASONING_PATTERNS = (
     r"muse-spark-1\.(?:1|2|3)(?:-|$)",
     r"muse-wonder(?:-|$)",
     r"gemini-4-argon(?:-|$)",
-    r"(?:^|-)claude-sonnet-5\.5(?:-|$)",
+    r"sonnet-5\.5(?:-|$)",
     r"haiku-5\.5(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
 )
@@ -609,6 +609,7 @@ _HIDDEN_REASONING_PATTERNS = (
     r"muse-spark-1\.(?:1|2|3)(?:-|$)",
     r"muse-wonder(?:-|$)",
     r"gemini-4-argon(?:-|$)",
+    r"sonnet-5\.5(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
 )
 
