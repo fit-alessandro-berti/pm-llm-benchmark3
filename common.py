@@ -527,6 +527,7 @@ _CLOSED_SOURCE_MODEL_MARKERS = (
 
 _OPEN_SOURCE_MODEL_EXCEPTIONS = (
     "muse-glimmer",
+    "muse-spark-open",
     "mimo-v2.5-pro",
     "mimo-v2.6",
 )
@@ -590,6 +591,7 @@ _REASONING_PATTERNS = (
     r"deepseek.*(?:r\d|v[4-9]|\d{2,})",
     r"(?:^|-)gemma-?[4-9]",
     r"muse-spark-1\.(?:1|2|3)(?:-|$)",
+    r"muse-spark-open(?:-|$)",
     r"muse-wonder(?:-|$)",
     r"gemini-4-argon(?:-|$)",
     r"sonnet-5\.5(?:-|$)",

@@ -4,40 +4,103 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 
 | Model                          | Score    | OS                 | LRM                | CCR                  | SQT                  | OCR                  | FMS                  | MCA                  | PPM                  | ORF                  | RPR                  |
 | ------------------------------ | -------- | ------------------ | ------------------ | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- | -------------------- |
+| deepseek-v4.1-flash-1017       | **39.1** | :white_check_mark: | :white_check_mark: | :mage_woman: **5.0** | :mage_woman: **4.8** | 4.6                  | **4.9**              | :mage_woman: **4.9** | :mage_woman: **5.0** | **4.9**              | :mage_woman: **5.0** |
 | moonshotaikimi-k3              | **38.4** | :white_check_mark: | :white_check_mark: | **4.9**              | 4.3                  | :mage_woman: **5.0** | :mage_woman: **5.0** | 4.3                  | **4.9**              | :mage_woman: **5.0** | :mage_woman: **5.0** |
 | qwen3.8-2.4t-a95b              | **38.2** | :white_check_mark: | :white_check_mark: | :mage_woman: **5.0** | 4.0                  | **4.8**              | :mage_woman: **5.0** | **4.7**              | **4.9**              | **4.8**              | :mage_woman: **5.0** |
-| deepseek-v4.1-flash            | **38.2** | :white_check_mark: | :white_check_mark: | **4.9**              | :mage_woman: **4.7** | **4.7**              | **4.8**              | :mage_woman: **4.8** | **4.8**              | **4.7**              | **4.8**              |
-| deepseek-v4-pro-0813           | **37.5** | :white_check_mark: | :white_check_mark: | **4.7**              | **4.4**              | **4.7**              | **4.8**              | **4.7**              | 4.6                  | **4.7**              | **4.8**              |
+| deepseek-v4.1-flash            | **38.2** | :white_check_mark: | :white_check_mark: | **4.9**              | **4.7**              | **4.7**              | **4.8**              | **4.8**              | **4.8**              | **4.7**              | **4.8**              |
+| deepseek-v4-pro-0813           | **37.5** | :white_check_mark: | :white_check_mark: | **4.7**              | 4.4                  | **4.7**              | **4.8**              | **4.7**              | 4.6                  | **4.7**              | **4.8**              |
 | qwen3.8-flash                  | **36.2** | :white_check_mark: | :white_check_mark: | **4.8**              | 3.9                  | **4.7**              | 4.4                  | 4.0                  | **4.9**              | **4.7**              | **4.9**              |
-| qwen3.8-27b                    | **36.0** | :white_check_mark: | :white_check_mark: | 4.6                  | 3.2                  | **4.8**              | 4.5                  | **4.5**              | **4.7**              | **4.8**              | **4.9**              |
+| metamuse-spark-open            | **36.2** | :white_check_mark: | :white_check_mark: | **4.7**              | 4.3                  | 4.5                  | 4.3                  | 4.6                  | 4.6                  | 4.5                  | **4.8**              |
+| qwen3.8-27b                    | **36.0** | :white_check_mark: | :white_check_mark: | 4.6                  | 3.2                  | **4.8**              | 4.5                  | 4.5                  | **4.7**              | **4.8**              | **4.9**              |
 | mistralaimistral-large-4-0     | **35.2** | :white_check_mark: | :white_check_mark: | 4.5                  | 4.0                  | 4.6                  | 4.1                  | **4.7**              | 4.1                  | 4.6                  | **4.8**              |
-| deepseek-v4-flash-0731         | **34.4** | :white_check_mark: | :white_check_mark: | 4.2                  | 3.8                  | 4.2                  | 4.6                  | **4.5**              | 4.2                  | 4.2                  | **4.7**              |
-| z-aiglm-5.3                    | **33.8** | :white_check_mark: | :white_check_mark: | **4.9**              | 2.2                  | 4.6                  | 3.0                  | 4.3                  | :mage_woman: **5.0** | **4.8**              | :mage_woman: **5.0** |
+| deepseek-v4-flash-0731         | **34.4** | :white_check_mark: | :white_check_mark: | 4.2                  | 3.8                  | 4.2                  | 4.6                  | 4.5                  | 4.2                  | 4.2                  | **4.7**              |
+| z-aiglm-5.3                    | **33.8** | :white_check_mark: | :white_check_mark: | **4.9**              | 2.2                  | 4.5                  | 3.0                  | 4.3                  | :mage_woman: **5.0** | **4.8**              | :mage_woman: **5.0** |
 | tencenthy3                     | **33.5** | :white_check_mark: | :white_check_mark: | 4.2                  | 4.1                  | 4.1                  | 4.2                  | 4.0                  | 4.5                  | **4.7**              | 3.8                  |
 | xiaomimimo-v2.6-flash          | **33.5** | :white_check_mark: | :white_check_mark: | **4.7**              | 2.1                  | 4.6                  | 3.9                  | 4.3                  | 4.4                  | 4.6                  | **4.9**              |
 | z-aiglm-5.3-flash              | **33.4** | :white_check_mark: | :white_check_mark: | **4.7**              | 3.4                  | 4.6                  | 3.3                  | 4.1                  | 4.5                  | 3.9                  | **4.9**              |
 | z-aiglm-5.2                    | **33.1** | :white_check_mark: | :white_check_mark: | 4.2                  | 3.8                  | 3.9                  | 4.2                  | 4.3                  | 4.3                  | 4.2                  | 4.2                  |
 | deepseek-v4-pro                | **31.9** | :white_check_mark: | :white_check_mark: | 3.9                  | 3.6                  | 3.9                  | 3.6                  | 4.0                  | 4.1                  | 4.4                  | 4.3                  |
 | xiaomimimo-v2.5-pro            | **31.6** | :white_check_mark: | :white_check_mark: | 4.1                  | 3.1                  | 3.9                  | 3.8                  | 4.1                  | 4.3                  | 4.1                  | 4.2                  |
-| xiaomimimo-v2.6-pro            | **31.2** | :white_check_mark: | :white_check_mark: | 4.5                  | 1.8                  | **4.8**              | 3.8                  | 3.6                  | 3.9                  | 4.0                  | **4.9**              |
+| xiaomimimo-v2.6-pro            | **31.2** | :white_check_mark: | :white_check_mark: | 4.4                  | 1.8                  | **4.8**              | 3.8                  | 3.6                  | 3.9                  | 4.0                  | **4.9**              |
 | metamuse-glimmer-30b           | **30.8** | :white_check_mark: | :white_check_mark: | 3.8                  | 3.7                  | 3.9                  | 3.2                  | 3.7                  | 4.0                  | 4.4                  | 4.3                  |
 | minimaxminimax-m3              | **29.8** | :white_check_mark: | :white_check_mark: | 4.0                  | 3.7                  | 3.8                  | 2.4                  | 3.3                  | 4.1                  | 4.3                  | 4.3                  |
 | qwen3.6-27b                    | **28.6** | :white_check_mark: | :white_check_mark: | 3.7                  | 3.0                  | 3.5                  | 2.8                  | 3.5                  | 3.6                  | 4.2                  | 4.2                  |
-| qwen3.5-397b-a17b              | **27.6** | :white_check_mark: | :white_check_mark: | 3.4                  | 3.0                  | 3.3                  | 3.4                  | 3.3                  | 3.4                  | 4.1                  | 3.9                  |
-| qwen3.6-35b-a3b                | **26.3** | :white_check_mark: | :white_check_mark: | 3.3                  | 2.8                  | 3.3                  | 2.4                  | 3.4                  | 3.4                  | 3.9                  | 3.7                  |
+| qwen3.5-397b-a17b              | **27.7** | :white_check_mark: | :white_check_mark: | 3.4                  | 3.0                  | 3.3                  | 3.4                  | 3.3                  | 3.4                  | 4.1                  | 3.9                  |
+| qwen3.6-35b-a3b                | **26.3** | :white_check_mark: | :white_check_mark: | 3.3                  | 2.8                  | 3.3                  | 2.4                  | 3.4                  | 3.4                  | 3.9                  | 3.6                  |
 | mistral-large-2512             | **25.9** | :white_check_mark: | :x:                | 3.2                  | 3.1                  | 3.3                  | 2.9                  | 3.1                  | 3.4                  | 3.6                  | 3.4                  |
 | mistral-medium-3-5             | **25.6** | :white_check_mark: | :x:                | 3.2                  | 2.9                  | 3.0                  | 2.8                  | 3.0                  | 3.3                  | 3.7                  | 3.5                  |
 | nemotron-3.5-lightning         | **25.0** | :white_check_mark: | :white_check_mark: | 2.7                  | 2.3                  | 3.6                  | 2.6                  | 3.0                  | 3.3                  | 3.8                  | 3.7                  |
-| qwen3.5-122b-a10b              | **24.7** | :white_check_mark: | :white_check_mark: | 2.8                  | 2.5                  | 3.0                  | 2.8                  | 2.8                  | 3.3                  | 3.8                  | 3.6                  |
+| qwen3.5-122b-a10b              | **24.7** | :white_check_mark: | :white_check_mark: | 2.8                  | 2.5                  | 2.9                  | 2.8                  | 2.8                  | 3.3                  | 3.8                  | 3.6                  |
 | inceptionmercury-2.5-preview   | **23.9** | :white_check_mark: | :x:                | 2.9                  | 2.6                  | 2.9                  | 2.5                  | 2.9                  | 3.2                  | 3.5                  | 3.4                  |
 | ibm-granitegranite-4.2-8b      | **23.3** | :white_check_mark: | :white_check_mark: | 2.7                  | 2.4                  | 2.8                  | 2.3                  | 2.6                  | 3.4                  | 3.6                  | 3.4                  |
 | mistral-small-2603             | **23.2** | :white_check_mark: | :x:                | 2.9                  | 2.5                  | 3.0                  | 2.5                  | 2.8                  | 3.0                  | 3.4                  | 3.2                  |
-| ministral-14b-2512             | **22.6** | :white_check_mark: | :x:                | 2.5                  | 2.4                  | 3.0                  | 2.5                  | 2.7                  | 2.9                  | 3.3                  | 3.2                  |
+| ministral-14b-2512             | **22.5** | :white_check_mark: | :x:                | 2.5                  | 2.4                  | 3.0                  | 2.5                  | 2.7                  | 2.9                  | 3.3                  | 3.2                  |
 | ministral-8b-2512              | **21.7** | :white_check_mark: | :x:                | 2.5                  | 2.2                  | 2.7                  | 2.5                  | 2.7                  | 2.8                  | 3.2                  | 3.1                  |
 | ibm-granitegranite-4.1-8b      | **20.5** | :white_check_mark: | :x:                | 2.6                  | 2.3                  | 2.5                  | 2.2                  | 2.5                  | 2.7                  | 2.7                  | 3.0                  |
 | qwen3.5-9b                     | **20.4** | :white_check_mark: | :white_check_mark: | 2.5                  | 2.0                  | 2.6                  | 2.3                  | 2.4                  | 2.4                  | 3.3                  | 2.9                  |
 | ministral-3b-2512              | **19.4** | :white_check_mark: | :x:                | 2.4                  | 2.0                  | 2.5                  | 2.3                  | 2.2                  | 2.3                  | 2.9                  | 2.8                  |
 | ibm-granitegranite-4.0-h-micro | **16.4** | :white_check_mark: | :x:                | 2.0                  | 1.7                  | 2.1                  | 1.9                  | 1.8                  | 2.0                  | 2.5                  | 2.4                  |
+
+### deepseekdeepseek-v4.1-flash-1017   => 39.1 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 6.9   |
+| cat01_02_staggered_automation                  | 7.2   |
+| cat01_03_flag_mediation                        | 7.2   |
+| cat01_04_conformance_root_cause                | 7.2   |
+| cat01_05_mixed_drift_attribution               | 7.3   |
+| cat01_06_intervention_transportability         | 6.7   |
+| cat01_07_case_counterfactuals                  | 7.1   |
+| cat02_01_reconstruct_partial_queue             | 7.2   |
+| cat02_02_infer_queue_disciplines               | 7.2   |
+| cat02_03_fork_join_delay_decomposition         | 7.1   |
+| cat02_04_batching_vs_bulk_logging              | 7.0   |
+| cat02_05_nonstationary_queue_regimes           | 7.3   |
+| cat02_06_sla_survival_censoring                | 6.9   |
+| cat02_07_robust_multiskill_staffing            | 5.6   |
+| cat03_01_case_notion_tradeoffs                 | 6.7   |
+| cat03_02_relation_repair                       | 6.7   |
+| cat03_03_cross_instance_bottlenecks            | 6.4   |
+| cat03_04_incomplete_norm_conformance           | 6.7   |
+| cat03_05_execution_equivalence_clustering      | 6.7   |
+| cat03_06_compact_ocel_pipeline                 | 6.9   |
+| cat03_07_duplicate_tie_cleaning                | 6.1   |
+| cat04_01_dual_formalism_synthesis              | 7.1   |
+| cat04_02_unsound_petri_net_repair              | 7.6   |
+| cat04_03_hybrid_procedural_declarative         | 6.1   |
+| cat04_04_sparse_evidence_model_completion      | 6.7   |
+| cat04_05_behavioral_equivalence_simplification | 7.6   |
+| cat04_06_conversion_semantic_loss_audit        | 6.9   |
+| cat04_07_adversarial_model_review              | 7.3   |
+| cat05_01_norm_hierarchy_conflicts              | 7.2   |
+| cat05_02_compensating_controls                 | 7.2   |
+| cat05_03_data_aware_obligations                | 6.1   |
+| cat05_04_uncertain_temporal_conformance        | 7.3   |
+| cat05_05_delegation_resource_conformance       | 6.9   |
+| cat05_06_alignment_business_severity           | 7.2   |
+| cat05_07_normative_model_dialectic             | 6.9   |
+| cat06_01_latent_state_next_event               | 6.9   |
+| cat06_02_competing_clocks_remaining_time       | 6.9   |
+| cat06_03_censored_outcome_study                | 7.2   |
+| cat06_04_capacity_aware_early_warning          | 6.9   |
+| cat06_05_process_aware_explanation_audit       | 7.4   |
+| cat06_06_conformant_next_best_action           | 6.9   |
+| cat06_07_process_evidence_drift_diagnosis      | 7.6   |
+| cat07_01_reconcile_org_networks                | 6.9   |
+| cat07_02_formal_shadow_roles                   | 6.9   |
+| cat07_03_collusion_or_necessity                | 7.1   |
+| cat07_04_procedural_fairness_complexity        | 7.3   |
+| cat07_05_learning_fatigue_queue_pressure       | 7.2   |
+| cat07_06_dynamic_resource_assignment           | 6.9   |
+| cat07_07_restructuring_impact                  | 7.1   |
+| cat08_01_conflicting_evidence_redesign         | 7.2   |
+| cat08_02_demand_shock_robustness               | 6.9   |
+| cat08_03_automation_portfolio_dependencies     | 7.2   |
+| cat08_04_sustainability_redesign               | 7.4   |
+| cat08_05_disruption_resilience_recovery        | 7.3   |
+| cat08_06_digital_twin_experiments              | 6.9   |
+| cat08_07_contradictory_evidence_memo           | 6.9   |
 
 ### moonshotaikimi-k3   => 38.4 points
 
@@ -343,6 +406,67 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_05_disruption_resilience_recovery        | 6.9   |
 | cat08_06_digital_twin_experiments              | 6.1   |
 | cat08_07_contradictory_evidence_memo           | 6.9   |
+
+### metamuse-spark-open   => 36.2 points
+
+| Question                                       | Score |
+| ---------------------------------------------- | ----- |
+| cat01_01_bottleneck_causality                  | 6.8   |
+| cat01_02_staggered_automation                  | 6.4   |
+| cat01_03_flag_mediation                        | 6.8   |
+| cat01_04_conformance_root_cause                | 7.1   |
+| cat01_05_mixed_drift_attribution               | 6.8   |
+| cat01_06_intervention_transportability         | 5.9   |
+| cat01_07_case_counterfactuals                  | 6.9   |
+| cat02_01_reconstruct_partial_queue             | 5.6   |
+| cat02_02_infer_queue_disciplines               | 6.7   |
+| cat02_03_fork_join_delay_decomposition         | 6.9   |
+| cat02_04_batching_vs_bulk_logging              | 6.1   |
+| cat02_05_nonstationary_queue_regimes           | 6.1   |
+| cat02_06_sla_survival_censoring                | 5.9   |
+| cat02_07_robust_multiskill_staffing            | 5.6   |
+| cat03_01_case_notion_tradeoffs                 | 6.6   |
+| cat03_02_relation_repair                       | 6.1   |
+| cat03_03_cross_instance_bottlenecks            | 6.7   |
+| cat03_04_incomplete_norm_conformance           | 7.2   |
+| cat03_05_execution_equivalence_clustering      | 6.1   |
+| cat03_06_compact_ocel_pipeline                 | 6.1   |
+| cat03_07_duplicate_tie_cleaning                | 6.0   |
+| cat04_01_dual_formalism_synthesis              | 6.1   |
+| cat04_02_unsound_petri_net_repair              | 6.1   |
+| cat04_03_hybrid_procedural_declarative         | 5.6   |
+| cat04_04_sparse_evidence_model_completion      | 6.7   |
+| cat04_05_behavioral_equivalence_simplification | 6.1   |
+| cat04_06_conversion_semantic_loss_audit        | 6.1   |
+| cat04_07_adversarial_model_review              | 6.4   |
+| cat05_01_norm_hierarchy_conflicts              | 5.9   |
+| cat05_02_compensating_controls                 | 6.9   |
+| cat05_03_data_aware_obligations                | 6.4   |
+| cat05_04_uncertain_temporal_conformance        | 6.1   |
+| cat05_05_delegation_resource_conformance       | 6.9   |
+| cat05_06_alignment_business_severity           | 6.9   |
+| cat05_07_normative_model_dialectic             | 7.2   |
+| cat06_01_latent_state_next_event               | 6.4   |
+| cat06_02_competing_clocks_remaining_time       | 6.1   |
+| cat06_03_censored_outcome_study                | 6.8   |
+| cat06_04_capacity_aware_early_warning          | 6.1   |
+| cat06_05_process_aware_explanation_audit       | 6.9   |
+| cat06_06_conformant_next_best_action           | 6.4   |
+| cat06_07_process_evidence_drift_diagnosis      | 6.9   |
+| cat07_01_reconcile_org_networks                | 6.4   |
+| cat07_02_formal_shadow_roles                   | 6.4   |
+| cat07_03_collusion_or_necessity                | 6.7   |
+| cat07_04_procedural_fairness_complexity        | 6.9   |
+| cat07_05_learning_fatigue_queue_pressure       | 6.4   |
+| cat07_06_dynamic_resource_assignment           | 5.6   |
+| cat07_07_restructuring_impact                  | 6.3   |
+| cat08_01_conflicting_evidence_redesign         | 6.7   |
+| cat08_02_demand_shock_robustness               | 6.3   |
+| cat08_03_automation_portfolio_dependencies     | 6.8   |
+| cat08_04_sustainability_redesign               | 6.9   |
+| cat08_05_disruption_resilience_recovery        | 7.2   |
+| cat08_06_digital_twin_experiments              | 6.8   |
+| cat08_07_contradictory_evidence_memo           | 7.2   |
 
 ### qwenqwen3.8-27b   => 36.0 points
 
@@ -1198,7 +1322,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 5.0   |
 | cat08_07_contradictory_evidence_memo           | 6.7   |
 
-### qwenqwen3.5-397b-a17b   => 27.6 points
+### qwenqwen3.5-397b-a17b   => 27.7 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
@@ -1747,7 +1871,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 4.5   |
 | cat08_07_contradictory_evidence_memo           | 5.5   |
 
-### ministral-14b-2512   => 22.6 points
+### ministral-14b-2512   => 22.5 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |

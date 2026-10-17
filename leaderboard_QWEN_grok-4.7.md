@@ -10,9 +10,9 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | qwen3.8-flash          | **36.2** | :white_check_mark: | :white_check_mark: | **4.8**              | 3.9                  | **4.7**              | 4.4                  | 4.0                  | **4.9**              | **4.7**              | **4.9**              |
 | qwen3.8-27b            | **36.0** | :white_check_mark: | :white_check_mark: | 4.6                  | 3.2                  | **4.8**              | 4.5                  | **4.5**              | **4.7**              | **4.8**              | **4.9**              |
 | qwen3.6-27b            | **28.6** | :white_check_mark: | :white_check_mark: | 3.7                  | 3.0                  | 3.5                  | 2.8                  | 3.5                  | 3.6                  | 4.2                  | 4.2                  |
-| qwen3.5-397b-a17b      | **27.6** | :white_check_mark: | :white_check_mark: | 3.4                  | 3.0                  | 3.3                  | 3.4                  | 3.3                  | 3.4                  | 4.1                  | 3.9                  |
-| qwen3.6-35b-a3b        | **26.3** | :white_check_mark: | :white_check_mark: | 3.3                  | 2.8                  | 3.3                  | 2.4                  | 3.4                  | 3.4                  | 3.9                  | 3.7                  |
-| qwen3.5-122b-a10b      | **24.7** | :white_check_mark: | :white_check_mark: | 2.8                  | 2.5                  | 3.0                  | 2.8                  | 2.8                  | 3.3                  | 3.8                  | 3.6                  |
+| qwen3.5-397b-a17b      | **27.7** | :white_check_mark: | :white_check_mark: | 3.4                  | 3.0                  | 3.3                  | 3.4                  | 3.3                  | 3.4                  | 4.1                  | 3.9                  |
+| qwen3.6-35b-a3b        | **26.3** | :white_check_mark: | :white_check_mark: | 3.3                  | 2.8                  | 3.3                  | 2.4                  | 3.4                  | 3.4                  | 3.9                  | 3.6                  |
+| qwen3.5-122b-a10b      | **24.7** | :white_check_mark: | :white_check_mark: | 2.8                  | 2.5                  | 2.9                  | 2.8                  | 2.8                  | 3.3                  | 3.8                  | 3.6                  |
 | qwen3.5-9b             | **20.4** | :white_check_mark: | :white_check_mark: | 2.5                  | 2.0                  | 2.6                  | 2.3                  | 2.4                  | 2.4                  | 3.3                  | 2.9                  |
 
 ### qwen3.8-max-2026-09-02   => 39.2 points
@@ -381,7 +381,7 @@ A score in the range **23-28** is considered **sufficient**; a score in the rang
 | cat08_06_digital_twin_experiments              | 5.0   |
 | cat08_07_contradictory_evidence_memo           | 6.7   |
 
-### qwenqwen3.5-397b-a17b   => 27.6 points
+### qwenqwen3.5-397b-a17b   => 27.7 points
 
 | Question                                       | Score |
 | ---------------------------------------------- | ----- |
