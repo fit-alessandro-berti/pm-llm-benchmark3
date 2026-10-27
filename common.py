@@ -597,6 +597,8 @@ _REASONING_PATTERNS = (
     r"sonnet-5\.5(?:-|$)",
     r"haiku-5\.5(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
+    r"kimi-k3\.1-pro(?:-|$)",
+    r"minimax-m3\.1-flash(?:-|$)",
 )
 
 _HIDDEN_REASONING_PATTERNS = (
