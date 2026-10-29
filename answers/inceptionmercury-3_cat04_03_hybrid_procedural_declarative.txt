@@ -1,0 +1,542 @@
+# 1. Policy Interpretation and Conflict Resolution
+
+## Material assumptions
+
+- A “case” is identified by `case:concept:name`; events are sorted by `time:timestamp`.
+- Activity labels are exactly the visible labels given in the scenario.
+- The event log has no `risk_classification` attribute, no `emergency` attribute, and no explicit joint-authorization event.
+- “Accepted” cases are recognized by the presence of `Activate Vendor`; “rejected” cases are recognized by `Reject Vendor`.
+- In the implemented model, **R5 is interpreted strictly**: after `Sanctions Escalation`, `Obtain Legal Opinion` must precede `Activate Vendor`.
+- R6 is treated as an external policy override that cannot be verified from the event log because its authorization is not logged.
+- Temporal deviations are warnings, not automatic control-flow violations.
+
+## Two possible resolutions of the R5/R6 conflict
+
+### Resolution 1: Strict R5, no unlogged emergency override
+
+`Obtain Legal Opinion` must be before `Activate Vendor` in every case containing `Sanctions Escalation`. The event log is the only conformance source, and unlogged authorizations are ignored.
+
+**Compliance risk:** legitimate emergency activations will be flagged as violations unless the external authorization is manually added to the case before checking. Operations will see false positives.
+
+### Resolution 2: R6 override with external authorization
+
+`Activate Vendor` may occur before `Obtain Legal Opinion` only when an external joint authorization exists, and the legal opinion must arrive within 24 hours. Because the event log does not contain the authorization attribute, this cannot be checked automatically from the event log alone.
+
+**Compliance risk:** unauthorized emergency activations could pass if the external authorization is not audited; the Legal department’s “under all circumstances” rule is relaxed.
+
+**Chosen implemented resolution:** Resolution 1, strict R5. R6 is represented in the external policy layer, but without the `emergency_authorization` attribute the trace is not accepted under the strict model.
+
+---
+
+# 2. Requirement-to-Formalism Mapping
+
+| Requirement | Primary formalism | Exact encoding | Why this formalism | Redundancy or limitation |
+|---|---|---|---|---|
+| R1 | Procedural Petri net | `Reject Vendor` and `Activate Vendor` are in exclusive outcome branches; no reachable marking enables both. DECLARE also has `noncoexistence(("Reject Vendor","Activate Vendor"))`; Log Skeleton has `never_together`. | Exclusive terminal outcomes are control-flow choices. | Duplicated across layers, but harmless and useful for reporting. |
+| R2 | Procedural Petri net | Accepted routes contain either `Manager Approval` or `Compliance Approval`; the reject route contains neither. The net does not produce both approvals in one case. | “Exactly one in accepted, none in rejected” is a routing/state property. | DECLARE cannot express the conditional exactly-one rule without an additional accepted/rejected state attribute. |
+| R3 | DECLARE | `response`, `altresponse`, and `precedence` on `("Request Clarification", "Receive Clarification")`. | Response and alternating response exactly capture “eventually receives” and “before the next request”. | The Petri net has an approximate clarification loop; DECLARE is authoritative. |
+| R4 | DECLARE | `response(("Sanctions Escalation", "Obtain Legal Opinion"))`. | “Eventually occurs” is a declarative response constraint. | Does not order the opinion relative to `Activate Vendor`; R5 covers that. |
+| R5 | Procedural Petri net + external check | Activation transitions require the `legal_done` token when escalation occurred. External check also verifies `index(Obtain Legal Opinion) < index(Activate Vendor)` in cases containing both. | Conditional precedence is not expressible in standard DECLARE templates; a Petri net can enforce it structurally. | This is the strict interpretation. R6 conflict is handled in the external policy layer. |
+| R6 | External policy/data validation | Requires `emergency_authorization` and a 24h legal-opinion deadline if activation precedes legal opinion. Because the attribute is absent, strict R5 applies. | Authorization is outside the event log; no activity-only formalism can express it. | Without the attribute, such traces are policy-dependent and cannot be automatically accepted. |
+| R7 | DECLARE | `precedence(("Run Sanctions Screening", "Sanctions Escalation"))`. | Simple precedence constraint. | Also enforced structurally in the Petri net: escalation consumes a token produced by `Run Sanctions Screening`. |
+| R8 | DECLARE | `noncoexistence(("Enhanced Due Diligence","Manager Approval"))` and `noncoexistence(("Compliance Approval","Manager Approval"))`. | “Should not co-occur” is non-coexistence. | Procedural XOR routing also prevents these pairs in normal cases. |
+| R9 | Resource/data-aware validation layer | Custom four-eyes checks comparing resources on `Verify Bank Account` vs approvals and `Capture Master Data` vs `Activate Vendor`. | Activity-only formalisms have no resource dimension. | Missing `org:resource` causes a fail-safe violation. |
+| R10 | Log Skeleton | `activ_freq = {"Reject Vendor": {0,1}, "Activate Vendor": {0,1}, "Release First Payment": {0,1}}`. | At-most-once is a cardinality invariant. | DECLARE lacks a native at-most-once template; `exactly_one` is unsuitable because rejected cases have zero occurrences. |
+| R11 | External data validation layer + optional procedural loop | If `Change Bank Details` occurs after `Activate Vendor`, require `Suspend Vendor` after it; for every later `Release First Payment`, require a `Verify Bank Account` between the change and release. | “Another Verify” is occurrence-specific and not expressible by standard DECLARE/log-skeleton constraints. | The Petri net includes `Change -> Suspend -> Verify -> Release` before first release. Changes after first release are deliberately outside the procedural scope. |
+| R12 | Temporal profile | `temporal_profile` dictionary with mean/std in seconds and `zeta = 2.0`. | Elapsed time is not a control-flow property. | Temporal deviations are warnings, not automatic rejections. |
+
+---
+
+# 3. Procedural Backbone
+
+## Compact formal description
+
+The procedural backbone is an accepting Petri net. A trace is accepted iff there is a complete firing sequence from the initial marking `{start}` to the final marking `{closed}`.
+
+The net represents:
+
+1. `Receive Onboarding Request` starts every case.
+2. A silent fork enables `Capture Master Data`, `Run Sanctions Screening`, and `Verify Bank Account` concurrently.
+3. `Classify Risk` is enabled only after all three checks have completed.
+4. An optional clarification loop is encoded with places `clarification_open` and `clarification_wait`:
+
+   - `Request Clarification` moves a token from `clarification_open` to `clarification_wait`.
+   - `Receive Clarification` moves it back.
+   - Final outcomes require `clarification_open`, so a pending clarification blocks activation/rejection.
+
+5. Sanctions escalation is optional:
+
+   - `Run Sanctions Screening` produces a token enabling either silent `No Escalation` or `Sanctions Escalation`.
+   - If escalation occurs, `Obtain Legal Opinion` must fire before activation or closing.
+
+6. After `Classify Risk`, the case chooses one of:
+
+   - reject route: `Reject Vendor -> Close Onboarding`;
+   - low-risk route: `Manager Approval -> Activate Vendor -> Release First Payment -> Close Onboarding`;
+   - high-risk route: `Enhanced Due Diligence -> Compliance Approval -> Activate Vendor -> Release First Payment -> Close Onboarding`.
+
+7. Post-activation behavior included before first release is `Change Bank Details -> Suspend Vendor -> Verify Bank Account -> Release First Payment`. Changes after the first release are deliberately excluded.
+
+## PM4Py code
+
+```python
+import pm4py
+from pm4py.objects.petri_net.obj import PetriNet, Marking
+
+
+def _place(net, name):
+    p = PetriNet.Place(name)
+    net.places.add(p)
+    return p
+
+
+def _trans(net, name, label=None):
+    t = PetriNet.Transition(name, label)
+    net.transitions.add(t)
+    return t
+
+
+def _arc(net, src, tgt):
+    a = PetriNet.Arc(src, tgt)
+    net.arcs.add(a)
+    return a
+
+
+net = PetriNet("VendorOnboarding")
+
+# Places
+p_start = _place(net, "start")
+p_after_receive = _place(net, "after_receive")
+p_capture_pending = _place(net, "capture_pending")
+p_sanctions_pending = _place(net, "sanctions_pending")
+p_bank_pending = _place(net, "bank_pending")
+p_clarification_open = _place(net, "clarification_open")
+p_capture_done = _place(net, "capture_done")
+p_sanctions_done = _place(net, "sanctions_done")
+p_bank_done = _place(net, "bank_done")
+p_clarification_wait = _place(net, "clarification_wait")
+p_sanctions_extra = _place(net, "sanctions_extra")
+p_no_escalation = _place(net, "no_escalation")
+p_escalated = _place(net, "escalated")
+p_legal_done = _place(net, "legal_done")
+p_classified = _place(net, "classified")
+p_low_approved = _place(net, "low_approved")
+p_edd_done = _place(net, "edd_done")
+p_high_approved = _place(net, "high_approved")
+p_rejected = _place(net, "rejected")
+p_activated = _place(net, "activated")
+p_changed = _place(net, "changed")
+p_suspended = _place(net, "suspended")
+p_verified_after_change = _place(net, "verified_after_change")
+p_released = _place(net, "released")
+p_closed = _place(net, "closed")
+
+# Transitions
+t_receive = _trans(net, "t_receive", "Receive Onboarding Request")
+t_fork = _trans(net, "t_fork")
+t_capture = _trans(net, "t_capture", "Capture Master Data")
+t_sanctions = _trans(net, "t_sanctions", "Run Sanctions Screening")
+t_verify = _trans(net, "t_verify", "Verify Bank Account")
+t_request = _trans(net, "t_request", "Request Clarification")
+t_receive_clarification = _trans(net, "t_receive_clarification", "Receive Clarification")
+t_no_escalation = _trans(net, "t_no_escalation")
+t_escalate = _trans(net, "t_escalate", "Sanctions Escalation")
+t_legal = _trans(net, "t_legal", "Obtain Legal Opinion")
+t_classify = _trans(net, "t_classify", "Classify Risk")
+t_reject = _trans(net, "t_reject", "Reject Vendor")
+t_manager = _trans(net, "t_manager", "Manager Approval")
+t_edd = _trans(net, "t_edd", "Enhanced Due Diligence")
+t_compliance = _trans(net, "t_compliance", "Compliance Approval")
+t_activate_low_no = _trans(net, "t_activate_low_no", "Activate Vendor")
+t_activate_low_legal = _trans(net, "t_activate_low_legal", "Activate Vendor")
+t_activate_high_no = _trans(net, "t_activate_high_no", "Activate Vendor")
+t_activate_high_legal = _trans(net, "t_activate_high_legal", "Activate Vendor")
+t_release_normal = _trans(net, "t_release_normal", "Release First Payment")
+t_change = _trans(net, "t_change", "Change Bank Details")
+t_suspend = _trans(net, "t_suspend", "Suspend Vendor")
+t_verify_after_change = _trans(net, "t_verify_after_change", "Verify Bank Account")
+t_release_after_change = _trans(net, "t_release_after_change", "Release First Payment")
+t_close_accepted = _trans(net, "t_close_accepted", "Close Onboarding")
+t_close_reject_no = _trans(net, "t_close_reject_no", "Close Onboarding")
+t_close_reject_legal = _trans(net, "t_close_reject_legal", "Close Onboarding")
+
+# Arcs
+_arc(net, p_start, t_receive)
+_arc(net, t_receive, p_after_receive)
+_arc(net, p_after_receive, t_fork)
+_arc(net, t_fork, p_capture_pending)
+_arc(net, t_fork, p_sanctions_pending)
+_arc(net, t_fork, p_bank_pending)
+_arc(net, t_fork, p_clarification_open)
+
+_arc(net, p_capture_pending, t_capture)
+_arc(net, t_capture, p_capture_done)
+
+_arc(net, p_sanctions_pending, t_sanctions)
+_arc(net, t_sanctions, p_sanctions_done)
+_arc(net, t_sanctions, p_sanctions_extra)
+
+_arc(net, p_bank_pending, t_verify)
+_arc(net, t_verify, p_bank_done)
+
+_arc(net, p_clarification_open, t_request)
+_arc(net, t_request, p_clarification_wait)
+_arc(net, p_clarification_wait, t_receive_clarification)
+_arc(net, t_receive_clarification, p_clarification_open)
+
+_arc(net, p_sanctions_extra, t_no_escalation)
+_arc(net, t_no_escalation, p_no_escalation)
+_arc(net, p_sanctions_extra, t_escalate)
+_arc(net, t_escalate, p_escalated)
+_arc(net, p_escalated, t_legal)
+_arc(net, t_legal, p_legal_done)
+
+_arc(net, p_capture_done, t_classify)
+_arc(net, p_sanctions_done, t_classify)
+_arc(net, p_bank_done, t_classify)
+_arc(net, t_classify, p_classified)
+
+_arc(net, p_classified, t_reject)
+_arc(net, p_clarification_open, t_reject)
+_arc(net, t_reject, p_rejected)
+
+_arc(net, p_classified, t_manager)
+_arc(net, t_manager, p_low_approved)
+
+_arc(net, p_classified, t_edd)
+_arc(net, t_edd, p_edd_done)
+_arc(net, p_edd_done, t_compliance)
+_arc(net, t_compliance, p_high_approved)
+
+_arc(net, p_low_approved, t_activate_low_no)
+_arc(net, p_no_escalation, t_activate_low_no)
+_arc(net, p_clarification_open, t_activate_low_no)
+_arc(net, t_activate_low_no, p_activated)
+
+_arc(net, p_low_approved, t_activate_low_legal)
+_arc(net, p_legal_done, t_activate_low_legal)
+_arc(net, p_clarification_open, t_activate_low_legal)
+_arc(net, t_activate_low_legal, p_activated)
+
+_arc(net, p_high_approved, t_activate_high_no)
+_arc(net, p_no_escalation, t_activate_high_no)
+_arc(net, p_clarification_open, t_activate_high_no)
+_arc(net, t_activate_high_no, p_activated)
+
+_arc(net, p_high_approved, t_activate_high_legal)
+_arc(net, p_legal_done, t_activate_high_legal)
+_arc(net, p_clarification_open, t_activate_high_legal)
+_arc(net, t_activate_high_legal, p_activated)
+
+_arc(net, p_activated, t_release_normal)
+_arc(net, t_release_normal, p_released)
+
+_arc(net, p_activated, t_change)
+_arc(net, t_change, p_changed)
+_arc(net, p_changed, t_suspend)
+_arc(net, t_suspend, p_suspended)
+_arc(net, p_suspended, t_verify_after_change)
+_arc(net, t_verify_after_change, p_verified_after_change)
+_arc(net, p_verified_after_change, t_release_after_change)
+_arc(net, t_release_after_change, p_released)
+
+_arc(net, p_released, t_close_accepted)
+_arc(net, t_close_accepted, p_closed)
+
+_arc(net, p_rejected, t_close_reject_no)
+_arc(net, p_no_escalation, t_close_reject_no)
+_arc(net, t_close_reject_no, p_closed)
+
+_arc(net, p_rejected, t_close_reject_legal)
+_arc(net, p_legal_done, t_close_reject_legal)
+_arc(net, t_close_reject_legal, p_closed)
+
+initial_marking = Marking({p_start: 1})
+final_marking = Marking({p_closed: 1})
+
+procedural_model = (net, initial_marking, final_marking)
+```
+
+## Explanation of modeling choices
+
+- **Concurrency**: the silent `t_fork` transition creates separate tokens for the three checks, so any interleaving of `Capture Master Data`, `Run Sanctions Screening`, and `Verify Bank Account` is allowed.
+- **Choices**: the `Classify Risk` place feeds three mutually exclusive paths: reject, low-risk, or high-risk.
+- **Clarification loops**: the places `clarification_open` and `clarification_wait` enforce alternating `Request Clarification` / `Receive Clarification` cycles. Final outcomes require `clarification_open`, so a pending clarification blocks activation and rejection.
+- **Terminal outcomes**: `Close Onboarding` can fire only after `Release First Payment` or after `Reject Vendor`, and any pending sanctions-legal token must be resolved.
+- **Post-activation behavior**: the net permits `Change Bank Details -> Suspend Vendor -> Verify Bank Account -> Release First Payment` before the first payment. Changes after first payment are deliberately excluded; those must be handled by the external data layer if they occur.
+
+---
+
+# 4. DECLARE Model
+
+```python
+declare_model = {
+    "init": {
+        "Receive Onboarding Request": {"support": 1.0, "confidence": 1.0}
+    },
+    "response": {
+        ("Request Clarification", "Receive Clarification"): {"support": 1.0, "confidence": 1.0},
+        ("Sanctions Escalation", "Obtain Legal Opinion"): {"support": 1.0, "confidence": 1.0},
+        ("Manager Approval", "Activate Vendor"): {"support": 1.0, "confidence": 1.0},
+        ("Compliance Approval", "Activate Vendor"): {"support": 1.0, "confidence": 1.0},
+        ("Enhanced Due Diligence", "Compliance Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Activate Vendor", "Release First Payment"): {"support": 1.0, "confidence": 1.0},
+        ("Release First Payment", "Close Onboarding"): {"support": 1.0, "confidence": 1.0},
+        ("Reject Vendor", "Close Onboarding"): {"support": 1.0, "confidence": 1.0},
+        ("Change Bank Details", "Suspend Vendor"): {"support": 1.0, "confidence": 1.0},
+    },
+    "precedence": {
+        ("Run Sanctions Screening", "Sanctions Escalation"): {"support": 1.0, "confidence": 1.0},
+        ("Classify Risk", "Manager Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Classify Risk", "Compliance Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Classify Risk", "Enhanced Due Diligence"): {"support": 1.0, "confidence": 1.0},
+        ("Classify Risk", "Reject Vendor"): {"support": 1.0, "confidence": 1.0},
+        ("Enhanced Due Diligence", "Compliance Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Request Clarification", "Receive Clarification"): {"support": 1.0, "confidence": 1.0},
+        ("Receive Onboarding Request", "Classify Risk"): {"support": 1.0, "confidence": 1.0},
+        ("Activate Vendor", "Release First Payment"): {"support": 1.0, "confidence": 1.0},
+        ("Release First Payment", "Close Onboarding"): {"support": 1.0, "confidence": 1.0},
+        ("Reject Vendor", "Close Onboarding"): {"support": 1.0, "confidence": 1.0},
+    },
+    "altresponse": {
+        ("Request Clarification", "Receive Clarification"): {"support": 1.0, "confidence": 1.0}
+    },
+    "noncoexistence": {
+        ("Reject Vendor", "Activate Vendor"): {"support": 1.0, "confidence": 1.0},
+        ("Enhanced Due Diligence", "Manager Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Compliance Approval", "Manager Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Reject Vendor", "Manager Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Reject Vendor", "Compliance Approval"): {"support": 1.0, "confidence": 1.0},
+        ("Reject Vendor", "Release First Payment"): {"support": 1.0, "confidence": 1.0},
+    },
+}
+```
+
+## DECLARE rule semantics
+
+| Rule | Direction | Meaning |
+|---|---|---|
+| `init` | `Receive Onboarding Request` | Every case starts with `Receive Onboarding Request`. |
+| `response` | `Request Clarification -> Receive Clarification` | Every clarification request is eventually followed by a clarification response. |
+| `altresponse` | `Request Clarification -> Receive Clarification` | Between two requests, a response must occur. |
+| `precedence` | `Request Clarification -> Receive Clarification` | Every response is preceded by a request. |
+| `response` | `Sanctions Escalation -> Obtain Legal Opinion` | Every escalation is eventually followed by a legal opinion. |
+| `precedence` | `Run Sanctions Screening -> Sanctions Escalation` | Escalation can occur only after sanctions screening. |
+| `precedence` | `Classify Risk -> Manager Approval`, `Classify Risk -> Compliance Approval`, `Classify Risk -> Enhanced Due Diligence`, `Classify Risk -> Reject Vendor` | All final-route activities occur after classification. |
+| `precedence` | `Enhanced Due Diligence -> Compliance Approval` | Compliance approval is preceded by EDD. |
+| `response` | `Manager Approval -> Activate Vendor` | Manager approval eventually leads to activation. |
+| `response` | `Compliance Approval -> Activate Vendor` | Compliance approval eventually leads to activation. |
+| `response` | `Enhanced Due Diligence -> Compliance Approval` | EDD eventually leads to compliance approval. |
+| `response` / `precedence` | `Activate Vendor -> Release First Payment` | Activation is followed by first payment; every first payment is preceded by activation. |
+| `response` / `precedence` | `Release First Payment -> Close Onboarding` | First payment is followed by close; close is preceded by first payment. |
+| `response` / `precedence` | `Reject Vendor -> Close Onboarding` | Rejection is followed by close; close is preceded by rejection. |
+| `response` | `Change Bank Details -> Suspend Vendor` | Every bank-details change is eventually followed by suspension. This is the partial activity-level part of R11. |
+| `noncoexistence` | pairs | The two activities never occur in the same case. This is used for R1 and R8. |
+
+I use `alternate response` rather than `chain response` because the clarification response need not be the immediately next event. I use `noncoexistence` rather than `nonsuccession` because R1/R8 forbid co-occurrence in both orders.
+
+---
+
+# 5. Log-Skeleton Model
+
+```python
+log_skeleton = {
+    "equivalence": {
+        ("Receive Onboarding Request", "Close Onboarding"),
+        ("Capture Master Data", "Run Sanctions Screening"),
+        ("Capture Master Data", "Verify Bank Account"),
+        ("Run Sanctions Screening", "Verify Bank Account"),
+        ("Activate Vendor", "Release First Payment"),
+        ("Request Clarification", "Receive Clarification"),
+        ("Sanctions Escalation", "Obtain Legal Opinion"),
+        ("Enhanced Due Diligence", "Compliance Approval"),
+    },
+    "always_before": {
+        ("Receive Onboarding Request", "Capture Master Data"),
+        ("Receive Onboarding Request", "Run Sanctions Screening"),
+        ("Receive Onboarding Request", "Verify Bank Account"),
+        ("Receive Onboarding Request", "Classify Risk"),
+        ("Capture Master Data", "Classify Risk"),
+        ("Run Sanctions Screening", "Classify Risk"),
+        ("Verify Bank Account", "Classify Risk"),
+        ("Run Sanctions Screening", "Sanctions Escalation"),
+        ("Classify Risk", "Manager Approval"),
+        ("Classify Risk", "Compliance Approval"),
+        ("Classify Risk", "Enhanced Due Diligence"),
+        ("Classify Risk", "Reject Vendor"),
+        ("Enhanced Due Diligence", "Compliance Approval"),
+        ("Request Clarification", "Receive Clarification"),
+        ("Sanctions Escalation", "Obtain Legal Opinion"),
+        ("Obtain Legal Opinion", "Activate Vendor"),
+        ("Manager Approval", "Activate Vendor"),
+        ("Compliance Approval", "Activate Vendor"),
+        ("Activate Vendor", "Release First Payment"),
+        ("Release First Payment", "Close Onboarding"),
+        ("Reject Vendor", "Close Onboarding"),
+    },
+    "always_after": {
+        ("Receive Onboarding Request", "Close Onboarding"),
+        ("Capture Master Data", "Classify Risk"),
+        ("Run Sanctions Screening", "Classify Risk"),
+        ("Verify Bank Account", "Classify Risk"),
+        ("Request Clarification", "Receive Clarification"),
+        ("Sanctions Escalation", "Obtain Legal Opinion"),
+        ("Manager Approval", "Activate Vendor"),
+        ("Compliance Approval", "Activate Vendor"),
+        ("Enhanced Due Diligence", "Compliance Approval"),
+        ("Activate Vendor", "Release First Payment"),
+        ("Release First Payment", "Close Onboarding"),
+        ("Reject Vendor", "Close Onboarding"),
+    },
+    "never_together": {
+        ("Reject Vendor", "Activate Vendor"),
+        ("Manager Approval", "Compliance Approval"),
+        ("Manager Approval", "Enhanced Due Diligence"),
+        ("Reject Vendor", "Manager Approval"),
+        ("Reject Vendor", "Compliance Approval"),
+        ("Reject Vendor", "Release First Payment"),
+    },
+    "activ_freq": {
+        "Receive Onboarding Request": {1},
+        "Capture Master Data": {1},
+        "Run Sanctions Screening": {1},
+        "Verify Bank Account": {1},
+        "Classify Risk": {1},
+        "Close Onboarding": {1},
+        "Reject Vendor": {0, 1},
+        "Activate Vendor": {0, 1},
+        "Release First Payment": {0, 1},
+        "Manager Approval": {0, 1},
+        "Compliance Approval": {0, 1},
+        "Enhanced Due Diligence": {0, 1},
+        "Sanctions Escalation": {0, 1},
+        "Obtain Legal Opinion": {0, 1},
+        "Change Bank Details": {0, 1},
+        "Suspend Vendor": {0, 1},
+    },
+    "directly_follows": {
+        ("Receive Onboarding Request", "Capture Master Data"),
+        ("Receive Onboarding Request", "Run Sanctions Screening"),
+        ("Receive Onboarding Request", "Verify Bank Account"),
+        ("Receive Onboarding Request", "Request Clarification"),
+        ("Capture Master Data", "Run Sanctions Screening"),
+        ("Capture Master Data", "Verify Bank Account"),
+        ("Capture Master Data", "Classify Risk"),
+        ("Capture Master Data", "Request Clarification"),
+        ("Run Sanctions Screening", "Capture Master Data"),
+        ("Run Sanctions Screening", "Verify Bank Account"),
+        ("Run Sanctions Screening", "Classify Risk"),
+        ("Run Sanctions Screening", "Request Clarification"),
+        ("Run Sanctions Screening", "Sanctions Escalation"),
+        ("Verify Bank Account", "Capture Master Data"),
+        ("Verify Bank Account", "Run Sanctions Screening"),
+        ("Verify Bank Account", "Classify Risk"),
+        ("Verify Bank Account", "Request Clarification"),
+        ("Request Clarification", "Receive Clarification"),
+        ("Request Clarification", "Classify Risk"),
+        ("Request Clarification", "Manager Approval"),
+        ("Request Clarification", "Enhanced Due Diligence"),
+        ("Request Clarification", "Sanctions Escalation"),
+        ("Receive Clarification", "Request Clarification"),
+        ("Receive Clarification", "Classify Risk"),
+        ("Receive Clarification", "Manager Approval"),
+        ("Receive Clarification", "Enhanced Due Diligence"),
+        ("Receive Clarification", "Sanctions Escalation"),
+        ("Receive Clarification", "Reject Vendor"),
+        ("Receive Clarification", "Activate Vendor"),
+        ("Classify Risk", "Request Clarification"),
+        ("Classify Risk", "Manager Approval"),
+        ("Classify Risk", "Enhanced Due Diligence"),
+        ("Classify Risk", "Reject Vendor"),
+        ("Classify Risk", "Sanctions Escalation"),
+        ("Sanctions Escalation", "Obtain Legal Opinion"),
+        ("Sanctions Escalation", "Enhanced Due Diligence"),
+        ("Sanctions Escalation", "Manager Approval"),
+        ("Sanctions Escalation", "Reject Vendor"),
+        ("Obtain Legal Opinion", "Compliance Approval"),
+        ("Obtain Legal Opinion", "Manager Approval"),
+        ("Obtain Legal Opinion", "Activate Vendor"),
+        ("Obtain Legal Opinion", "Reject Vendor"),
+        ("Obtain Legal Opinion", "Close Onboarding"),
+        ("Enhanced Due Diligence", "Compliance Approval"),
+        ("Enhanced Due Diligence", "Obtain Legal Opinion"),
+        ("Enhanced Due Diligence", "Request Clarification"),
+        ("Enhanced Due Diligence", "Sanctions Escalation"),
+        ("Manager Approval", "Activate Vendor"),
+        ("Manager Approval", "Request Clarification"),
+        ("Manager Approval", "Sanctions Escalation"),
+        ("Compliance Approval", "Activate Vendor"),
+        ("Compliance Approval", "Request Clarification"),
+        ("Compliance Approval", "Sanctions Escalation"),
+        ("Activate Vendor", "Release First Payment"),
+        ("Activate Vendor", "Change Bank Details"),
+        ("Change Bank Details", "Suspend Vendor"),
+        ("Suspend Vendor", "Verify Bank Account"),
+        ("Verify Bank Account", "Release First Payment"),
+        ("Release First Payment", "Close Onboarding"),
+        ("Reject Vendor", "Close Onboarding"),
+        ("Reject Vendor", "Obtain Legal Opinion"),
+    },
+}
+```
+
+## Orientation and overlap
+
+- `equivalence(A, B)` means `A` and `B` occur the same number of times in every conforming case.
+- `always_before(A, B)` means when both `A` and `B` occur, `A` occurs before `B`.
+- `always_after(A, B)` means when `A` occurs, `B` eventually occurs after it.
+- `never_together(A, B)` means `A` and `B` never occur in the same case.
+- `activ_freq[A]` is the set of allowed occurrence counts for `A`.
+- `directly_follows(A, B)` means `B` can be the immediate successor of `A`.
+
+This layer overlaps with the DECLARE layer. For example, `always_before(("Run Sanctions Screening", "Sanctions Escalation"))` duplicates the DECLARE precedence rule, and `never_together` duplicates `noncoexistence`. The main disagreement is under the R6 override: the strict rule `always_before(("Obtain Legal Opinion", "Activate Vendor"))` would no longer be valid if emergency activation before legal opinion were allowed.
+
+---
+
+# 6. Temporal Profile
+
+```python
+temporal_profile = {
+    ("Request Clarification", "Receive Clarification"): (48 * 3600, 24 * 3600),
+    ("Sanctions Escalation", "Obtain Legal Opinion"): (12 * 3600, 6 * 3600),
+    ("Activate Vendor", "Release First Payment"): (72 * 3600, 36 * 3600),
+}
+
+zeta = 2.0
+```
+
+The values are in seconds:
+
+- `48 * 3600 = 172800` seconds, standard deviation `86400` seconds.
+- `12 * 3600 = 43200` seconds, standard deviation `21600` seconds.
+- `72 * 3600 = 259200` seconds, standard deviation `129600` seconds.
+
+Temporal deviations are warnings rather than automatic control-flow violations because elapsed time is normative, not descriptive of the allowed process structure. A late legal opinion or a late first payment may be caused by workload, waiting time, or external dependencies. R12 explicitly says these are “normative enough to flag but not automatically reject.”
+
+---
+
+# 7. Resource- and Data-Aware Checks
+
+The following checks are executable-style Python. They assume `log` is a pandas DataFrame with columns including `case:concept:name`, `concept:name`, `time:timestamp`, and optionally `org:resource`.
+
+```python
+import pandas as pd
+
+
+def iter_cases(log):
+    log = log.sort_values("time:timestamp")
+    for cid, grp in log.groupby("case:concept:name", sort=False):
+        yield cid, grp.to_dict("records")
+
+
+def check_segregation_of_duties(log):
+    """
+    R9:
+    - Verify Bank Account resource != applicable approval resource
+    - Capture Master Data resource != Activate Vendor resource
+
+    Required attributes: org:resource.
+    Missing resource: fail-safe violation.
+    """
+    if "org:resource" not in log.columns:
+        return [("__global__", "missing
