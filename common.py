@@ -595,6 +595,7 @@ _REASONING_PATTERNS = (
     r"muse-wonder(?:-|$)",
     r"gemini-4-argon(?:-|$)",
     r"sonnet-5\.5(?:-|$)",
+    r"mercury-3(?:-|$)",
     r"haiku-5\.5(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
     r"kimi-k3\.1-pro(?:-|$)",
@@ -614,6 +615,7 @@ _HIDDEN_REASONING_PATTERNS = (
     r"muse-wonder(?:-|$)",
     r"gemini-4-argon(?:-|$)",
     r"sonnet-5\.5(?:-|$)",
+    r"mercury-3(?:-|$)",
     r"mistral-large-4-0(?:-|$)",
 )
 
