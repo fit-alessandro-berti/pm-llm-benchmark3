@@ -9,16 +9,16 @@ The prompts are reported in the *questions/* folder (56 textual tasks: 7 prompts
 
 ## Categories (three-letter codes)
 
-| Code | Category | Focus |
-| --- | --- | --- |
-| **CCR** | Causal and Counterfactual Process Reasoning | Attribution, mediation, transportability, and case-level counterfactuals under process constraints |
-| **SQT** | Stochastic Performance, Queue Mining, and Temporal Statistics | Queues, delay decomposition, non-stationarity, censoring, and staffing under imperfect timing data |
-| **OCR** | Object-Centric and Cross-Instance Process Reasoning | Case notions, OCEL relations, cross-instance bottlenecks, and object-centric conformance |
-| **FMS** | Formal Process-Model Synthesis, Equivalence, and Repair | Process trees, Petri nets, POWL/BPMN conversions, soundness repair, and model critique |
-| **MCA** | Multi-Perspective Conformance and Compliance Argumentation | Conflicting norms, data-aware and temporal conformance, severity, and dialectical defense of norms |
-| **PPM** | Predictive Process Monitoring under Uncertainty | Next-state and remaining-time prediction, censoring, early warning, explanations, and drift |
-| **ORF** | Organizational Mining, Resource Reasoning, and Procedural Fairness | Org networks, shadow roles, collusion vs necessity, fairness, and restructuring impact |
-| **RPR** | Robust Process Redesign, Optimization, and Strategic Reasoning | Multi-objective redesign, shocks, automation portfolios, sustainability, resilience, and decision memos |
+| Number | Code | Category | Focus |
+| --- | --- | --- | --- |
+| `cat01` | **CCR** | Causal and Counterfactual Process Reasoning | Attribution, mediation, transportability, and case-level counterfactuals under process constraints |
+| `cat02` | **SQT** | Stochastic Performance, Queue Mining, and Temporal Statistics | Queues, delay decomposition, non-stationarity, censoring, and staffing under imperfect timing data |
+| `cat03` | **OCR** | Object-Centric and Cross-Instance Process Reasoning | Case notions, OCEL relations, cross-instance bottlenecks, and object-centric conformance |
+| `cat04` | **FMS** | Formal Process-Model Synthesis, Equivalence, and Repair | Process trees, Petri nets, POWL/BPMN conversions, soundness repair, and model critique |
+| `cat05` | **MCA** | Multi-Perspective Conformance and Compliance Argumentation | Conflicting norms, data-aware and temporal conformance, severity, and dialectical defense of norms |
+| `cat06` | **PPM** | Predictive Process Monitoring under Uncertainty | Next-state and remaining-time prediction, censoring, early warning, explanations, and drift |
+| `cat07` | **ORF** | Organizational Mining, Resource Reasoning, and Procedural Fairness | Org networks, shadow roles, collusion vs necessity, fairness, and restructuring impact |
+| `cat08` | **RPR** | Robust Process Redesign, Optimization, and Strategic Reasoning | Multi-objective redesign, shocks, automation portfolios, sustainability, resilience, and decision memos |
 
 ## Textual Question Index
 
