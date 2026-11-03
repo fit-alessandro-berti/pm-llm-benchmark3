@@ -30,11 +30,11 @@ from utils.script_bootstrap import REPO_ROOT
 from utils.table_per_model import match_regex
 
 
-TARGET_MODEL = "gpt-5.6-terra"
+TARGET_MODEL = "gpt-6-luna"
 TARGET_REASONING_EFFORT = "low"
 MAX_WORKERS = 80
 DEFAULT_RETRY_DELAY_SECONDS = 17.0
-EVALUATION_FOLDER = Path("evaluation-gpt-5.6-terra")
+EVALUATION_FOLDER = Path("evaluation-gpt-6-luna")
 
 _print_lock = threading.Lock()
 
