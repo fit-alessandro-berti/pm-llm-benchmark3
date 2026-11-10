@@ -21,10 +21,6 @@ def read_contents(file_path):
 
 
 def copy_to_clipboard(text):
-    try:
-        import pyperclip
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("pyperclip is required for clipboard operations.") from exc
     pyperclip.copy(text)
 
 
@@ -82,10 +78,15 @@ for q in questions:
             proceed = True
 
     if proceed:
-        copy_to_clipboard(question)
-
         F = open(answer_path, "w")
         F.close()
+
+        try:
+            import pyperclip
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("pyperclip is required for clipboard operations.") from exc
+
+        copy_to_clipboard(question)
 
         open_text_editor(answer_path)
 
@@ -106,9 +107,14 @@ if also_graphical == "y":
                 proceed = True
 
         if proceed:
-            copy_to_clipboard("Can you explain the provided visualization?")
-
             F = open(answer_path, "w")
             F.close()
+
+            try:
+                import pyperclip
+            except ModuleNotFoundError as exc:
+                raise RuntimeError("pyperclip is required for clipboard operations.") from exc
+
+            copy_to_clipboard("Can you explain the provided visualization?")
 
             open_text_editor(answer_path)
