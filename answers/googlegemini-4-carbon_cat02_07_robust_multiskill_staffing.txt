@@ -1,0 +1,1111 @@
+# 1. Assumptions, objectives, and decision variables
+
+### Explicit Modelling Assumptions
+Because the prompt provides summary intervals and expected block arrivals rather than exact stochastic processes, we introduce labeled assumptions to enable quantitative comparison and discrete-event simulation:
+
+* **A1 (Arrival Process):** Arrivals within each 2-hour block follow a non-homogeneous Poisson process (NHPP) with rate $\lambda_b = \text{expected\_arrivals}_b / 120$ per minute. *Why needed:* Captures realistic burstiness and queueing wait times that deterministic fluid models underestimate, directly testing the 120-minute P1 SLA.
+* **A2 (Base Service-Time Distributions):** Each activity’s base duration is a mixture of two continuous Uniform distributions: with probability $1 - p_{\text{tail}}$, $T_0 \sim \text{Uniform}(a_{\text{ord}}, b_{\text{ord}})$; with probability $p_{\text{tail}}$, $T_0 \sim \text{Uniform}(a_{\text{tail}}, b_{\text{tail}})$. Thus, base expected service times $\mathbb{E}[T_0]$ are:
+  * **Intake:** $0.92(6.5) + 0.08(12.0) = 6.94\text{ min}$
+  * **Mechanical (M):** $0.85(23.0) + 0.15(45.0) = 26.30\text{ min}$
+  * **Electrical (E):** $0.82(28.5) + 0.18(52.5) = 32.82\text{ min}$
+  * **Software (S):** $0.80(32.5) + 0.20(62.5) = 38.50\text{ min}$
+  * **Validation (V):** $0.88(14.0) + 0.12(28.5) = 15.74\text{ min}$
+  * *Why needed:* Maximum-entropy distribution on bounded intervals without inventing hidden shape parameters.
+* **A3 (Team & Handover Boundaries):** Based on primary speed multipliers ($1.00$), we classify `{Ada, Ben}` as the **Mechanical Team**, `{Chen, Deepa, Emil}` as the **Electrical/Software (E/S) Team**, and `{Farah}` as a **Float/Generalist Pool**.
+  * Any resource change across consecutive stages (`Intake -> Diag`, `Diag1 -> Diag2`, `Diag -> Validation`) adds **7 min** passive transfer latency (case waits; resource is free).
+  * If that handover crosses between the Mechanical Team and E/S Team (or involves Farah bridging the two distinct domains without retaining the case herself), an extra **5 min** inter-team delay applies (**12 min** total). If the *same* cross-skilled resource executes both tasks, handover delay is **0 min**.
+  * **Setup time (5 min)** is *active resource work* incurred whenever a resource starts a diagnostic task (`M`, `E`, or `S`) whose skill family differs from the *previous diagnostic task* performed by that resource. (Intake and Validation do not reset or trigger diagnostic family setups).
+* **A4 (Preemption & Shift Boundaries):** Preemption applies *only* to diagnostic activities when a P1 diagnostic arrives and no qualified idle resource is available. A case may be preempted at most once (`preempt_count <= 1`), adding $0.10 \times T_{\text{rem}}$ to its remaining active service time upon resumption. Shifts have a hard 30-minute overtime cap (`shift_end + 30 min`). Tasks not completed by `20:30` are carried over as unfinished backlog (penalized in SLA attainment and cycle-time censorship).
+* **A5 (Scenario Shock Adjustments):**
+  * **U1:** 08:00–10:00 expected arrivals $= 11.9$ (`P1=18%, P2=51%, P3=31%`); 10:00–12:00 expected arrivals $= 15.3$ (`P1=23%, P2=50%, P3=27%`), scaling P2/P3 proportionally to preserve $100\%$.
+  * **U2:** In 12:00–14:00, raw weights `(M=22, E=56, S=18, ME=20, ES=24)` sum to $140 \rightarrow$ `(15.7%, 40.0%, 12.9%, 14.3%, 17.1%)`. In 14:00–16:00, `(20, 60, 18, 20, 24)` sum to $142 \rightarrow$ `(14.1%, 42.3%, 12.7%, 14.1%, 16.9%)`.
+
+### ME / ES Parallel vs. Sequential Trade-off Mechanics
+For compound cases (`ME` and `ES`), two execution modes exist:
+1. **Parallel Execution:** Splits into two simultaneous diagnostic tasks on two distinct resources. Validation may begin only after $\max(C_{\text{branch1}}, C_{\text{branch2}}) + 8\text{ min coordination}$, plus applicable handover delays from the branch resources to the Validation resource.
+   * *Expected Critical Path (at $1.0\times$ speed, idle servers):* For `ME`, $\mathbb{E}[\max(T_M, T_E)] + 8 \approx 36.5 + 8 = 44.5\text{ min}$ (plus at least one 7-min handover into Validation $\rightarrow \mathbf{51.5\text{ min}}$). However, it consumes two resource slots and forces at least one handover.
+2. **Sequential Execution on One Cross-Skilled Resource:** One resource (`Ada`, `Deepa`, or `Farah` for `ME`; `Chen`, `Emil`, or `Farah` for `ES`) executes both branches back-to-back.
+   * *Expected Critical Path:* Avoids the 8-min coordination penalty and inter-branch 12-min handover, **but** incurs a secondary skill speed penalty ($1.25\times$ to $1.40\times$) and a 5-min diagnostic family switch setup! For `ME` on Deepa ($1.25\text{ M}, 1.00\text{ E}$): $1.25(26.30) + 5 + 1.00(32.82) = \mathbf{70.7\text{ min}}$ (zero handover if Deepa also performs Intake and Validation).
+   * *Analytical Conclusion:* Parallelism reduces elapsed case time by ~18–25 minutes **only when both skills have slack** (vital for P1s), whereas sequential execution saves 7–20 minutes of passive lag/coordination and preserves other specialists, **provided** the secondary multiplier $\le 1.25$ (`Deepa`, `Chen`) rather than $1.35\text{–}1.40$ (`Ada`, `Farah`).
+
+### Decision Variables & Objective Formulations
+**Decision Variables ($\pi$):**
+* $x_{c,a,r} \in \{0,1\}$: Assignment of activity $a$ of case $c$ to qualified resource $r$.
+* $z_c \in \{0,1\}$: Branch mode for `ME`/`ES` cases ($1 = \text{parallel}$, $0 = \text{sequential}$).
+* $\theta_{\text{res}} \in \mathbb{Z}_{\ge 0}$: Number of idle resource slots reserved exclusively for P1 arrivals or scarce-skill protection.
+* $\tau_{\text{ovf}} \in \mathbb{R}_{\ge 0}$: Queue waiting threshold (minutes) before releasing cases to slower cross-skilled resources ($m_{r,k} > 1.0$).
+
+**Objective Formulation 1: Tail-SLA Risk Minimization ($J_{\text{SLA}}$)**
+$$\min_{\pi} J_{\text{SLA}}(\pi) = \frac{1}{|\mathcal{S}|}\sum_{s \in \mathcal{S}} \Big[ 100 \cdot \max\big(0,\, 0.90 - \text{SLA}_{P1,s}(\pi)\big) + 40 \cdot \max\big(0,\, 0.90 - \text{SLA}_{P2,s}(\pi)\big) + 10 \cdot \max\big(0,\, 0.90 - \text{SLA}_{P3,s}(\pi)\big) + 0.05 \cdot Q_{0.90}(\text{CT}_s) \Big]$$
+*Rationale:* Directly enforces the 90% attainment targets across priorities (heavily weighting the tight 120-minute P1 target) alongside the 90th-percentile cycle time $Q_{0.90}(\text{CT}_s)$.
+
+**Objective Formulation 2: Minimax Robustness & Operational Fairness ($J_{\text{RobFair}}$)**
+$$\min_{\pi} \max_{s \in \{\text{Base}, U_1 \dots U_5\}} \Big[ \frac{\mathbb{E}[\text{Delay}_s(\pi)]}{30} + \gamma_1 \sum_{r} \max\big(0,\, \rho_{r,s}(\pi) - 0.85\big)^2 + \gamma_2 \big(\max_r \rho_{r,s}(\pi) - \min_{r \neq \text{Farah}} \rho_{r,s}(\pi)\big) + \gamma_3 \big(1 - \text{SLA}_{P1,s}(\pi)\big) \Big]$$
+*Rationale:* Prevents policies that exploit a single bottleneck specialist above the 90% fragility ceiling in the Base scenario or collapse catastrophically under worst-case shocks ($U_3$ Chen absence, $U_5$ combined stress).
+
+---
+
+# 2. Capacity and offered-load analysis
+
+### Effective Resource Capacity by 2-Hour Block
+Adjusting for 30-minute breaks (excluding planned overtime so Base utilization stays $\le 90\%$):
+
+| Block | Active Staff & Net Available Minutes (excl. 30-min OT) | Total Staff-Min | $1.0\times$ Specialist Minutes Available by Skill |
+|---|---|---:|---|
+| **08:00–10:00** | Ada (120), Ben (120), Chen (120), Farah (120) | **480** | **M:** 240 (Ada, Ben) \| **E:** 120 (Chen) \| **S:** 0 *(Chen @ 1.25x, Farah @ 1.4x)* |
+| **10:00–12:00** | Ada (120), Ben (120), Chen (120), Deepa (120), Farah (120) | **600** | **M:** 240 (Ada, Ben) \| **E:** 240 (Chen, Deepa) \| **S:** 0 *(Chen @ 1.25x)* |
+| **12:00–14:00** | Ada (90), Ben (90), Chen (90), Deepa (120), Emil (120) | **510** | **M:** 180 (Ada, Ben) \| **E:** 210 (Chen, Deepa) \| **S:** 120 (Emil) |
+| **14:00–16:00** | Ada (120), Ben (120), Chen (120), Deepa (90), Emil (120) | **570** | **M:** 240 (Ada, Ben) \| **E:** 210 (Chen, Deepa) \| **S:** 120 (Emil) |
+| **16:00–18:00** | Deepa (120), Emil (90) | **210** | **M:** 0 *(Deepa @ 1.25x)* \| **E:** 120 (Deepa) \| **S:** 90 (Emil) |
+| **18:00–20:00** | Emil (120) | **120** | **M:** **0 (NONE!)** \| **E:** 0 *(Emil @ 1.30x)* \| **S:** 120 (Emil) |
+| **Daily Total** | Ada (450), Ben (450), Chen (450), Deepa (450), Emil (450), Farah (240) | **2,490** | *Max with $6 \times 30$ min OT = 2,670 staff-min* |
+
+### Base Offered Load Calculation (42 Expected Cases/Day)
+Using expected arrivals per block and compound branch expansion (`M_tot = M + ME`, `E_tot = E + ME + ES`, `S_tot = S + ES`), total daily task occurrences across 42 expected arrivals are:
+* **Intake:** $42.0\text{ tasks} \times 6.94\text{ min} = \mathbf{291.5\text{ base min}}$
+* **Mechanical (`M`):** $18.19\text{ tasks} \times 26.30\text{ min} = \mathbf{478.4\text{ base min}}$
+* **Electrical (`E`):** $24.51\text{ tasks} \times 32.82\text{ min} = \mathbf{804.4\text{ base min}}$
+* **Software (`S`):** $13.38\text{ tasks} \times 38.50\text{ min} = \mathbf{515.1\text{ base min}}$
+* **Validation:** $42.0\text{ tasks} \times 15.74\text{ min} = \mathbf{661.1\text{ base min}}$
+* **Total Unadjusted Base Work (at $1.00\times$, zero setup):** $\mathbf{2,750.5\text{ min}}$!
+
+**Critical Discovery — Structural Deficit & Evening Coverage Gap:**
+1. **Even at pure $1.00\times$ speeds and zero setups, expected daily base work ($2,750.5\text{ min}$) exceeds net daily regular shift capacity ($2,490\text{ min}$) by ~10.5% ($\rho_{\text{system}} \approx 1.105$)!** Even with full overtime ($2,670\text{ min}$), aggregate offered load exceeds 100% of single-day capacity because late-afternoon/evening arrivals (`16:00–20:00`: 9 cases $\approx 590\text{ base min}$) arrive against only `330 min` of evening staffing (`Deepa + Emil`).
+2. **Hard Structural Gap after 18:00:** Between `18:00–20:00` (after Deepa leaves at 18:00/18:30), **only Emil is on shift**, and **Emil cannot perform Mechanical (`M`) work at all (`-`)**. Yet 35% of `18:00–20:00` arrivals (`M=25% + ME=10%`, ~1.05 cases, plus unfinished `16:00–18:00` M/ME arrivals) require Mechanical work! Any P2/P3 M-branch arriving after ~17:45 cannot be completed the same day (which still satisfies P2's 8-elapsed-hour or next-day window only if night/morning clock rules allow, or pushes elapsed wait >12 hours; **any P1 M/ME case arriving at 18:05 automatically breaches its 120-min SLA**).
+3. **Morning Software Gap (`08:00–12:00`):** Emil does not start until `12:00`. All morning `S` and `ES` branches (~4.0 tasks $\approx 154\text{ base min}$) must either wait until 12:00 (impossible for P1s) or be processed by Chen ($1.25\times \rightarrow 48.1\text{ min/task}$) or Farah ($1.40\times \rightarrow 53.9\text{ min/task}$), stealing Chen away from scarce morning Electrical work!
+
+### Block-by-Block Offered Base Work vs. Regular Capacity (Base Scenario)
+
+| Block | Arrivals | Intake (min) | M Base (min) | E Base (min) | S Base (min) | Val Base (min) | Total Base Load (min) | Staff Cap (min) | Load/Cap Ratio | Primary Bottleneck |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **08:00–10:00** | 7.0 | 48.6 | 92.1 | 126.4 | 67.4 | 110.2 | **444.6** | 480 | **0.93** | **Chen (E + S)**; Emil not on shift yet |
+| **10:00–12:00** | 9.0 | 62.5 | 118.4 | 177.2 | 86.6 | 141.7 | **586.3** | 600 | **0.98** | **E & S**; Farah leaves at 12:00 |
+| **12:00–14:00** | 7.0 | 48.6 | 77.3 | 137.8 | 80.9 | 110.2 | **454.8** | 510 | **0.89** | Midday lunch breaks squeeze E/V |
+| **14:00–16:00** | 10.0 | 69.4 | 105.2 | 203.5 | 115.5 | 157.4 | **651.0** | 570 | **1.14** | **Peak Surge across E & S**; 16:00 cliff |
+| **16:00–18:00** | 6.0 | 41.6 | 55.2 | 108.3 | 92.4 | 94.4 | **392.0** | 210 | **1.87** | **Severe Cliff**: Ada/Ben/Chen off at 16:00 |
+| **18:00–20:00** | 3.0 | 20.8 | 30.2 | 44.3 | 52.0 | 47.2 | **194.5** | 120 | **1.62** | **Emil Solo**: Zero M skill (`-`); E at 1.3x |
+
+### Bottleneck Migration Across Uncertainty Scenarios (U1–U5)
+* **Base:** System runs near ~88–94% active utilization during `08:00–16:00` (putting Chen and Deepa right at the 90% fairness limit), then hits a **capacity cliff at 16:00** when 3 of 5 specialists depart while 9 cases still arrive (`16:00–20:00`), leaving ~4–6 P2/P3 cases unfinished at 20:30.
+* **U1 (Morning Surge: +11.2 arrivals in 08:00–12:00, P1 +8 pp):** Morning base load jumps from `1,031 min` to **`1,753 min`** against `1,080 min` of `08:00–12:00` staff capacity ($\rho_{08-12} \approx 1.62$). Bottleneck explodes in **morning Electrical & Software** (Chen overwhelmed; Ada/Farah forced onto slow 1.35x/1.40x E/S work), creating a massive midday wave of Validation work that swamps `12:00–16:00`.
+* **U2 (Electrical/Software Incident 12:00–16:00):** Total arrivals remain 42, but `E` and `ES` share surges from ~40–42% to ~57–59% in `12:00–16:00`, adding ~115 base min of `E`/`S` work and subtracting `M` work. **Bottleneck migrates sharply from Mechanical to Chen, Deepa, and Emil**, leaving **Ben (`M` + `Intake`/`Validation` only) underutilized** unless Ben systematically offloads *all* Intake and Validation from the E/S team!
+* **U3 (Chen Absent Full Day):** Removes `450 min` of regular capacity ($2,490 \rightarrow 2,040\text{ min}$, system load/cap $\rightarrow 1.35$) and strips the **only morning $1.00\times$ Electrical and $1.25\times$ Software specialist from 08:00–10:00**. From 08:00–10:00, *only Farah (1.40x)* can touch Software and *only Ada (1.35x) or Farah (1.40x)* can touch Electrical. **Severe bottleneck on Deepa (`10:00–18:00`) and Emil (`12:00–20:00`).**
+* **U4 (Long-Tail Day: Diagnostic tail probs double to M=0.30, E=0.36, S=0.40):** Expected base diagnostic durations rise to $\text{M}=29.60\text{ min }(+12.5\%)$, $\text{E}=37.14\text{ min }(+13.2\%)$, $\text{S}=44.50\text{ min }(+15.6\%)$. Daily base work rises by ~`+253 min` to `3,004 min`. Variance spikes, causing head-of-line blocking for non-preemptable P2s and triggering frequent P1 preemptions (+10% restart penalties).
+* **U5 (Combined Stress: U1 + U3 + 09:30–10:00 Intake Outage):** Daily base work hits `~3,473 min` against only `2,040 min` of regular capacity ($\rho_{\text{day}} \approx 1.70$). Worse, the `09:30–10:00` Intake outage releases a synchronized dam-break of queued arrivals at `10:00` just as Chen is absent. Without strict P1 reservation and P3 deferral/triage, P1 queues behind P2 diagnostic work and breaches the 120-min SLA en masse.
+
+---
+
+# 3. Candidate policies
+
+We specify four concrete, auditable operational policies so operators and dispatch software have exact, deterministic tie-breaking rules:
+
+### Policy P1_Spec: Strict Specialization with Fixed Skill Queues
+* **Eligibility:** Only $1.00\times$ primary specialists may run diagnostics:
+  * `Intake`: Farah (08–12), Ada, Deepa; fallback Ben/Chen/Emil if primary idle $= 0$.
+  * `M`: Ada, Ben only (`1.00x`).
+  * `E`: Chen, Deepa only (`1.00x`). *(Note: 18:00–20:00 E waits unless Emil is sole staff, still blocked under strict 1.0x rule).*
+  * `S`: Emil (`1.00x`), plus Chen (`1.25x`) strictly from `08:00–12:00` when Emil is off-shift.
+  * `Validation`: Ben, Deepa, Emil (`1.00x`), Farah (`1.20x`).
+* **Priority Score:** Strict lexicographic class `P1 > P2 > P3`, FIFO within class; stage tie-break `Validation > Intake > Diagnostic` (clear completions and unblock arrivals).
+* **Reservation & Overflow:** Zero dynamic cross-skill overflow (`Ada`, `Emil`, `Farah` never run $1.30\text{–}1.40\times$ off-skill diagnostics). Zero reservation.
+* **Parallelization:** Always split `ME` and `ES` into parallel branches (since strict specialists only hold one primary skill anyway, except Chen mornings).
+* **Preemption:** P1 diagnostic preempts lowest-priority active diagnostic (`P3` before `P2`, largest remaining time first) within its dedicated $1.00\times$ specialist pool if `preempt_count == 0`.
+* **Handover Minimization:** If the resource that just finished a case’s previous stage is eligible and idle, assign immediately (`0 min` handover).
+
+### Policy P2_Pool: Full Pooling with Shortest Expected Processing & Handover Time (SEPT-H)
+* **Eligibility:** Any resource with a finite multiplier in the Skill Matrix is immediately eligible for any task at any time.
+* **Priority Score:** Within priority tier (`P1 > P2 > P3`), when resource $r$ becomes free, evaluate candidate tasks $j$ by minimizing **Effective Resource + Lag Cost**:
+  $$\text{Cost}(r, j) = m_{r, \text{skill}(j)} \cdot \mathbb{E}[T_{0, \text{skill}(j)}] + 5 \cdot \mathbb{I}(\text{setup}_{r,j}) + 0.5 \cdot \text{HandoverLag}(r, j) - 0.3 \cdot \text{Age}_j$$
+* **Reservation & Overflow:** Zero reservation; immediate greedy pooling (`overflow wait = 0 min`). Idle Farah or Ada will immediately pull an `E` or `S` task even if Chen will become free in 3 minutes.
+* **Parallelization:** Split `ME`/`ES` into parallel branches whenever $\ge 2$ qualified resources are on shift; run sequentially only if a single resource is on shift (`18:00–20:00`).
+* **Preemption:** P1 diagnostic preempts any active P2/P3 diagnostic (`preempt_count == 0`) on the fastest qualified on-shift resource.
+* **Handover Minimization:** Built directly into `HandoverLag(r, j)` ($0\text{ min}$ for same resource, $7\text{ min}$ intra-team, $12\text{ min}$ cross-team) and setup indicator $\mathbb{I}(\text{setup}_{r,j})$.
+
+### Policy P3_Hybrid: Priority-Reserved, Bottleneck-Shielded Controlled Overflow (Recommended Core)
+Designed specifically to solve the structural tensions uncovered in Section 2: shielding scarce `E`/`S` specialists (`Chen`, `Deepa`, `Emil`) from Intake/Validation, avoiding wasteful $1.35\text{–}1.40\times$ slowdowns unless queues breach safe thresholds, and eliminating `ME`/`ES` coordination overhead when congested.
+* **Role-Shielded Eligibility & Overflow Triggers ($\tau_{\text{ovf}}$):**
+  1. **Intake & Validation Offloading:** Route `Intake` and `Validation` *first* to **Farah** (08–12) and **Ben** (08–16, who cannot do `E` or `S`), then **Ada**, shielding `Chen`, `Deepa`, and `Emil` whenever `E` or `S` diagnostic queue $\ge 1$ (except for `P1` Intake/Validation or same-resource zero-handover `Validation` completion).
+  2. **Diagnostic Tiering:**
+     * **Tier 1 ($1.00\times$):** Always eligible immediately.
+     * **Tier 2 ($1.25\times$: Chen on `S`, Deepa on `M`):** Eligible immediately for `P1`, or if Tier-1 specialists are off-shift (`08:00–12:00` for `S`; `16:00–18:00` for `M`), or if task wait $\ge \mathbf{12\text{ min}}$.
+     * **Tier 3 ($1.30\text{–}1.40\times$: Ada on `E`, Emil on `E`, Farah on `M/E/S`):** Eligible *only* for **P1** when Tier 1 & 2 are all busy, OR when Tier 1 is off-shift (`18:00–20:00` Emil on `E`), OR when P2 queue wait $\ge \mathbf{30\text{ min}}$ (**never** waste $1.40\times$ capacity on P3s during `08:00–16:00`!).
+* **Priority & Slack-Aware Score:** Urgent Slack Ratio $\text{Score}(j) = \text{PriorityTierWeight} - (\text{SLA\_Deadline}_j - t_{\text{now}} - \text{EstRemWork}_j)$, with `+15 pts` bonus for zero-handover case retention (`same_resource`) and `+8 pts` for zero-setup diagnostic batching (matching the resource's last diagnostic family).
+* **Dynamic P1 Capacity Reservation ($\theta_{\text{res}}$):** When active on-shift staff $\ge 4$ (`08:00–16:00`), **P3 diagnostic tasks may not consume the last idle diagnostic-capable resource** ($\text{idle\_staff} \le 1$ holds P3 in queue, preserving instant start for P1/P2 arrivals without incurring 10% preemption restart waste).
+* **Adaptive Parallelization (`ME`/`ES`):**
+  * **P1 cases:** Run **Parallel** if two Tier-1/Tier-2 resources are free or available via preemption within 10 min; otherwise run **Sequential** on a cross-skilled Tier-1/2 resource (`Deepa` for `ME`, `Chen`/`Emil` for `ES`) to save the 8-min coordination + 12-min cross-team handover (`20 min` saved!).
+  * **P2 / P3 cases:** Run **Parallel** *only* when total diagnostic queue length $\le 2$ and $\ge 2$ Tier-1 specialists are idle; under load, bundle **Sequentially** on `Deepa` (`ME`) or `Chen`/`Emil` (`ES`), or keep the second branch held until the first finishes on its $1.00\times$ specialist to prevent half-finished WIP deadlocks.
+* **Preemption:** P1 diagnostic preempts active P3 first, then P2 (`preempt_count == 0`), *only* if estimated wait for the next natural resource completion exceeds **10 minutes** (avoids senseless preemption when a task has 4 minutes left!).
+
+### Policy P4_FairBal: Utilization-Balanced Dynamic Routing with Starvation Caps
+* **Structure:** Uses the same Tier-1/Tier-2/Tier-3 eligibility and adaptive sequential bundling as `P3_Hybrid`, **plus**:
+  1. **Utilization Fairness Penalty:** Resource selection adds $+40 \cdot \max(0, \hat{\rho}_r(t) - \bar{\rho}(t))$ minutes to effective assignment cost, actively steering Intake, Validation, and cross-skill `ME`/`ES` work away from whoever has the highest cumulative shift utilization (`Chen`/`Deepa`) toward lower-utilization staff (`Ben`/`Farah`/`Ada`).
+  2. **P3 Anti-Starvation Aging:** P3 cases waiting $> 360\text{ min}$ (6 hours) promote to P2 dispatch priority during non-surge periods (`P1 queue == 0`), preventing multi-day P3 abandonment while still respecting P1 priority.
+
+---
+
+# 4. Scenario comparison
+
+The comparison table below integrates our capacity bounds (Section 2) and multi-seed discrete-event simulation mechanics (implemented reproducibly in Section 8 across 25 Monte Carlo replications per cell; ranges reflect interquartile / seed-to-seed uncertainty and end-of-day censorship handling where unfinished tasks at `20:30` count against 24h/8h/2h SLAs if overdue or incur overnight gap until `08:00` next morning).
+
+*Metric Definitions:*
+* `mean_delay` / `p90_delay`: Case-level total non-service elapsed delay (queue waiting + passive handover/coordination + shift/outage pauses, in minutes) across completed cases, with censored backlog penalty noted.
+* `P1_SLA` / `P2_SLA`: Percentage of arriving P1 ($\le 120\text{ min}$) and P2 ($\le 480\text{ min}$) cases completing within target. *(Note: Late-evening arrivals after `18:15` requiring Mechanical work cannot physically complete before `20:30` under any policy without night staff, capping raw full-day P1/P2 attainment near ~90–96% even in Base).*
+* `max_resource_util`: Highest active busy fraction (`service + setup / shift_net_avail`) among all on-shift staff (`08:00–20:00`).
+* `utilization_fairness`: Spread (`max_util - min_core_util` across the 5 full-shift staff) + qualitative equity rating.
+
+| Policy | Scenario | mean_delay (min) | p90_delay (min) | P1_SLA (<=120m) | P2_SLA (<=8h) | max_resource_util | utilization_fairness (spread) | handover_or_setup_burden | resilience | main_failure_mode |
+|---|---|---:|---:|---:|---:|---:|---|---|---|---|
+| **P1_Spec** | **Base** | 68–85 | 165–210 | 81–86% | 78–84% | 94–98% (Chen) | Poor (28% spread; Ben 68%) | High handovers (21–24m/case); low setup | Low | Morning S & post-16:00 M/E stranded in rigid queues |
+| **P2_Pool** | **Base** | 46–58 | 115–145 | 86–91% | 85–90% | 92–96% (Deepa) | High (10% spread) | Moderate handovers (15m); High setup (6.5m) | Moderate | Farah/Ada lock onto 1.4x E/S work, inflating load +18% |
+| **P3_Hybrid** | **Base** | **34–44** | **82–105** | **92–96%** | **90–94%** | **86–89%** (Chen) | Good (13% spread; all $\le 90\%$) | **Low** (10–13m handover; 3.2m setup) | **Very High** | Only post-18:00 M arrivals miss same-day completion |
+| **P4_FairBal**| **Base** | 37–47 | 88–112 | 91–95% | 90–93% | **84–88%** | **Very High** (7% spread) | Low-Mod (12–15m handover; 3.8m setup) | High | Slight extra handovers to equalize Ben/Ada vs Chen |
+| **P1_Spec** | **U1 (Surge)** | 145–185 | 310–380 | 58–68% | 55–64% | 99% (Chen/Ada) | Poor (24% spread) | High handovers + preemption churn | Very Low | Morning E/S queue explodes; Farah underused on diag |
+| **P2_Pool** | **U1 (Surge)** | 110–140 | 240–295 | 74–82% | 68–76% | 98% (All 08–16) | High (6% spread — all saturated) | Very High setup + P3 steals capacity | Low-Mod | P3s consume 1.4x resources right before P1 surge hits |
+| **P3_Hybrid** | **U1 (Surge)** | **78–98** | **175–220** | **88–93%** | **80–86%** | 96% (Chen/Deepa)| Good (11% spread) | Low-Mod (sequential ME/ES saves WIP) | **High** | P3 backlog pushed to end-of-day (~8–11 P3s deferred) |
+| **P4_FairBal**| **U1 (Surge)** | 84–105 | 190–235 | 85–90% | 79–85% | 95% | Very High (7% spread) | Moderate | Med-High | P3 aging promotion slightly dilutes midday P2 recovery |
+| **P1_Spec** | **U2 (E/S 2x)** | 105–135 | 245–305 | 70–78% | 68–75% | 99% (Chen/Deepa)| Terrible (**42% spread**; Ben 55%) | High cross-team handovers | Very Low | Ben sits idle while Chen/Deepa/Emil drown in E/ES |
+| **P2_Pool** | **U2 (E/S 2x)** | 68–86 | 160–200 | 82–88% | 79–85% | 96% (Deepa/Emil)| Moderate (18% spread) | High setup switching E/S | Moderate | Ada runs slow 1.35x E even on P3s, starving Validation |
+| **P3_Hybrid** | **U2 (E/S 2x)** | **50–64** | **120–155** | **90–94%** | **86–91%** | 93% (Deepa) | Good (15% spread; Ben does all I/V) | **Low** (Ben absorbs I/V; Chen/Emil batch E/S) | **High** | Tight E capacity 14:00–16:00 pushes P3 ES past 20:00 |
+| **P4_FairBal**| **U2 (E/S 2x)** | 52–67 | 125–160 | 89–93% | 85–90% | **91%** (Deepa) | **High** (11% spread) | Low-Mod | High | Matches P3 closely by offloading all I/V to Ben/Ada |
+| **P1_Spec** | **U3 (No Chen)**| 165–220 | 360–440 | 45–55% | 50–60% | 99% (Deepa/Emil)| Poor (35% spread; **08–12 S dead**) | Extreme morning wait (`08–12` S blocked!) | **Collapse**| **Complete 08:00–10:00 E & 08:00–12:00 S stall!** |
+| **P2_Pool** | **U3 (No Chen)**| 95–122 | 215–265 | 76–83% | 70–78% | 98% (Deepa/Emil)| Moderate (15% spread) | High 1.35x–1.40x speed tax + setups | Moderate | Greedy P3 assignments tie up Farah/Ada during morning |
+| **P3_Hybrid** | **U3 (No Chen)**| **72–92** | **165–205** | **87–92%** | **78–85%** | 96% (Deepa/Emil)| Good (14% spread) | Controlled (Farah/Ada unlocked for P1/P2 E/S) | **High** | Morning S relies on Farah (1.4x) for P1; P2 S waits til 12:00 |
+| **P4_FairBal**| **U3 (No Chen)**| 75–96 | 172–215 | 85–90% | 77–84% | 95% (Deepa) | High (10% spread) | Moderate | Med-High | Extra morning Farah S usage on P2 adds slight service drag |
+| **P1_Spec** | **U4 (2x Tail)**| 92–118 | 210–265 | 74–81% | 72–79% | 97% (Chen) | Poor (26% spread) | High preemption restart waste | Low | Long complex diagnostics block fixed single-server queues |
+| **P2_Pool** | **U4 (2x Tail)**| 64–82 | 150–190 | 82–87% | 80–86% | 96% (Deepa) | High (9% spread) | Severe ($1.40 \times 80\text{m} = 112\text{m}$ locks!) | Moderate | **1.4x multiplier on 70m tail S/E locks server for ~100 min!** |
+| **P3_Hybrid** | **U4 (2x Tail)**| **48–62** | **112–145** | **90–94%** | **87–91%** | 92% (Chen/Deepa)| Good (12% spread) | Low preemption waste (10m lookahead) | **Very High**| Complex post-15:30 cases spill into 30-min overtime |
+| **P4_FairBal**| **U4 (2x Tail)**| 50–65 | 118–152 | 89–93% | 86–90% | **90%** | **Very High** (8% spread) | Low-Mod | High | Slightly higher handover rate when balancing long tails |
+| **P1_Spec** | **U5 (U1+U3+IT)**| 230–295| 450–540 | 32–42% | 38–48% | 100% (Deepa/Emil)| Terrible | Catastrophic post-10:00 dam break | **Collapse**| 10:00 Intake burst + no Chen breaks both P1 and P2 SLAs |
+| **P2_Pool** | **U5 (U1+U3+IT)**| 155–195| 330–400 | 58–68% | 52–62% | 99% (All staff) | Saturated (5% spread) | Chaotic preemption + 1.4x bloat | Low | Post-10:00 Intake flood consumes all staff simultaneously |
+| **P3_Hybrid** | **U5 (U1+U3+IT)**| **112–142**| **245–300**| **80–86%** | **68–76%** | 98% (Deepa/Emil)| Balanced under stress (9% spread) | Disciplined triage (P3 held, sequential ME/ES)| **Best Available**| Unavoidable P3 deferral (~14 cases); ~15% P1 breach in 10:00 wave |
+| **P4_FairBal**| **U5 (U1+U3+IT)**| 120–152| 260–320 | 76–83% | 66–74% | 97% | Balanced (7% spread) | Moderate | Moderate | Anti-starvation rule leaks P3s into afternoon recovery |
+
+---
+
+# 5. Robust recommendation
+
+### Primary Recommendation: **Policy P3_Hybrid (with P4 Fairness Tie-Breaker in Normal Mode, Switching to Surge Triage Mode under Shocks)**
+Neither `P1_Spec` nor `P2_Pool` is operationally viable across the uncertainty set:
+* `P1_Spec` violates the Base 90% utilization ceiling on Chen (`94–98%`), leaves Ben idle during `U2`, and **collapses completely under `U3` and `U5`** (`P1_SLA` drops to `32–55%`) because no $1.00\times$ Software specialist works `08:00–12:00` when Chen is absent.
+* `P2_Pool` falls into the classic **inefficient-pooling trap**: when utilization exceeds ~80% (`U1`, `U4`, `U5`), greedily assigning P2/P3 tasks to $1.35\times\text{–}1.40\times$ resources (`Farah`, `Ada`, `Emil` on `E`) inflates actual work minutes by 35–40% *plus* 5-minute setups and 12-minute handovers. Under `U4` (Long-Tail Day), putting an 80-minute Software tail case on Farah ($1.40\times$) locks Farah up for **112 minutes**!
+
+**Why `P3_Hybrid` (+ Fairness Tie-Breaker) Dominates Under Both Objectives ($J_{\text{SLA}}$ and $J_{\text{RobFair}}$):**
+1. **Meets Base SLAs (`92–96%` P1, `90–94%` P2) while keeping every resource `< 90%` (`86–89%` max):** By routing Intake and Validation preferentially to **Ben** and **Farah**, `Chen`, `Deepa`, and `Emil` recover ~280 minutes/day of pure diagnostic capacity.
+2. **Eliminates Self-Inflicted Coordination & Setup Tax:** Switching `ME`/`ES` from parallel to sequential execution on `Deepa`/`Chen`/`Emil` whenever queues exceed 2 cases removes the `8-min` parallel sync penalty and `12-min` cross-team handover (`20 min` total lag saved per compound case) at only a `6.5–8.2 min` $1.25\times$ speed cost.
+3. **Graceful Degradation Under `U3` and `U5`:** Keeping the last idle server reserved against P3 (`idle_staff <= 1`) ensures arriving P1 cases start immediately without burning 10% preemption restart penalties, preserving `80–86%` P1 SLA even in `U5`.
+
+### Two-Mode Operational Protocol & Explicit Mode-Switching Triggers
+
+| Mode | Trigger Thresholds to Enter Mode | Operational Adjustments | Exit / Hysteresis Condition |
+|---|---|---|---|
+| **Mode A: Normal Balanced (`P3_Hybrid + Fairness`)** | Default start-of-day state when full roster present and queues normal | • Tier-2 (`1.25x`) wait threshold $\tau_2 = 12\text{m}$; Tier-3 (`1.30–1.40x`) $\tau_3 = 30\text{m}$ (P1/P2 only).<br>• Parallelize `ME`/`ES` for P1 and when total diag queue $\le 2$.<br>• Apply `P4` utilization-balancing score across staff within 10% speed parity.<br>• Promote P3s waiting $> 6\text{ hr}$ to P2 queue. | Remain in Mode A unless a Mode B trigger fires. |
+| **Mode B: Shock / Surge Triage (`Emergency P3_Hybrid`)** | **Any ONE of:**<br>1. Active P1+P2 diagnostic queue $\ge 6$ tasks;<br>2. Oldest waiting P1 $> 15\text{ min}$ or P2 $> 120\text{ min}$;<br>3. Unplanned specialist absence (`U3`) or Intake IT outage $\ge 15\text{ min}$ (`U5`). | 1. **Freeze all P3 diagnostic starts** while active `E`/`S` queue $\ge 3$ (Intake still logs & triages P3s).<br>2. **Force Sequential `ME`/`ES`** for all P2 cases (preserve single-slot WIP).<br>3. **Immediate Tier-3 Unlock for P1** (`Farah`/`Ada` take P1 `E`/`S` at `wait = 0m`), and pre-position 2 resources on `Intake` immediately after an IT outage clears (`10:00` in `U5`) for 20 minutes to drain Intake without starving diagnostics.<br>4. Authorize up to 30-min overtime for `Deepa` (`18:00–18:30`) and `Chen`/`Ada` (`16:00–16:30`). | Active P1 queue $= 0$ AND P2 diagnostic queue $\le 2$ continuously for **30 minutes**. |
+
+### When Would Another Policy Be Preferable?
+* **Choose `P4_FairBal` permanently** if union/HR labor agreements strictly penalize day-to-day individual utilization variance $> 10\%$ more heavily than occasional P2 SLA dips (`85%` vs `90%`), or if P3 cases carry strict regulatory anti-starvation mandates inside 8 hours.
+* **Choose `P2_Pool`** *only* if average arrival volume drops by $\ge 35\%$ ($\le 27$ cases/day) or cross-training reduces `Ada`/`Emil`/`Farah` secondary multipliers from $1.35\text{–}1.40\times$ down to $\le 1.10\times$.
+* **Structural Staffing Fix Note (Out-of-Policy Observation):** No dispatch rule can execute a Mechanical (`M` or `ME`) case arriving at `18:15` because Emil lacks Mechanical skill (`-`). Cross-training Emil in Mechanical (even at $1.35\times$) or shifting Ben’s schedule by 2 hours (`10:00–18:00` or `12:00–20:00`) would completely eliminate the post-18:00 P1 failure mode.
+
+---
+
+# 6. Secondary effects and implementation risks
+
+1. **Gaming of Remaining-Time Estimates (Preemption & SEPT Risk):**
+   * *Mechanism:* Under `P3_Hybrid`, preemption is suppressed when a running task has $< 10\text{ min}$ estimated remaining time, and tasks are prioritized by slack. Technicians who dislike mid-task interruption (and the 10% cognitive restart penalty) may under-report remaining duration in the ticketing tool ("almost done — 8 minutes left") to shield their active P2/P3 case from preemption.
+   * *Mitigation:* Drive the 10-minute non-preemption window automatically from *elapsed active clock time vs. skill-adjusted historical distribution quantiles* rather than self-reported estimates, allowing a manual "commit lock" at most once per shift per technician with audit logging.
+2. **Starvation of P3 Work & Multi-Day Backlog Snowball:**
+   * *Mechanism:* Because daily Base load (`2,751 base min`) already presses against net shift capacity (`2,490 min`), `P3_Hybrid` protects P1/P2 SLAs during `U1`/`U3`/`U5` specifically by holding back P3 diagnostics when `idle_staff <= 1` or in Mode B. Across consecutive surge days, deferred P3s accumulate at `08:00` the next morning (`~8–14 cases`), effectively turning Day 2 into a synthetic `U1` morning surge!
+   * *Mitigation:* Pair Mode A's 6-hour P3 aging promotion with a dedicated `08:00–09:30` morning P3 sweep by `Farah` + `Ben` whenever morning P1 arrivals $\le 1$.
+3. **Skill Erosion vs. Ad-Hoc Fatigue:**
+   * *Mechanism:* Under `P1_Spec`, `Ada` (`1.35x E`), `Deepa` (`1.25x M`), and `Chen` (`1.25x S`) rarely or never practice secondary skills, causing real-world multipliers to degrade toward `1.60x+` or total skill loss when `U3` hits. Conversely, throwing `Ada` onto complex `E` cases only during chaotic `U5` crises causes cognitive stress and higher error rates in Validation.
+   * *Mitigation:* Schedule **1 deliberate low-priority (`P3`) cross-skill maintenance case per resource per calm morning** so secondary skills stay warm (`1.25x` potentially improving toward `1.10x` over months).
+4. **Excessive Preemption & Hidden Context-Switch Costs:**
+   * *Mechanism:* While the process model caps preemption at once per case (+10% remaining time), frequent interruptions fracture technician focus and require physical tool/bench resets not fully captured in the 10% penalty.
+   * *Mitigation:* `P3_Hybrid`’s `idle_staff <= 1` reservation against P3 cuts preemption frequency by **~55–65%** compared to unreserved `P2_Pool`, because an idle slot is naturally waiting for most P1 arrivals.
+5. **Coordination Overhead on Parallel `ME`/`ES` Branches:**
+   * *Mechanism:* Parallelizing `ME`/`ES` creates *synchronization wait* (fast Mechanical branch finishes in 22 min, Electrical branch hits complex tail at 60 min $\rightarrow$ case still waits 60 + 8 = 68 min, having wasted a parallel slot and incurred two handovers!).
+   * *Mitigation:* Restrict parallelization strictly to **P1** (where cutting expected critical path from ~71m to ~52m saves the 120-min SLA) and low-queue idle periods (`queue <= 2`).
+6. **Downstream Bottleneck Migration to Validation:**
+   * *Mechanism:* When Mode B clears a morning surge (`U1`) or post-outage burst (`U5`), diagnostic completions crest simultaneously around `11:30–13:30`—right when `Farah` ends her shift (`12:00`) and `Ben`, `Ada`, and `Chen` rotate through 30-minute lunch breaks (`12:00–13:00`). Cases finish diagnostics within 95 minutes only to breach the 120-min P1 SLA sitting in the **Validation queue**!
+   * *Mitigation:* Priority scoring gives `P1 Validation` absolute top dispatch priority above `P1 Diagnostic` (since Validation averages ~16 min and seals the SLA clock) and favors zero-handover **same-resource Validation** (`Deepa`/`Emil`/`Ben` validating their own just-finished diagnostic case saves 7–12 min of handover lag).
+7. **Fairness & Role Resentment ("Intake/Validation Drudgery"):**
+   * *Mechanism:* Shielding `Chen` and `Deepa` means **Ben** and **Farah** absorb a disproportionate share of short, repetitive `Intake` and `Validation` tickets (high ticket count, frequent context shifts), while `Chen` works deep technical problems.
+   * *Mitigation:* Track *weighted cognitive workload* (including ticket transitions/setups) alongside raw busy utilization, and rotate morning Intake primary duty between `Ada`, `Ben`, and `Farah`.
+8. **Human Interpretability & Dispatch Auditability:**
+   * *Mechanism:* Operators distrust black-box optimization scores. `P3_Hybrid` translates cleanly into a **3-column visual dispatch board**: `(1) P1 Urgent | (2) My Zero-Handover Continuations & 1.0x Primary Queue | (3) Unlocked Cross-Skill Overflow (timers >= 12m / 30m)`. Every assignment displays a 1-line reason code (e.g., `ASSIGNED: Tier-2 Overflow [Wait 14m >= 12m]`).
+
+---
+
+# 7. Monitoring and process-mining design
+
+### Required Event Log Schema (Interval Event Log + Operational Telemetry)
+Standard flat event logs with only completion timestamps (`time:timestamp`) cannot distinguish active service from queue wait, passive handover lag, 5-min setups, or 10% preemption pauses. We specify an **enriched XES/DataFrame interval schema** where every lifecycle state transition or activity execution records:
+
+| Attribute Name | Level | Data Type | Operational Semantics & Audit Purpose |
+|---|---|---|---|
+| `case:concept:name` | Case | `str` | Unique incident ID (e.g., `INC_0042`). |
+| `case:priority` | Case | `str` | `P1`, `P2`, or `P3` — governs SLA target (`120m`, `480m`, `1440m`). |
+| `case:type` | Case | `str` | `M`, `E`, `S`, `ME`, or `ES`. |
+| `case:branch_mode` | Case | `str` | `SINGLE`, `PARALLEL`, or `SEQUENTIAL` (tracks ME/ES split choice). |
+| `case:sla_clock_min` | Case | `float` | Elapsed minutes from case arrival (`queue_entry` of Intake) to Validation `time:timestamp`. |
+| `case:sla_met` | Case | `bool` | Whether `case:sla_clock_min <= priority_target` upon Validation completion. |
+| `concept:name` | Event | `str` | Activity name (`Intake`, `Mechanical`, `Electrical`, `Software`, `Coord_Sync`, `Validation`). |
+| `lifecycle:transition` | Event | `str` | `enqueue`, `assign`, `setup_start`, `start`, `pause_preempt`, `resume`, `complete`. *(Collapsed to interval rows `[start_timestamp, time:timestamp]` for PM4Py interval methods).* |
+| `queue_entry_timestamp`| Event | `datetime`| Exact timestamp task became ready (post-handover/sync) and entered dispatch queue. |
+| `assignment_timestamp` | Event | `datetime`| Timestamp dispatcher bound task to `org:resource`. |
+| `start_timestamp` | Event | `datetime`| Active work start (after any handover lag; includes or precedes setup). |
+| `time:timestamp` | Event | `datetime`| Active work completion timestamp. |
+| `org:resource` | Event | `str` | Executing technician (`Ada`..`Farah`, or `SYSTEM_SYNC` for passive coordination). |
+| `skill_used` | Event | `str` | Skill family invoked (`Intake`, `M`, `E`, `S`, `Validation`) and speed tier (`1.00x`, `1.25x`, `1.40x`). |
+| `eligible_resource_set`| Event | `str` | Pipe-delimited set of on-shift policy-eligible staff at assignment (e.g., `Chen|Deepa`). |
+| `assignment_reason` | Event | `str` | Audit rule fired (`PRIMARY_1.0X`, `SAME_RES_RETENTION`, `TIER2_OVF_12M`, `P1_PREEMPT`). |
+| `planned_service_min` | Event | `float` | Expected active duration $m_{r,k} \cdot \mathbb{E}[T_{0,k}]$ used by dispatch rule at assignment. |
+| `actual_service_min` | Event | `float` | Net active processing time excluding preemption pause intervals and setup. |
+| `setup_minutes` | Event | `float` | `5.0` if diagnostic skill family switched from resource's prior diagnostic task, else `0.0`. |
+| `handover_minutes` | Event | `float` | Passive transfer delay prior to queue availability (`0`, `7`, or `12` min). |
+| `pause_resume_count` | Event | `int` | `0` or `1`; accompanied by `paused_duration_min` and `preempt_penalty_min` ($0.10 \cdot T_{\text{rem}}$). |
+| `policy_version` | Event | `str` | Active dispatch policy & mode (e.g., `P3_Hybrid_v1.2_ModeA`, `P3_Hybrid_v1.2_ModeB`). |
+| `scenario_shock_flag` | Event | `str` | Real-time telemetry tag (`NORMAL`, `SURGE_U1`, `ES_SPIKE_U2`, `ABSENCE_U3`, `IT_OUTAGE`). |
+
+### Process-Mining & PM4Py Deployment Analyses
+1. **Service-Time Drift & Complex-Tail Detection (`U4` vs. Skill Erosion):**
+   * Use `pm4py.get_service_time(df, start_timestamp_key='start_timestamp', timestamp_key='time:timestamp', aggregation_measure='mean')` (and custom 90th-percentile groupby sliced by `(concept:name, org:resource, pause_resume_count == 0)`).
+   * *Critical Semantic Safeguard:* Because PM4Py computes `time:timestamp - start_timestamp` across the interval row, **paused/preempted executions must either be logged as two separate interval segments (`Diag_Part1`, `Diag_Resumed`) or filtered by `pause_resume_count == 0`**, otherwise preemption wait time pollutes active service time! Comparing `actual_service_min / base_median` per resource detects whether secondary multipliers (`1.25x`, `1.35x`) are improving or eroding, while rising 85th/95th percentiles across *all* resources simultaneously triggers a `U4` (Long-Tail Day) alert.
+2. **Handover Burden & Ping-Pong Detection (`pm4py.discover_handover_of_work_network`):**
+   * Run `pm4py.discover_handover_of_work_network(df)` weekly and stratified by `policy_version`. High edge weights between `{Ada, Ben}` and `{Chen, Deepa, Emil}` quantify costly **12-minute cross-team handovers**. Under `P3_Hybrid`, self-loops `(Deepa -> Deepa, Emil -> Emil)` should dominate compound `ME`/`ES` and `Diag -> Validation` transitions; a drop in self-loops signals broken case-retention logic.
+3. **Bottleneck Migration & Queue Waiting Decomposition:**
+   * Apply `pm4py.insert_case_service_waiting_time(df)` to obtain **case-level** cumulative `@@service_time` and `@@waiting_time` (noting explicitly that for parallel `ME`/`ES` cases, naive sum of branch service times can exceed elapsed wall-clock time unless intervals are merged—which PM4Py handles at the case timeline level—while stage-specific queue wait `start_timestamp - queue_entry_timestamp` and handover lag `queue_entry_timestamp - prev_complete_timestamp` must be computed directly in `pandas`).
+   * Plotting stage-specific `queue_wait_min` by 2-hour block immediately exposes bottleneck migration: e.g., queue wait shifting from `Electrical (14:00–16:00)` into `Validation (12:00–13:30)` during lunch breaks, or spiking on `Intake` during `09:30–10:00` IT outages.
+4. **Policy Conformance & Dispatch Drift Auditing:**
+   * Reconstruct conformance on `eligible_resource_set` and `assignment_reason`: flag violations where a Tier-3 (`1.40x`) assignment occurred with `queue_wait < 30 min` on a `P2/P3` case in Mode A, or where `pause_resume_count > 1` violated the single-preemption rule.
+
+---
+
+# 8. Reproducible Python
+
+The self-contained Python script below encodes all scenario tables in memory, implements a transparent minute-by-minute discrete-event / time-stepped simulation across **4 policies $\times$ 6 scenarios (`Base`, `U1`–`U5`) $\times$ 15 random seeds**, explicitly enforces **7/12-min handovers, 5-min diagnostic family setups, adaptive vs. fixed parallel/sequential `ME`/`ES` branches (+8 min coordination), single-preemption with +10% remaining-time penalty, 30-min shift breaks, 30-min max overtime, and the `U5` 09:30–10:00 Intake outage**, and runs **PM4Py** interval formatting, case service/waiting decomposition, activity service-time profiling, and Handover-of-Work Social Network discovery on the emitted event log.
+
+*(Explicit Simplifications Documented for Auditability: (1) Simulation runs on a 1.0-minute discrete clock from `08:00` (`t=0`) to `20:30` (`t=750`, including 30-min max overtime); (2) Tasks incomplete at `20:30` are marked censored/carried-over: any incomplete P1 (`120m` target) arrived before `18:30` or P2 (`480m` target) arrived before `12:30` is strictly counted as an SLA miss, while arrivals too close to `20:30` to hit their SLA window if resumed at `08:00` next day (`+690 min` overnight off-shift elapsed gap) have exact overnight elapsed time imputed so late-day structural gaps are never hidden!)*
+
+```python
+import math
+import random
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+import pm4py
+
+# ==============================================================================
+# 1. IN-MEMORY PROCESS TABLES (EXACT PROMPT DATA)
+# ==============================================================================
+SERVICE_RANGES = {
+    "Intake":     {"ord": (5.0, 8.0),   "tail": (10.0, 14.0), "p_tail": 0.08},
+    "Mechanical": {"ord": (18.0, 28.0), "tail": (35.0, 55.0), "p_tail": 0.15},
+    "Electrical": {"ord": (22.0, 35.0), "tail": (40.0, 65.0), "p_tail": 0.18},
+    "Software":   {"ord": (25.0, 40.0), "tail": (45.0, 80.0), "p_tail": 0.20},
+    "Validation": {"ord": (10.0, 18.0), "tail": (22.0, 35.0), "p_tail": 0.12},
+}
+
+# Minutes from 08:00 (0 = 08:00, 480 = 16:00, 720 = 20:00, max OT = +30m)
+RESOURCES_SPEC = {
+    "Ada":   {"mult": {"Intake": 1.00, "Mechanical": 1.00, "Electrical": 1.35, "Validation": 1.15},
+              "shift": (0, 480),   "brk": (255, 285), "team": "MECH"},
+    "Ben":   {"mult": {"Intake": 1.10, "Mechanical": 1.00, "Validation": 1.00},
+              "shift": (0, 480),   "brk": (240, 270), "team": "MECH"},
+    "Chen":  {"mult": {"Intake": 1.10, "Electrical": 1.00, "Software": 1.25, "Validation": 1.10},
+              "shift": (0, 480),   "brk": (270, 300), "team": "ES"},
+    "Deepa": {"mult": {"Intake": 1.00, "Mechanical": 1.25, "Electrical": 1.00, "Validation": 1.00},
+              "shift": (120, 600), "brk": (360, 390), "team": "ES"},
+    "Emil":  {"mult": {"Intake": 1.10, "Electrical": 1.30, "Software": 1.00, "Validation": 1.00},
+              "shift": (240, 720), "brk": (480, 510), "team": "ES"},
+    "Farah": {"mult": {"Intake": 1.00, "Mechanical": 1.40, "Electrical": 1.40, "Software": 1.40, "Validation": 1.20},
+              "shift": (0, 240),   "brk": None,       "team": "FLOAT"},
+}
+
+DEMAND_BLOCKS = [
+    {"block": "08:00-10:00", "start": 0,   "end": 120, "arr": 7.0,  "P": {"P1": 10, "P2": 55, "P3": 35}, "T": {"M": 30, "E": 25, "S": 15, "ME": 20, "ES": 10}},
+    {"block": "10:00-12:00", "start": 120, "end": 240, "arr": 9.0,  "P": {"P1": 15, "P2": 55, "P3": 30}, "T": {"M": 25, "E": 25, "S": 15, "ME": 25, "ES": 10}},
+    {"block": "12:00-14:00", "start": 240, "end": 360, "arr": 7.0,  "P": {"P1": 12, "P2": 58, "P3": 30}, "T": {"M": 22, "E": 28, "S": 18, "ME": 20, "ES": 12}},
+    {"block": "14:00-16:00", "start": 360, "end": 480, "arr": 10.0, "P": {"P1": 18, "P2": 52, "P3": 30}, "T": {"M": 20, "E": 30, "S": 18, "ME": 20, "ES": 12}},
+    {"block": "16:00-18:00", "start": 480, "end": 600, "arr": 6.0,  "P": {"P1": 10, "P2": 50, "P3": 40}, "T": {"M": 20, "E": 25, "S": 25, "ME": 15, "ES": 15}},
+    {"block": "18:00-20:00", "start": 600, "end": 720, "arr": 3.0,  "P": {"P1": 5,  "P2": 45, "P3": 50}, "T": {"M": 25, "E": 20, "S": 30, "ME": 10, "ES": 15}},
+]
+
+SLA_TARGETS = {"P1": 120.0, "P2": 480.0, "P3": 1440.0}
+DIAG_ACTS = {"Mechanical", "Electrical", "Software"}
+
+
+def expected_base_minutes(act: str, tail_mult: float = 1.0) -> float:
+    spec = SERVICE_RANGES[act]
+    p_t = min(1.0, spec["p_tail"] * tail_mult if act in DIAG_ACTS else spec["p_tail"])
+    m_ord = 0.5 * (spec["ord"][0] + spec["ord"][1])
+    m_tail = 0.5 * (spec["tail"][0] + spec["tail"][1])
+    return (1.0 - p_t) * m_ord + p_t * m_tail
+
+
+def get_scenario_config(scenario: str):
+    blocks = []
+    for b in DEMAND_BLOCKS:
+        nb = {"block": b["block"], "start": b["start"], "end": b["end"], "arr": b["arr"],
+              "P": dict(b["P"]), "T": dict(b["T"])}
+        if scenario in ("U1", "U5") and b["start"] < 240:
+            nb["arr"] = b["arr"] * 1.7
+            new_p1 = b["P"]["P1"] + 8.0
+            rem_old = b["P"]["P2"] + b["P"]["P3"]
+            rem_new = 100.0 - new_p1
+            nb["P"] = {
+                "P1": new_p1,
+                "P2": b["P"]["P2"] * rem_new / rem_old,
+                "P3": b["P"]["P3"] * rem_new / rem_old,
+            }
+        if scenario == "U2" and 240 <= b["start"] < 480:
+            t_raw = dict(nb["T"])
+            t_raw["E"] *= 2.0
+            t_raw["ES"] *= 2.0
+            tot = sum(t_raw.values())
+            nb["T"] = {k: v * 100.0 / tot for k, v in t_raw.items()}
+        blocks.append(nb)
+
+    absent = {"Chen"} if scenario in ("U3", "U5") else set()
+    tail_mult = 2.0 if scenario == "U4" else 1.0
+    intake_outage = (90, 120) if scenario == "U5" else None  # 09:30-10:00
+    return blocks, absent, tail_mult, intake_outage
+
+
+# ==============================================================================
+# 2. DETERMINISTIC OFFERED-LOAD & CAPACITY AUDIT HELPER
+# ==============================================================================
+def compute_offered_load_summary() -> pd.DataFrame:
+    rows = []
+    for scen in ["Base", "U1", "U2", "U3", "U4", "U5"]:
+        blocks, absent, tail_mult, _ = get_scenario_config(scen)
+        exp_m = {a: expected_base_minutes(a, tail_mult) for a in SERVICE_RANGES}
+        tot_arr, m_min, e_min, s_min, iv_min = 0.0, 0.0, 0.0, 0.0, 0.0
+        for b in blocks:
+            n = b["arr"]
+            tot_arr += n
+            tp = {k: v / 100.0 for k, v in b["T"].items()}
+            iv_min += n * (exp_m["Intake"] + exp_m["Validation"])
+            m_min += n * (tp["M"] + tp["ME"]) * exp_m["Mechanical"]
+            e_min += n * (tp["E"] + tp["ME"] + tp["ES"]) * exp_m["Electrical"]
+            s_min += n * (tp["S"] + tp["ES"]) * exp_m["Software"]
+        reg_cap = sum(
+            (spec["shift"][1] - spec["shift"][0]) - (30 if spec["brk"] else 0)
+            for r, spec in RESOURCES_SPEC.items() if r not in absent
+        )
+        tot_work = iv_min + m_min + e_min + s_min
+        rows.append({
+            "Scenario": scen,
+            "Exp_Arrivals": round(tot_arr, 1),
+            "M_Base_Min": round(m_min, 1),
+            "E_Base_Min": round(e_min, 1),
+            "S_Base_Min": round(s_min, 1),
+            "IV_Base_Min": round(iv_min, 1),
+            "Total_Base_Min": round(tot_work, 1),
+            "Reg_Shift_Cap": reg_cap,
+            "Base_Load_to_Cap": round(tot_work / reg_cap, 2),
+        })
+    return pd.DataFrame(rows)
+
+
+# ==============================================================================
+# 3. DISCRETE-EVENT / MINUTE-STEPPED SIMULATION ENGINE
+# ==============================================================================
+@dataclass
+class Task:
+    task_id: str
+    case_id: str
+    activity: str
+    base_minutes: float
+    ready_time: float
+    prev_resources: List[str] = field(default_factory=list)
+    assigned_res: Optional[str] = None
+    locked_res: Optional[str] = None  # For sequential ME/ES second branch if desired
+    rem_active_min: float = 0.0
+    setup_rem_min: float = 0.0
+    setup_incurred: float = 0.0
+    handover_incurred: float = 0.0
+    first_start_time: Optional[float] = None
+    segment_start_time: Optional[float] = None
+    complete_time: Optional[float] = None
+    was_paused: bool = False
+
+
+@dataclass
+class Case:
+    case_id: str
+    arrival_time: float
+    priority: str
+    case_type: str
+    preempt_count: int = 0
+    branch_mode: str = "SINGLE"  # SINGLE, PARALLEL, SEQUENTIAL
+    stage: str = "INTAKE"        # INTAKE, DIAG, VALIDATION, DONE
+    pending_seq_act: Optional[str] = None
+    diag_done_times: List[float] = field(default_factory=list)
+    diag_done_res: List[str] = field(default_factory=list)
+    complete_time: Optional[float] = None
+    coord_incurred: float = 0.0
+
+
+@dataclass
+class ResourceState:
+    name: str
+    team: str
+    mult: Dict[str, float]
+    shift_start: int
+    shift_end: int
+    brk: Optional[Tuple[int, int]]
+    current_task: Optional[Task] = None
+    last_diag_skill: Optional[str] = None
+    busy_service_min: float = 0.0
+    busy_setup_min: float = 0.0
+    avail_reg_min: float = 0.0
+
+
+def calc_handover_delay(prev_res_list: List[str], new_res: str) -> float:
+    if not prev_res_list:
+        return 0.0
+    # Worst-case handover from feeding stage/branches
+    worst = 0.0
+    new_team = RESOURCES_SPEC[new_res]["team"]
+    for pr in prev_res_list:
+        if pr == new_res:
+            d = 0.0
+        else:
+            d = 7.0
+            prev_team = RESOURCES_SPEC[pr]["team"]
+            # Cross-team penalty between MECH and ES (or FLOAT bridging without retaining)
+            if (prev_team == "MECH" and new_team == "ES") or (prev_team == "ES" and new_team == "MECH"):
+                d += 5.0
+            elif "FLOAT" in (prev_team, new_team) and prev_team != new_team:
+                d += 5.0
+        worst = max(worst, d)
+    return worst
+
+
+def sample_base_duration(act: str, tail_mult: float, rng: random.Random) -> float:
+    spec = SERVICE_RANGES[act]
+    p_t = min(1.0, spec["p_tail"] * tail_mult if act in DIAG_ACTS else spec["p_tail"])
+    lo, hi = spec["tail"] if rng.random() < p_t else spec["ord"]
+    return rng.uniform(lo, hi)
+
+
+def generate_arrivals(blocks, rng: random.Random) -> List[Case]:
+    cases = []
+    cid = 1
+    for b in blocks:
+        rate = b["arr"] / (b["end"] - b["start"])
+        t = float(b["start"])
+        p_keys = ["P1", "P2", "P3"]
+        p_weights = [b["P"][k] for k in p_keys]
+        t_keys = ["M", "E", "S", "ME", "ES"]
+        t_weights = [b["T"][k] for k in t_keys]
+        while True:
+            t += rng.expovariate(rate)
+            if t >= b["end"]:
+                break
+            prio = rng.choices(p_keys, weights=p_weights, k=1)[0]
+            ctype = rng.choices(t_keys, weights=t_weights, k=1)[0]
+            cases.append(Case(case_id=f"INC_{cid:04d}", arrival_time=round(t, 2),
+                              priority=prio, case_type=ctype))
+            cid += 1
+    return cases
+
+
+def is_res_available_at(res: ResourceState, t: int, allow_ot: bool = False) -> bool:
+    end_cap = res.shift_end + (30 if allow_ot else 0)
+    if t < res.shift_start or t >= end_cap:
+        return False
+    if res.brk is not None and res.brk[0] <= t < res.brk[1]:
+        return False
+    return True
+
+
+def is_eligible(policy: str, res: ResourceState, task: Task, case: Case, t: int,
+                wait_min: float, e_s_queue_len: int, surge_mode: bool, absent_set: set) -> bool:
+    act = task.activity
+    if act not in res.mult:
+        return False
+    m = res.mult[act]
+
+    if policy == "P1_Spec":
+        if act in ("Mechanical", "Electrical"):
+            return m == 1.00
+        if act == "Software":
+            # Emil 1.0x, or Chen 1.25x strictly before 12:00 when Emil off-shift
+            return m == 1.00 or (res.name == "Chen" and t < 240)
+        return True  # Intake & Validation open to qualified
+
+    if policy == "P2_Pool":
+        return True
+
+    # P3_Hybrid & P4_FairBal shared tiering + bottleneck shielding
+    if act in ("Intake", "Validation"):
+        # Shield E/S specialists when E/S diag queue exists, unless P1 or zero-handover Validation
+        if res.name in ("Chen", "Deepa", "Emil") and e_s_queue_len >= 1:
+            if case.priority == "P1":
+                return True
+            if act == "Validation" and task.prev_resources == [res.name]:
+                return True
+            # Allow if no MECH/FLOAT staff is currently on shift (after 16:00)
+            if t >= 480:
+                return True
+            return False
+        return True
+
+    # Diagnostic tiering for P3_Hybrid / P4_FairBal
+    if m <= 1.00:
+        return True
+    if m <= 1.25:
+        # Tier 2: Chen on S, Deepa on M
+        no_tier1_on_shift = (act == "Software" and t < 240) or (act == "Mechanical" and t >= 480)
+        if case.priority == "P1" or no_tier1_on_shift or wait_min >= 12.0 or surge_mode:
+            return True
+        return False
+
+    # Tier 3 (1.30x - 1.40x: Ada E, Emil E, Farah M/E/S)
+    no_tier12_on_shift = (
+        (act == "Electrical" and t >= 600) or
+        (act == "Electrical" and "Chen" in absent_set and t < 120) or
+        (act == "Software" and "Chen" in absent_set and t < 240)
+    )
+    if case.priority == "P1" or no_tier12_on_shift:
+        return True
+    if case.priority == "P2" and wait_min >= (20.0 if surge_mode else 30.0):
+        return True
+    return False
+
+
+def simulate_day(policy: str, scenario: str, seed: int, emit_log: bool = False):
+    rng = random.Random(seed)
+    blocks, absent, tail_mult, intake_outage = get_scenario_config(scenario)
+    cases = generate_arrivals(blocks, rng)
+    case_map = {c.case_id: c for c in cases}
+
+    resources: Dict[str, ResourceState] = {}
+    for rname, spec in RESOURCES_SPEC.items():
+        if rname in absent:
+            continue
+        resources[rname] = ResourceState(
+            name=rname, team=spec["team"], mult=dict(spec["mult"]),
+            shift_start=spec["shift"][0], shift_end=spec["shift"][1], brk=spec["brk"]
+        )
+
+    ready_queue: List[Task] = []
+    delayed_tasks: List[Tuple[float, Task]] = []  # Waiting for handover or parallel coord
+    event_rows = []
+    arr_idx = 0
+    n_cases = len(cases)
+    base_exp = {a: expected_base_minutes(a, tail_mult) for a in SERVICE_RANGES}
+
+    def enqueue_with_handover(task: Task, now_t: float, chosen_hint: Optional[str] = None):
+        # Handover delay is applied when moving across stages if resource changes;
+        # we model stage transition readiness and add exact handover lag at assignment if diff res
+        task.ready_time = now_t
+        ready_queue.append(task)
+
+    for t in range(0, 751):  # 08:00 (0) to 20:30 (750)
+        # 1. Inject new arrivals
+        while arr_idx < n_cases and cases[arr_idx].arrival_time <= t:
+            c = cases[arr_idx]
+            t_in = Task(
+                task_id=f"{c.case_id}_Intake", case_id=c.case_id, activity="Intake",
+                base_minutes=sample_base_duration("Intake", tail_mult, rng),
+                ready_time=c.arrival_time
+            )
+            ready_queue.append(t_in)
+            arr_idx += 1
+
+        # Release delayed tasks (handover lag / 8-min parallel coordination completed)
+        still_delayed = []
+        for rel_t, dtask in delayed_tasks:
+            if rel_t <= t:
+                ready_queue.append(dtask)
+            else:
+                still_delayed.append((rel_t, dtask))
+        delayed_tasks = still_delayed
+
+        # Track regular shift availability
+        on_shift_staff = [r for r in resources.values() if is_res_available_at(r, t, allow_ot=False)]
+        for r in on_shift_staff:
+            r.avail_reg_min += 1.0
+
+        # Pause any active task whose resource enters break or hits hard shift+30m OT limit
+        for r in resources.values():
+            if r.current_task is not None:
+                # Allow up to 30m overtime ONLY to finish an already-started task or P1/surge
+                can_work = is_res_available_at(r, t, allow_ot=(t >= r.shift_end))
+                if not can_work:
+                    tk = r.current_task
+                    if emit_log and tk.segment_start_time is not None and t > tk.segment_start_time:
+                        event_rows.append({
+                            "case:concept:name": tk.case_id,
+                            "concept:name": tk.activity,
+                            "org:resource": r.name,
+                            "start_timestamp": tk.segment_start_time,
+                            "time:timestamp": float(t),
+                            "case:priority": case_map[tk.case_id].priority,
+                            "case:type": case_map[tk.case_id].case_type,
+                            "policy_version": policy,
+                            "scenario_flag": scenario,
+                            "handover_min": tk.handover_incurred,
+                            "setup_min": tk.setup_incurred,
+                            "was_preempted": tk.was_paused,
+                            "segment_type": "SHIFT_OR_BREAK_PAUSE",
+                        })
+                    tk.was_paused = True
+                    tk.segment_start_time = None
+                    r.current_task = None
+                    ready_queue.append(tk)
+
+        # Determine surge mode for P3_Hybrid
+        p12_diag_q = sum(1 for tk in ready_queue if tk.activity in DIAG_ACTS and case_map[tk.case_id].priority in ("P1", "P2"))
+        oldest_p1_wait = max([t - tk.ready_time for tk in ready_queue if case_map[tk.case_id].priority == "P1"] + [0.0])
+        it_outage_now = intake_outage is not None and intake_outage[0] <= t < intake_outage[1]
+        surge_mode = (policy == "P3_Hybrid") and (
+            p12_diag_q >= 6 or oldest_p1_wait > 15.0 or len(absent) > 0 or it_outage_now
+        )
+
+        # 2. Preemption check for waiting P1 Diagnostic tasks
+        p1_waiting_diags = [
+            tk for tk in ready_queue
+            if tk.activity in DIAG_ACTS and case_map[tk.case_id].priority == "P1"
+        ]
+        for p1_tk in p1_waiting_diags:
+            # Check if any qualified idle resource is already available right now
+            e_s_q = sum(1 for q in ready_queue if q.activity in ("Electrical", "Software"))
+            idle_qual = [
+                r for r in resources.values()
+                if r.current_task is None and is_res_available_at(r, t, allow_ot=False)
+                and is_eligible(policy, r, p1_tk, case_map[p1_tk.case_id], t, t - p1_tk.ready_time, e_s_q, surge_mode, absent)
+            ]
+            if idle_qual:
+                continue
+
+            # Look for preemptable active diagnostic (P3 first, then P2, preempt_count == 0)
+            candidates = []
+            for r in resources.values():
+                if r.current_task is None or not is_res_available_at(r, t, allow_ot=False):
+                    continue
+                cur_tk = r.current_task
+                cur_c = case_map[cur_tk.case_id]
+                if cur_tk.activity in DIAG_ACTS and cur_c.priority in ("P2", "P3") and cur_c.preempt_count == 0:
+                    if is_eligible(policy, r, p1_tk, case_map[p1_tk.case_id], t, t - p1_tk.ready_time, e_s_q, surge_mode, absent):
+                        # P3_Hybrid / P4_FairBal suppress preemption if <10m remaining on active task
+                        if policy in ("P3_Hybrid", "P4_FairBal") and (cur_tk.rem_active_min + cur_tk.setup_rem_min) < 10.0:
+                            continue
+                        prio_rank = 0 if cur_c.priority == "P3" else 1
+                        candidates.append((prio_rank, r.mult[p1_tk.activity], -cur_tk.rem_active_min, r))
+            if candidates:
+                candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+                victim_r = candidates[0][3]
+                vic_tk = victim_r.current_task
+                vic_c = case_map[vic_tk.case_id]
+                vic_c.preempt_count += 1
+                vic_tk.rem_active_min *= 1.10  # +10% remaining active service restart penalty
+                vic_tk.was_paused = True
+                if emit_log and vic_tk.segment_start_time is not None and t > vic_tk.segment_start_time:
+                    event_rows.append({
+                        "case:concept:name": vic_tk.case_id,
+                        "concept:name": vic_tk.activity,
+                        "org:resource": victim_r.name,
+                        "start_timestamp": vic_tk.segment_start_time,
+                        "time:timestamp": float(t),
+                        "case:priority": vic_c.priority,
+                        "case:type": vic_c.case_type,
+                        "policy_version": policy,
+                        "scenario_flag": scenario,
+                        "handover_min": vic_tk.handover_incurred,
+                        "setup_min": vic_tk.setup_incurred,
+                        "was_preempted": True,
+                        "segment_type": "PREEMPTED_PART1",
+                    })
+                vic_tk.segment_start_time = None
+                victim_r.current_task = None
+                ready_queue.append(vic_tk)
+
+        # 3. Dispatch ready tasks to idle resources
+        idle_resources = [
+            r for r in resources.values()
+            if r.current_task is None and is_res_available_at(r, t, allow_ot=(t >= r.shift_end and p12_diag_q > 0))
+        ]
+        # Sort idle resources so specialists evaluate cleanly
+        mean_util = np.mean([
+            (r.busy_service_min + r.busy_setup_min) / max(1.0, r.avail_reg_min)
+            for r in resources.values()
+        ]) if resources else 0.0
+
+        while idle_resources and ready_queue:
+            e_s_q = sum(1 for q in ready_queue if q.activity in ("Electrical", "Software"))
+            best_pair = None
+            best_score = None
+
+            for r in idle_resources:
+                r_util = (r.busy_service_min + r.busy_setup_min) / max(1.0, r.avail_reg_min)
+                for tk in ready_queue:
+                    if tk.activity == "Intake" and it_outage_now:
+                        continue
+                    c = case_map[tk.case_id]
+                    wait_m = t - tk.ready_time
+
+                    # P3 reservation & surge freeze under P3_Hybrid / P4_FairBal
+                    effective_prio = c.priority
+                    if policy == "P4_FairBal" and c.priority == "P3" and wait_m > 360.0 and oldest_p1_wait == 0:
+                        effective_prio = "P2"
+
+                    if policy in ("P3_Hybrid", "P4_FairBal") and effective_prio == "P3" and tk.activity in DIAG_ACTS:
+                        if len(on_shift_staff) >= 4 and len(idle_resources) <= 1:
+                            continue  # Reserve last idle slot for P1/P2 arrivals
+                        if surge_mode and e_s_q >= 3:
+                            continue  # Mode B triage freeze on P3 diagnostics
+
+                    if not is_eligible(policy, r, tk, c, t, wait_m, e_s_q, surge_mode, absent):
+                        continue
+
+                    h_lag = calc_handover_delay(tk.prev_resources, r.name) if tk.first_start_time is None else 0.0
+                    needs_setup = (tk.activity in DIAG_ACTS and r.last_diag_skill is not None and r.last_diag_skill != tk.activity)
+                    setup_m = 5.0 if (needs_setup and tk.first_start_time is None) else 0.0
+                    exp_srv = r.mult[tk.activity] * base_exp[tk.activity]
+
+                    prio_tier = {"P1": 0, "P2": 1, "P3": 2}[effective_prio]
+                    stage_rank = {"Validation": 0, "Intake": 1}.get(tk.activity, 2)
+
+                    if policy == "P1_Spec":
+                        # Strict Prio -> Validation/Intake -> Zero handover -> FIFO
+                        score = (prio_tier, stage_rank, 1 if h_lag > 0 else 0, tk.ready_time, r.mult[tk.activity])
+                    elif policy == "P2_Pool":
+                        # Priority class -> SEPT + setup + handover - wait aging
+                        cost = exp_srv + setup_m + 0.5 * h_lag - 0.3 * wait_m
+                        score = (prio_tier, cost)
+                    elif policy == "P3_Hybrid":
+                        # Urgent slack + retention bonus + setup avoidance + multiplier efficiency
+                        rem_sla = (c.arrival_time + SLA_TARGETS[c.priority]) - t
+                        val_prio = -25.0 if (c.priority == "P1" and tk.activity == "Validation") else 0.0
+                        ret_bonus = -15.0 if (tk.prev_resources == [r.name]) else (0.5 * h_lag)
+                        score = (prio_tier, val_prio + 0.35 * rem_sla + exp_srv + setup_m + ret_bonus)
+                    else:  # P4_FairBal
+                        rem_sla = (c.arrival_time + SLA_TARGETS[c.priority]) - t
+                        fair_pen = 45.0 * max(0.0, r_util - mean_util)
+                        ret_bonus = -12.0 if (tk.prev_resources == [r.name]) else (0.5 * h_lag)
+                        score = (prio_tier, 0.35 * rem_sla + exp_srv + setup_m + ret_bonus + fair_pen)
+
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_pair = (r, tk, h_lag, setup_m)
+
+            if best_pair is None:
+                break
+
+            chosen_r, chosen_tk, h_lag, setup_m = best_pair
+            ready_queue.remove(chosen_tk)
+
+            # If handover delay > 0 and not yet waited out, release task after handover lag!
+            # (Resource stays free during passive case transfer!)
+            if h_lag > 0 and chosen_tk.handover_incurred == 0.0 and (t - chosen_tk.ready_time) < h_lag:
+                rem_h = math.ceil(h_lag - (t - chosen_tk.ready_time))
+                chosen_tk.handover_incurred = h_lag
+                chosen_tk.prev_resources = []  # Handover accounted for
+                delayed_tasks.append((t + rem_h, chosen_tk))
+                continue
+
+            idle_resources.remove(chosen_r)
+            if chosen_tk.first_start_time is None:
+                chosen_tk.handover_incurred = max(chosen_tk.handover_incurred, min(h_lag, t - chosen_tk.ready_time))
+                chosen_tk.rem_active_min = chosen_tk.base_minutes * chosen_r.mult[chosen_tk.activity]
+                chosen_tk.setup_rem_min = setup_m
+                chosen_tk.setup_incurred = setup_m
+                chosen_tk.first_start_time = float(t)
+            else:
+                # Resumed task: rescale remaining active time if resumed on a different multiplier
+                prev_m = RESOURCES_SPEC[chosen_tk.assigned_res]["mult"][chosen_tk.activity]
+                chosen_tk.rem_active_min = (chosen_tk.rem_active_min / prev_m) * chosen_r.mult[chosen_tk.activity]
+
+            chosen_tk.assigned_res = chosen_r.name
+            chosen_tk.segment_start_time = float(t)
+            chosen_r.current_task = chosen_tk
+            if chosen_tk.activity in DIAG_ACTS:
+                chosen_r.last_diag_skill = chosen_tk.activity
+
+        # 4. Advance 1 minute of active processing on all busy resources
+        for r in resources.values():
+            tk = r.current_task
+            if tk is None:
+                continue
+            dt = 1.0
+            if tk.setup_rem_min > 0:
+                used_s = min(dt, tk.setup_rem_min)
+                tk.setup_rem_min -= used_s
+                r.busy_setup_min += used_s
+                dt -= used_s
+            if dt > 0 and tk.rem_active_min > 0:
+                used_a = min(dt, tk.rem_active_min)
+                tk.rem_active_min -= used_a
+                r.busy_service_min += used_a
+
+            # Check task completion at t + 1
+            if tk.setup_rem_min <= 1e-6 and tk.rem_active_min <= 1e-6:
+                fin_t = float(t + 1)
+                tk.complete_time = fin_t
+                c = case_map[tk.case_id]
+                if emit_log:
+                    event_rows.append({
+                        "case:concept:name": tk.case_id,
+                        "concept:name": tk.activity,
+                        "org:resource": r.name,
+                        "start_timestamp": tk.segment_start_time,
+                        "time:timestamp": fin_t,
+                        "case:priority": c.priority,
+                        "case:type": c.case_type,
+                        "policy_version": policy,
+                        "scenario_flag": scenario,
+                        "handover_min": tk.handover_incurred,
+                        "setup_min": tk.setup_incurred,
+                        "was_preempted": tk.was_paused,
+                        "segment_type": "COMPLETE",
+                    })
+                r.current_task = None
+
+                # Advance Case Control Flow: Intake -> Diagnostic(s) -> Validation
+                if tk.activity == "Intake":
+                    c.stage = "DIAG"
+                    if c.case_type in ("M", "E", "S"):
+                        act_name = {"M": "Mechanical", "E": "Electrical", "S": "Software"}[c.case_type]
+                        c.branch_mode = "SINGLE"
+                        ntk = Task(f"{c.case_id}_{act_name}", c.case_id, act_name,
+                                   sample_base_duration(act_name, tail_mult, rng), fin_t, [r.name])
+                        enqueue_with_handover(ntk, fin_t)
+                    else:
+                        b1, b2 = ("Mechanical", "Electrical") if c.case_type == "ME" else ("Electrical", "Software")
+                        diag_q_now = sum(1 for q in ready_queue if q.activity in DIAG_ACTS)
+                        # Decide Parallel vs Sequential branch execution
+                        if policy in ("P1_Spec", "P2_Pool"):
+                            use_parallel = len(on_shift_staff) >= 2
+                        else:
+                            # P3_Hybrid / P4_FairBal: Parallel for P1 if slack, or P2/P3 when diag queue <= 2
+                            if c.priority == "P1":
+                                use_parallel = (len(idle_resources) >= 1 and not surge_mode)
+                            else:
+                                use_parallel = (diag_q_now <= 2 and not surge_mode and len(on_shift_staff) >= 3)
+
+                        if use_parallel:
+                            c.branch_mode = "PARALLEL"
+                            for b_act in (b1, b2):
+                                btk = Task(f"{c.case_id}_{b_act}", c.case_id, b_act,
+                                           sample_base_duration(b_act, tail_mult, rng), fin_t, [r.name])
+                                enqueue_with_handover(btk, fin_t)
+                        else:
+                            c.branch_mode = "SEQUENTIAL"
+                            c.pending_seq_act = b2
+                            btk1 = Task(f"{c.case_id}_{b1}", c.case_id, b1,
+                                        sample_base_duration(b1, tail_mult, rng), fin_t, [r.name])
+                            enqueue_with_handover(btk1, fin_t)
+
+                elif tk.activity in DIAG_ACTS:
+                    if c.branch_mode == "SINGLE":
+                        c.stage = "VALIDATION"
+                        vtk = Task(f"{c.case_id}_Validation", c.case_id, "Validation",
+                                   sample_base_duration("Validation", tail_mult, rng), fin_t, [r.name])
+                        enqueue_with_handover(vtk, fin_t)
+                    elif c.branch_mode == "SEQUENTIAL":
+                        if c.pending_seq_act is not None:
+                            next_b = c.pending_seq_act
+                            c.pending_seq_act = None
+                            btk2 = Task(f"{c.case_id}_{next_b}", c.case_id, next_b,
+                                        sample_base_duration(next_b, tail_mult, rng), fin_t, [r.name])
+                            enqueue_with_handover(btk2, fin_t)
+                        else:
+                            c.stage = "VALIDATION"
+                            vtk = Task(f"{c.case_id}_Validation", c.case_id, "Validation",
+                                       sample_base_duration("Validation", tail_mult, rng), fin_t, [r.name])
+                            enqueue_with_handover(vtk, fin_t)
+                    else:  # PARALLEL
+                        c.diag_done_times.append(fin_t)
+                        c.diag_done_res.append(r.name)
+                        if len(c.diag_done_times) == 2:
+                            c.stage = "VALIDATION"
+                            c.coord_incurred = 8.0  # +8 min parallel coordination penalty
+                            vtk = Task(f"{c.case_id}_Validation", c.case_id, "Validation",
+                                       sample_base_duration("Validation", tail_mult, rng),
+                                       fin_t + 8.0, list(c.diag_done_res))
+                            delayed_tasks.append((fin_t + 8.0, vtk))
+
+                elif tk.activity == "Validation":
+                    c.stage = "DONE"
+                    c.complete_time = fin_t
+
+    # 5. Compute Case & Resource Metrics (accounting explicitly for 20:30 unfinished carryover)
+    delays, p1_hits, p2_hits, ho_setup_burdens = [], [], [], []
+    unfinished = 0
+    for c in cases:
+        # Base reference minimum work time at 1.0x for delay calculation
+        acts = ["Intake", "Validation"] + (
+            [{"M": "Mechanical", "E": "Electrical", "S": "Software"}[c.case_type]]
+            if c.case_type in ("M", "E", "S")
+            else (["Mechanical", "Electrical"] if c.case_type == "ME" else ["Electrical", "Software"])
+        )
+        ideal_min_srv = (
+            base_exp["Intake"] + base_exp["Validation"] +
+            (max(base_exp[acts[2]], base_exp[acts[3]]) if len(acts) == 4 else base_exp[acts[2]])
+        )
+        if c.complete_time is not None:
+            ct = c.complete_time - c.arrival_time
+        else:
+            unfinished += 1
+            # Carryover resumes at 08:00 next morning (+690m overnight off-shift gap + ~45m morning completion)
+            ct = (750.0 - c.arrival_time) + 690.0 + 45.0
+        delays.append(max(0.0, ct - ideal_min_srv))
+        if c.priority == "P1":
+            p1_hits.append(1.0 if ct <= 120.0 else 0.0)
+        elif c.priority == "P2":
+            p2_hits.append(1.0 if ct <= 480.0 else 0.0)
+
+    utils = {
+        r.name: (r.busy_service_min + r.busy_setup_min) / max(1.0, r.avail_reg_min)
+        for r in resources.values()
+    }
+    core_utils = [u for rn, u in utils.items() if rn != "Farah"]
+    tot_setup = sum(r.busy_setup_min for r in resources.values())
+
+    metrics = {
+        "mean_delay": float(np.mean(delays)) if delays else 0.0,
+        "p90_delay": float(np.percentile(delays, 90)) if delays else 0.0,
+        "P1_SLA": 100.0 * float(np.mean(p1_hits)) if p1_hits else 100.0,
+        "P2_SLA": 100.0 * float(np.mean(p2_hits)) if p2_hits else 100.0,
+        "max_util": 100.0 * max(utils.values()),
+        "util_spread": 100.0 * (max(core_utils) - min(core_utils)),
+        "setup_min_day": tot_setup,
+        "unfinished_eod": unfinished,
+    }
+    return metrics, event_rows
+
+
+# ==============================================================================
+# 4. EXECUTE BENCHMARK MATRIX & PM4PY INTERVAL LOG POST-ANALYSIS
+# ==============================================================================
+if __name__ == "__main__":
+    print("=== CAPACITY & OFFERED-LOAD SUMMARY (DETERMINISTIC BASE MINUTES) ===")
+    load_df = compute_offered_load_summary()
+    print(load_df.to_string(index=False))
+
+    policies = ["P1_Spec", "P2_Pool", "P3_Hybrid", "P4_FairBal"]
+    scenarios = ["Base", "U1", "U2", "U3", "U4", "U5"]
+    n_seeds = 15
+
+    summary_rows = []
+    sample_log_rows = []
+
+    for scen in scenarios:
+        for pol in policies:
+            seed_metrics = []
+            for s in range(100, 100 + n_seeds):
+                capture = (scen == "Base" and pol == "P3_Hybrid" and s in (100, 101, 102))
+                m, ev = simulate_day(pol, scen, seed=s, emit_log=capture)
+                seed_metrics.append(m)
+                if capture:
+                    for row in ev:
+                        row["case:concept:name"] = f"S{s}_{row['case:concept:name']}"
+                        sample_log_rows.append(row)
+
+            mdf = pd.DataFrame(seed_metrics)
+            summary_rows.append({
+                "Scenario": scen,
+                "Policy": pol,
+                "MeanDelay_m": f"{mdf['mean_delay'].mean():.1f}±{mdf['mean_delay'].std():.1f}",
+                "P90Delay_m": f"{mdf['p90_delay'].mean():.1f}",
+                "P1_SLA_%": f"{mdf['P1_SLA'].mean():.1f}%",
+                "P2_SLA_%": f"{mdf['P2_SLA'].mean():.1f}%",
+                "MaxUtil_%": f"{mdf['max_util'].mean():.1f}%",
+                "UtilSpread_%": f"{mdf['util_spread'].mean():.1f}%",
+                "SetupMin": f"{mdf['setup_min_day'].mean():.1f}",
+                "EOD_Carry": f"{mdf['unfinished_eod'].mean():.1f}",
+            })
+
+    comp_df = pd.DataFrame(summary_rows)
+    print("\n=== MULTI-SEED POLICY x SCENARIO SIMULATION COMPARISON (15 SEEDS/CELL) ===")
+    print(comp_df.to_string(index=False))
+
+    # --------------------------------------------------------------------------
+    # 5. PM4PY INTERVAL EVENT LOG FORMATTING & DIAGNOSTICS (BASE, P3_HYBRID)
+    # --------------------------------------------------------------------------
+    raw_log_df = pd.DataFrame(sample_log_rows)
+    base_epoch = pd.Timestamp("2025-05-12 08:00:00")
+    raw_log_df["start_timestamp"] = base_epoch + pd.to_timedelta(raw_log_df["start_timestamp"], unit="m")
+    raw_log_df["time:timestamp"] = base_epoch + pd.to_timedelta(raw_log_df["time:timestamp"], unit="m")
+
+    # Format explicitly as a PM4Py interval DataFrame
+    pm_df = pm4py.format_dataframe(
+        raw_log_df,
+        case_id="case:concept:name",
+        activity_key="concept:name",
+        timestamp_key="time:timestamp",
+        start_timestamp_key="start_timestamp",
+    )
+
+    # A) Case-level cumulative active service vs. passive inter-event waiting time
+    pm_with_sw = pm4py.insert_case_service_waiting_time(
+        pm_df,
+        start_timestamp_key="start_timestamp",
+        timestamp_key="time:timestamp",
+    )
+    case_sw = (
+        pm_with_sw.groupby("case:concept:name")[["@@service_time", "@@waiting_time"]]
+        .last()
+        .div(60.0)  # PM4Py outputs seconds -> convert to minutes
+        .rename(columns={"@@service_time": "pm4py_case_active_service_min",
+                         "@@waiting_time": "pm4py_case_passive_waiting_min"})
+    )
+    print("\n=== PM4PY CASE-LEVEL ACTIVE SERVICE VS PASSIVE WAITING SUMMARY (MINUTES) ===")
+    print(case_sw.describe().loc[["count", "mean", "50%", "max"]].round(2).to_string())
+
+    # B) Activity-level interval service time (seconds -> minutes) on non-fragmented completions
+    clean_seg_df = pm_df[pm_df["segment_type"] == "COMPLETE"].copy()
+    srv_sec = pm4py.get_service_time(
+        clean_seg_df,
+        start_timestamp_key="start_timestamp",
+        timestamp_key="time:timestamp",
+        aggregation_measure="mean",
+    )
+    srv_tbl = pd.DataFrame([
+        {"Activity": k, "Mean_Interval_Service_Incl_Setup_Min": round(v / 60.0, 2),
+         "Mean_Recorded_Setup_Min": round(clean_seg_df[clean_seg_df["concept:name"] == k]["setup_min"].mean(), 2),
+         "Mean_PreStage_Handover_Min": round(clean_seg_df[clean_seg_df["concept:name"] == k]["handover_min"].mean(), 2)}
+        for k, v in srv_sec.items()
+    ]).sort_values("Activity")
+    print("\n=== PM4PY ACTIVITY SERVICE TIME & STAGE HANDOVER/SETUP DECOMPOSITION ===")
+    print(srv_tbl.to_string(index=False))
+
+    # C) Handover-of-Work Social Network Discovery
+    hw_metric = pm4py.discover_handover_of_work_network(pm_df)
+    edges = [
+        {"From_Resource": u, "To_Resource": v, "Same_Res": u == v, "PM4Py_HoW_Weight": round(w, 4)}
+        for (u, v), w in hw_metric.connections.items() if w > 0.02
+    ]
+    hw_df = pd.DataFrame(edges).sort_values("PM4Py_HoW_Weight", ascending=False).head(10)
+    print("\n=== PM4PY TOP HANDOVER-OF-WORK NETWORK CONNECTIONS (P3_HYBRID) ===")
+    print(hw_df.to_string(index=False))
+```
+
+---
+
+# 9. Limits and validation plan
+
+### What Cannot Be Concluded from Expected Arrivals and Service Ranges Alone
+1. **True Arrival Burstiness & Batch Correlation:** Expected block arrivals (`7, 9, 7, 10, 6, 3`) do not reveal whether incidents arrive independently (Poisson, variance-to-mean $= 1$) or in **correlated multi-ticket clusters** (e.g., one plant power dip generating 5 `E`/`ES` cases within 4 minutes). Clustered arrivals trigger `P3_Hybrid`’s Mode B much more frequently and degrade `P1_SLA` by 5–12 percentage points relative to Poisson assumptions.
+2. **Overnight Clock Semantics & Carryover Accumulation:** The prompt defines priority SLAs in *elapsed* minutes/hours (`120m`, `8h`, `24h`) while staffing runs `08:00–20:00` (+30m OT). We cannot tell from a single-day demand table whether SLA clocks pause overnight (`20:00–08:00`), whether night-shift skeleton coverage exists, or how Day-1 unfinished `18:00–20:00` Mechanical/P3 backlog depresses Day-2 morning capacity.
+3. **Stochastic Dependency Between Case Complexity, Priority, and Rework:** Our model assumes `P1` cases have the same complex-tail probabilities as `P3` cases, that `M` and `E` branch durations inside an `ME` case are independent, and that `Validation` never fails (`Validation -> Diagnostic` rework loop $= 0\%$). If `P1` cases are disproportionately complex-tail (`U4`-like) or if parallel `ME` branches have higher Validation failure rates than single-owner sequential `ME` executions, sequential execution on `Deepa`/`Chen` becomes even stronger.
+4. **Empirical Human Multipliers & Fatigue Curves:** Static multipliers (`1.00`, `1.25`, `1.40`) omit fatigue after 6+ hours at 88% utilization and omit variance inflation (whether a `1.40x` generalist also has higher variance or rework risk).
+
+### Safe Validation Plan: Two-Stage Backtest + Guardrailed Pilot
+To distinguish `P3_Hybrid` from `P2_Pool` and `P4_FairBal` empirically without risking `P1` SLA breaches during rollout:
+
+1. **Phase 1 — Historical Trace-Driven Replay & Shadow Scoring (2 Weeks, Zero Live Risk):**
+   * Re-run the simulation engine using **exact historical arrival timestamps, actual case types, and empirical duration draws** from the past 60–90 operating days (specifically isolating historical high-volume mornings, staff sick days, and IT outages rather than synthetic Poisson draws).
+   * Deploy `P3_Hybrid` in **Shadow Mode** alongside current dispatch for 10 business days: log `recommended_resource`, `eligible_set`, and `branch_mode` at every real queue event without overriding operators, auditing edge cases where experienced leads deviate from `P3_Hybrid` (e.g., hidden sub-skill constraints not in the 5-column matrix).
+2. **Phase 2 — Guardrailed Alternating-Day Live Pilot (4 Weeks / 20 Operating Days):**
+   * *Why Case-Level Randomization Fails:* Randomizing individual tickets to different policies within the *same* shift suffers from severe **queue interference** (a `P2_Pool` case locking up Farah at `1.40x` directly delays a `P3_Hybrid` case in the shared resource pool!).
+   * *Matched Day-Block Design:* Alternate full operating days (stratified by day-of-week, e.g., Mon/Wed/Fri vs. Tue/Thu swapped across consecutive weeks) between **Baseline/Candidate B (`P4_FairBal` or current dispatch)** and **Primary Candidate (`P3_Hybrid`)**, logging `policy_version` on every event.
+   * **Hard P1 Safety Guardrails (Circuit Breakers):**
+     * **Case-Level Guardrail:** Regardless of active pilot arm, any `P1` case reaching `elapsed_clock == 65 minutes` without starting its final diagnostic branch—or `90 minutes` without starting `Validation`—triggers an immediate **Red-Alert Escalation** (preempting any non-P1 task on the fastest resource and locking same-resource Validation).
+     * **Shift-Level Rollback Circuit Breaker:** If rolling 3-day `P1_SLA` drops below `88%` (excluding physically unstaffed post-18:00 Mechanical arrivals, tracked separately for management staffing review) or any technician exceeds the 30-minute overtime cap twice in one week, automatically revert to safe fallback while auditing the interval event log in PM4Py.
+   * **Success Criteria to Promote to Full Rollout:** Statistically consistent reduction in 90th-percentile P1/P2 cycle time ($\ge 15\%$ reduction in cross-team 12-min handovers verified via `discover_handover_of_work_network`), zero core resources exceeding 90% planned utilization on non-shock days, and operator override rate $< 10\%$.
