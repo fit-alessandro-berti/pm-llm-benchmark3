@@ -600,6 +600,7 @@ _REASONING_PATTERNS = (
     r"mistral-large-4-0(?:-|$)",
     r"kimi-k3\.1-pro(?:-|$)",
     r"minimax-m3\.1-flash(?:-|$)",
+    r"hy4(?:-|$)",
 )
 
 _HIDDEN_REASONING_PATTERNS = (
