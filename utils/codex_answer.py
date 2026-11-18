@@ -29,8 +29,8 @@ from common import clean_model_name, is_completed_output
 # ---------------------------------------------------------------------------
 # Hard-coded run configuration — edit these before launching.
 # ---------------------------------------------------------------------------
-TARGET_MODEL_NAME = "gpt-6.2-astra-XHIGH"  # prefix used in answers/
-TARGET_MODEL = "gpt-6.2-astra"  # value passed to codex --model
+TARGET_MODEL_NAME = "gpt-6.2-sol-XHIGH"  # prefix used in answers/
+TARGET_MODEL = "gpt-6.2-sol"  # value passed to codex --model
 TARGET_REASONING_EFFORT = "xhigh"  # none | low | medium | high | xhigh
 
 # Max concurrent Codex CLI invocations. Each worker handles one question
